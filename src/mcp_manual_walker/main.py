@@ -2,7 +2,6 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import uvicorn
 from fastmcp import FastMCP
 from markitdown import MarkItDown
 from sqlalchemy.orm import Session, joinedload
@@ -107,10 +106,14 @@ def sync_database():
 @asynccontextmanager
 async def lifespan(app: FastMCP):
     """Server startup event handler."""
-    logger.info("Initializing database...")
-    init_db()
+    logger.info("Initializing application...")
+    # Ensure all necessary directories exist before initializing the database
+    settings.DB_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     settings.PDF_ROOT_DIR.mkdir(parents=True, exist_ok=True)
     settings.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Initializing database...")
+    init_db()
     sync_database()
     yield
 
@@ -221,4 +224,4 @@ def get_markdown_content(file_name: str, bookmark_title: str) -> str:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    app.run(transport="http", host="0.0.0.0", port=8000)
