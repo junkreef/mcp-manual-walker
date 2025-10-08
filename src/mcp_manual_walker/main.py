@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
@@ -20,8 +21,6 @@ from .pdf_utils import (
 # Configure logging
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
-
-app = FastMCP()
 
 
 def sync_database():
@@ -105,14 +104,18 @@ def sync_database():
     logger.info("Database synchronization complete.")
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastMCP):
     """Server startup event handler."""
     logger.info("Initializing database...")
     init_db()
     settings.PDF_ROOT_DIR.mkdir(parents=True, exist_ok=True)
     settings.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     sync_database()
+    yield
+
+
+app = FastMCP(lifespan=lifespan)
 
 
 @app.tool()
