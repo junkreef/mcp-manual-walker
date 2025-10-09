@@ -137,3 +137,6 @@ cache/
 # Database files
 *.sqlite3
 *.db
+
+# Data files
+data/
