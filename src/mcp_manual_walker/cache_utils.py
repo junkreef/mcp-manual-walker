@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-def get_cache_filepath(bookmark_id: int, manual_hash: str) -> Path:
+def get_cache_filepath(bookmark_id: str, manual_hash: str) -> Path:
     """Generates a consistent filepath for a cached bookmark."""
     return settings.CACHE_DIR / f"{manual_hash[:16]}_{bookmark_id}.md"
 
