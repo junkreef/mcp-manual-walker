@@ -13,6 +13,7 @@ dependencies = [
     "SQLAlchemy",
     "pydantic",
     "pydantic-settings",
+    "uuid7",
 ]
 
 [project.optional-dependencies]
