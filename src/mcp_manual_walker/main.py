@@ -71,17 +71,19 @@ def sync_database():
                 db.flush()
 
                 parent_stack = {}
-                for bm_data in pdf_data["bookmarks"]:
+                for i, bm_data in enumerate(pdf_data["bookmarks"]):
                     level = bm_data["level"]
                     parent = parent_stack.get(level - 1)
                     bookmark = Bookmark(
                         manual_id=new_manual.id,
+                        ordering=i,
                         title=bm_data["title"],
                         level=level,
                         page_num=bm_data["page_num"],
                         parent_id=parent.id if parent else None,
                     )
                     db.add(bookmark)
+                    db.flush()  # Flush to get the new bookmark's ID
                     parent_stack[level] = bookmark
                     keys_to_del = [k for k in parent_stack if k > level]
                     for k in keys_to_del:
@@ -122,12 +124,19 @@ app = FastMCP(lifespan=lifespan)
 
 
 @app.tool()
-def list_manuals() -> list[dict[str, str]]:
-    """Returns a list of all available manuals, including their filenames and document titles."""
+def list_manuals() -> list[dict]:
+    """Returns a list of all available manuals, including their ID, filename, and title."""
     db: Session = SessionLocal()
     try:
         manuals = db.query(Manual).order_by(Manual.file_name).all()
-        return [{"file_name": m.file_name, "document_title": m.document_title} for m in manuals]
+        return [
+            {
+                "id": m.id,
+                "file_name": m.file_name,
+                "document_title": m.document_title,
+            }
+            for m in manuals
+        ]
     except Exception as e:
         logger.error(f"Error fetching list of manuals: {e}")
         return []
@@ -138,7 +147,10 @@ def list_manuals() -> list[dict[str, str]]:
 def _build_toc(bookmarks: list[Bookmark]) -> list[dict]:
     """Builds a nested table of contents from a flat list of bookmarks."""
     toc = []
-    bookmark_map = {bm.id: {"title": bm.title, "page": bm.page_num, "children": []} for bm in bookmarks}
+    bookmark_map = {
+        bm.id: {"id": bm.id, "title": bm.title, "page": bm.page_num, "children": []}
+        for bm in bookmarks
+    }
     for bm in bookmarks:
         if bm.parent_id:
             if parent := bookmark_map.get(bm.parent_id):
@@ -149,48 +161,53 @@ def _build_toc(bookmarks: list[Bookmark]) -> list[dict]:
 
 
 @app.tool()
-def get_manual_metadata(file_name: str) -> dict:
-    """Returns metadata and hierarchical bookmark information for a specified manual."""
+def get_manual_metadata(manual_id: str) -> dict:
+    """Returns metadata and hierarchical bookmark info for a specified manual."""
     db: Session = SessionLocal()
     try:
-        manual = db.query(Manual).filter(Manual.file_name == file_name).first()
+        manual = db.query(Manual).filter(Manual.id == manual_id).first()
         if not manual:
-            return {"error": f"Manual with file_name '{file_name}' not found."}
+            return {"error": f"Manual with id '{manual_id}' not found."}
 
-        bookmarks = db.query(Bookmark).filter(Bookmark.manual_id == manual.id).order_by(Bookmark.id).all()
+        bookmarks = (
+            db.query(Bookmark)
+            .filter(Bookmark.manual_id == manual.id)
+            .order_by(Bookmark.ordering)
+            .all()
+        )
         table_of_contents = _build_toc(bookmarks)
 
         return {
+            "id": manual.id,
             "file_name": manual.file_name,
             "document_title": manual.document_title,
             "file_hash": manual.file_hash,
             "table_of_contents": table_of_contents,
         }
     except Exception as e:
-        logger.error(f"Error fetching metadata for '{file_name}': {e}")
+        logger.error(f"Error fetching metadata for manual_id '{manual_id}': {e}")
         return {"error": "An internal error occurred."}
     finally:
         db.close()
 
 
 @app.tool()
-def get_markdown_content(file_name: str, bookmark_title: str) -> str:
+def get_markdown_content(bookmark_id: str) -> str:
     """
-    Returns the Markdown content for a specific bookmark within a specified manual.
-    It uses a cache to speed up repeated requests.
+    Returns the Markdown content for a specific bookmark.
+    Uses a cache to speed up repeated requests.
     """
     db: Session = SessionLocal()
     markdown_converter = MarkItDown()
     try:
         bookmark = (
             db.query(Bookmark)
-            .join(Manual)
-            .filter(Manual.file_name == file_name, Bookmark.title == bookmark_title)
+            .filter(Bookmark.id == bookmark_id)
             .options(joinedload(Bookmark.manual), joinedload(Bookmark.cache_entry))
             .first()
         )
         if not bookmark:
-            return f"Error: Bookmark '{bookmark_title}' not found in manual '{file_name}'."
+            return f"Error: Bookmark with id '{bookmark_id}' not found."
 
         if cached_content := find_valid_cache(bookmark, db):
             return cached_content
@@ -199,25 +216,37 @@ def get_markdown_content(file_name: str, bookmark_title: str) -> str:
         pdf_path = settings.PDF_ROOT_DIR.resolve() / manual.relative_path
         start_page = bookmark.page_num
 
+        # Find the next bookmark to determine the end page.
         next_bookmark = (
             db.query(Bookmark)
-            .filter(Bookmark.manual_id == manual.id, Bookmark.level <= bookmark.level, Bookmark.id > bookmark.id)
-            .order_by(Bookmark.id)
+            .filter(
+                Bookmark.manual_id == manual.id,
+                Bookmark.ordering > bookmark.ordering,
+            )
+            .order_by(Bookmark.ordering)
             .first()
         )
-        end_page = next_bookmark.page_num - 1 if next_bookmark and next_bookmark.page_num > start_page else None
 
-        logger.info(f"Cache miss. Extracting pages {start_page}-{end_page or 'end'} from '{pdf_path.name}'.")
+        end_page = (
+            next_bookmark.page_num - 1
+            if next_bookmark and next_bookmark.page_num > start_page
+            else None
+        )
+
+        logger.info(
+            f"Cache miss for bookmark '{bookmark.title}'. "
+            f"Extracting pages {start_page}-{end_page or 'end'} from '{pdf_path.name}'."
+        )
         raw_text = extract_text_from_page_range(pdf_path, start_page, end_page)
         if not raw_text:
-            return f"Error: Could not extract text for bookmark '{bookmark_title}'."
+            return f"Error: Could not extract text for bookmark '{bookmark.title}'."
 
         markdown_content = markdown_converter.convert(raw_text)
         create_cache(bookmark, markdown_content, db)
         return markdown_content
 
     except Exception as e:
-        logger.error(f"Error getting content for '{bookmark_title}' in '{file_name}': {e}")
+        logger.error(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
         return "Error: An internal error occurred while fetching content."
     finally:
         db.close()

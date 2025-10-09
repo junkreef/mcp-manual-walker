@@ -1,22 +1,24 @@
 import datetime
+import uuid
 from typing import List, Optional
 from sqlalchemy import (
-    create_engine,
     Column,
     Integer,
     String,
     DateTime,
     ForeignKey,
-    Text,
 )
 from sqlalchemy.orm import declarative_base, relationship, Mapped
 
 Base = declarative_base()
 
+def generate_uuid():
+    return str(uuid.uuid4())
+
 class Manual(Base):
     __tablename__ = "manuals"
 
-    id: Mapped[int] = Column(Integer, primary_key=True)
+    id: Mapped[str] = Column(String(36), primary_key=True, default=generate_uuid)
     file_name: Mapped[str] = Column(String, unique=True, nullable=False)
     document_title: Mapped[Optional[str]] = Column(String)
     relative_path: Mapped[str] = Column(String, nullable=False)
@@ -30,12 +32,13 @@ class Manual(Base):
 class Bookmark(Base):
     __tablename__ = "bookmarks"
 
-    id: Mapped[int] = Column(Integer, primary_key=True)
-    manual_id: Mapped[int] = Column(Integer, ForeignKey("manuals.id"), nullable=False)
+    id: Mapped[str] = Column(String(36), primary_key=True, default=generate_uuid)
+    manual_id: Mapped[str] = Column(String(36), ForeignKey("manuals.id"), nullable=False)
+    ordering: Mapped[int] = Column(Integer, nullable=False)
     title: Mapped[str] = Column(String, nullable=False)
     level: Mapped[int] = Column(Integer, nullable=False)
     page_num: Mapped[int] = Column(Integer, nullable=False)
-    parent_id: Mapped[Optional[int]] = Column(Integer, ForeignKey("bookmarks.id"))
+    parent_id: Mapped[Optional[str]] = Column(String(36), ForeignKey("bookmarks.id"))
 
     manual: Mapped["Manual"] = relationship("Manual", back_populates="bookmarks")
     parent: Mapped[Optional["Bookmark"]] = relationship("Bookmark", remote_side=[id], back_populates="children")
@@ -46,8 +49,8 @@ class Bookmark(Base):
 class Cache(Base):
     __tablename__ = "cache"
 
-    id: Mapped[int] = Column(Integer, primary_key=True)
-    bookmark_id: Mapped[int] = Column(Integer, ForeignKey("bookmarks.id"), nullable=False)
+    id: Mapped[str] = Column(String(36), primary_key=True, default=generate_uuid)
+    bookmark_id: Mapped[str] = Column(String(36), ForeignKey("bookmarks.id"), nullable=False)
     manual_hash: Mapped[str] = Column(String, nullable=False)
     markdown_file_path: Mapped[str] = Column(String, nullable=False)
     created_at: Mapped[datetime.datetime] = Column(DateTime, default=datetime.datetime.utcnow)
