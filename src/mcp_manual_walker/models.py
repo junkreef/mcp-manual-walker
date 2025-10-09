@@ -11,15 +11,14 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.orm import Mapped, declarative_base, relationship
-from uuid7 import uuid7
 
 
 Base = declarative_base()
 
 
 def new_uuid() -> str:
-    """Generates a new UUIDv7 string."""
-    return str(uuid7())
+    """Generates a new UUIDv4 string."""
+    return str(uuid.uuid4())
 
 
 class Manual(Base):
@@ -48,6 +47,10 @@ class Bookmark(Base):
     level: Mapped[int] = Column(Integer, nullable=False)
     page_num: Mapped[int] = Column(Integer, nullable=False)
     parent_id: Mapped[Optional[str]] = Column(String, ForeignKey("bookmarks.id"))
+    created_at: Mapped[datetime.datetime] = Column(
+        DateTime, default=datetime.datetime.utcnow, nullable=False
+    )
+
 
     manual: Mapped["Manual"] = relationship("Manual", back_populates="bookmarks")
     parent: Mapped[Optional["Bookmark"]] = relationship(

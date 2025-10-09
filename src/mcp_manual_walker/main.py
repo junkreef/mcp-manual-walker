@@ -173,7 +173,7 @@ def get_manual_metadata(manual_id: str) -> dict[str, Any]:
         bookmarks = (
             db.query(Bookmark)
             .filter(Bookmark.manual_id == manual.id)
-            .order_by(Bookmark.id)
+            .order_by(Bookmark.created_at)
             .all()
         )
         table_of_contents = _build_toc(bookmarks)
@@ -218,15 +218,15 @@ def get_markdown_content(bookmark_id: str) -> str:
         start_page = bookmark.page_num
 
         # Find the next bookmark to determine the page range.
-        # The ordering by ID works because UUIDv7 is time-ordered.
+        # Ordering is by creation time to ensure we get the correct next bookmark.
         next_bookmark = (
             db.query(Bookmark)
             .filter(
                 Bookmark.manual_id == manual.id,
                 Bookmark.level <= bookmark.level,
-                Bookmark.id > bookmark.id,
+                Bookmark.created_at > bookmark.created_at,
             )
-            .order_by(Bookmark.id)
+            .order_by(Bookmark.created_at)
             .first()
         )
         end_page = (
