@@ -1,9 +1,10 @@
 import hashlib
 import logging
+import tempfile
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Generator
+from typing import Any, Dict, Generator, Optional
 
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
 
 logger = logging.getLogger(__name__)
@@ -111,3 +112,47 @@ def extract_text_from_page_range(file_path: Path, start_page: int, end_page: Opt
         return ""
 
     return text
+
+
+def create_temp_pdf_from_page_range(
+    file_path: Path, start_page: int, end_page: Optional[int] = None
+) -> Optional[Path]:
+    """
+    Creates a temporary PDF file from a given page range (inclusive).
+    Page numbers are 1-based.
+    Returns the Path to the temporary file, or None on failure.
+    """
+    if end_page is None or end_page < start_page:
+        end_page = start_page
+
+    try:
+        reader = PdfReader(str(file_path))
+        writer = PdfWriter()
+        num_pages = len(reader.pages)
+
+        # Validate page range
+        start_idx = start_page - 1
+        end_idx = end_page - 1
+
+        if not (0 <= start_idx < num_pages):
+            logger.error(
+                f"Start page {start_page} is out of bounds for PDF with {num_pages} pages."
+            )
+            return None
+
+        # Add pages to the writer
+        for i in range(start_idx, min(end_idx, num_pages - 1) + 1):
+            writer.add_page(reader.pages[i])
+
+        # Create a temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        temp_file_path = Path(temp_file.name)
+        writer.write(temp_file)
+        temp_file.close()  # Close the file handle
+
+        logger.info(f"Created temporary PDF: {temp_file_path}")
+        return temp_file_path
+
+    except Exception as e:
+        logger.error(f"Failed to create temporary PDF from {file_path}: {e}")
+        return None

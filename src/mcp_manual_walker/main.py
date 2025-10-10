@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,8 +13,8 @@ from .database import SessionLocal, init_db
 from .models import Bookmark, Manual
 from .pdf_utils import (
     calculate_file_hash,
+    create_temp_pdf_from_page_range,
     extract_pdf_metadata,
-    extract_text_from_page_range,
     scan_pdfs,
 )
 
@@ -199,6 +200,7 @@ def get_markdown_content(bookmark_id: str) -> str:
     """
     db: Session = SessionLocal()
     markdown_converter = MarkItDown()
+    temp_pdf_path: Path | None = None
     try:
         bookmark = (
             db.query(Bookmark)
@@ -235,20 +237,30 @@ def get_markdown_content(bookmark_id: str) -> str:
 
         logger.info(
             f"Cache miss for bookmark '{bookmark.title}'. "
-            f"Extracting pages {start_page}-{end_page or 'end'} from '{pdf_path.name}'."
+            f"Creating temporary PDF for pages {start_page}-{end_page or 'end'} from '{pdf_path.name}'."
         )
-        raw_text = extract_text_from_page_range(pdf_path, start_page, end_page)
-        if not raw_text:
-            return f"Error: Could not extract text for bookmark '{bookmark.title}'."
 
-        markdown_content = markdown_converter.convert(raw_text)
-        create_cache(bookmark, markdown_content, db)
-        return markdown_content
+        temp_pdf_path = create_temp_pdf_from_page_range(pdf_path, start_page, end_page)
+        if not temp_pdf_path:
+            return f"Error: Could not create temporary PDF for bookmark '{bookmark.title}'."
+
+        markdown_content = markdown_converter.convert(str(temp_pdf_path))
+        if not markdown_content:
+            return f"Error: Failed to convert content for bookmark '{bookmark.title}' to Markdown."
+
+        create_cache(bookmark, markdown_content.markdown, db)
+        return markdown_content.markdown
 
     except Exception as e:
         logger.error(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
         return "Error: An internal error occurred while fetching content."
     finally:
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
+            try:
+                os.remove(temp_pdf_path)
+                logger.info(f"Successfully removed temporary file: {temp_pdf_path}")
+            except OSError as e:
+                logger.error(f"Error removing temporary file {temp_pdf_path}: {e}")
         db.close()
 
 
