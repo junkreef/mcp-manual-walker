@@ -248,8 +248,8 @@ def get_markdown_content(bookmark_id: str) -> str:
         if not markdown_content:
             return f"Error: Failed to convert content for bookmark '{bookmark.title}' to Markdown."
 
-        create_cache(bookmark, markdown_content, db)
-        return markdown_content
+        create_cache(bookmark, markdown_content.markdown, db)
+        return markdown_content.markdown
 
     except Exception as e:
         logger.error(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
