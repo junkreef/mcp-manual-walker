@@ -138,5 +138,11 @@ cache/
 *.sqlite3
 *.db
 
-# Data files
+# Gemini CLI
+.gemini/
+
+# VSCode
+.vscode/
+
+# Data
 data/
