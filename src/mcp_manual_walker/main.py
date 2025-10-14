@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, joinedload
 from .cache_utils import create_cache, find_valid_cache
 from .config import settings
 from .database import SessionLocal, init_db
-from .models import Bookmark, Manual
+from .models import Bookmark, Cache, Manual
 from .pdf_utils import (
     calculate_file_hash,
     create_temp_pdf_from_page_range,
@@ -93,8 +93,32 @@ def sync_database():
 
         deleted_paths = db_paths - fs_paths
         for path_to_delete in deleted_paths:
+            manual_to_delete = db_manuals[path_to_delete]
             logger.info(f"'{path_to_delete}' has been removed. Deleting from database.")
-            db.delete(db_manuals[path_to_delete])
+
+            # Query for all cache entries related to the manual being deleted
+            cache_files_to_delete = (
+                db.query(Cache.markdown_file_path)
+                .join(Bookmark)
+                .filter(Bookmark.manual_id == manual_to_delete.id)
+                .all()
+            )
+
+            # Delete the physical cache files
+            for cache_file in cache_files_to_delete:
+                try:
+                    file_path = Path(cache_file[0])
+                    if file_path.is_file():
+                        os.remove(file_path)
+                        logger.info(f"Deleted orphaned cache file: {file_path}")
+                except FileNotFoundError:
+                    logger.warning(
+                        f"Cache file not found, skipping deletion: {cache_file[0]}"
+                    )
+                except Exception as e:
+                    logger.error(f"Error deleting cache file {cache_file[0]}: {e}")
+
+            db.delete(manual_to_delete)
 
         db.commit()
 
