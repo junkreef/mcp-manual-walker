@@ -52,7 +52,7 @@ def test_data(db_session):
     return manual, bookmark
 
 
-def test_cascade_delete(db_session, test_data):
+def test_cascade_delete(db_session, test_data, tmp_path):
     """
     Tests that deleting a Manual also deletes its associated Bookmarks and Caches.
     This verifies the `cascade="all, delete-orphan"` setting in the models.
@@ -62,9 +62,8 @@ def test_cascade_delete(db_session, test_data):
     bookmark_id = bookmark.id
 
     # Create a dummy cache entry to test cascade deletion
-    cache_path = Path("./test_cache.md")
-    with open(cache_path, "w") as f:
-        f.write("cached content")
+    cache_path = tmp_path / "test_cache.md"
+    cache_path.write_text("cached content")
 
     cache_entry = Cache(
         id="cache-1",
@@ -88,9 +87,6 @@ def test_cascade_delete(db_session, test_data):
     assert db_session.query(Manual).filter_by(id=manual_id).first() is None
     assert db_session.query(Bookmark).filter_by(id=bookmark_id).first() is None
     assert db_session.query(Cache).filter_by(id="cache-1").first() is None
-
-    # Clean up the dummy cache file
-    os.remove(cache_path)
 
 
 def test_find_valid_cache_hit(db_session, test_data, tmp_path):
