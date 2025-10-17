@@ -8,6 +8,16 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
+from mcp_manual_walker import config
+from mcp_manual_walker.database import init_db
+from mcp_manual_walker.main import (
+    app,
+    get_manual_metadata,
+    get_markdown_content,
+    list_manuals,
+    sync_database,
+)
+
 
 @pytest.fixture(scope="function")
 async def test_client(tmp_path: Path):
@@ -47,7 +57,6 @@ async def test_client(tmp_path: Path):
         writer.write(f)
 
     # 3. Configure app settings to use temporary paths
-    from mcp_manual_walker import config
     original_pdf_dir = config.settings.PDF_ROOT_DIR
     original_db_path = config.settings.DB_FILE_PATH
     original_cache_dir = config.settings.CACHE_DIR
@@ -55,9 +64,6 @@ async def test_client(tmp_path: Path):
     config.settings.PDF_ROOT_DIR = pdf_dir
     config.settings.DB_FILE_PATH = db_dir / "test.db"
     config.settings.CACHE_DIR = cache_dir
-
-    # Import app and sync_database after patching settings
-    from mcp_manual_walker.main import app, sync_database
 
     try:
         # 4. The app's lifespan manager will handle init_db and sync_database.
@@ -136,7 +142,6 @@ async def test_delete_orphaned_cache(tmp_path: Path):
         writer.write(f)
 
     # 3. Configure settings
-    from mcp_manual_walker import config
     original_pdf_dir = config.settings.PDF_ROOT_DIR
     original_db_path = config.settings.DB_FILE_PATH
     original_cache_dir = config.settings.CACHE_DIR
@@ -145,8 +150,6 @@ async def test_delete_orphaned_cache(tmp_path: Path):
     config.settings.CACHE_DIR = cache_dir
 
     # 4. Initialize app and database
-    from mcp_manual_walker.main import app, sync_database, get_markdown_content, list_manuals, get_manual_metadata
-    from mcp_manual_walker.database import init_db
     init_db()
     sync_database()
 
