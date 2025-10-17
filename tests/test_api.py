@@ -23,6 +23,10 @@ async def test_client(tmp_path: Path):
     pdf_dir.mkdir()
     db_dir.mkdir()
     cache_dir.mkdir()
+    # Clear the cache directory before each test
+    for item in cache_dir.iterdir():
+        if item.is_file():
+            item.unlink()
 
     # 2. Create a dummy PDF with known content
     dummy_pdf_path = pdf_dir / "integration_test_manual.pdf"
@@ -107,3 +111,68 @@ async def test_e2e_workflow(test_client: Client):
     assert "1.1 Intro" in content
     # The dummy PDF is blank, so we don't expect much other content
     assert len(content) > 10
+
+
+@pytest.mark.asyncio
+async def test_delete_orphaned_cache(tmp_path: Path):
+    """
+    Tests that orphaned cache files are deleted when the source PDF is removed.
+    """
+    # 1. Create a temporary environment
+    pdf_dir = tmp_path / "pdfs"
+    db_dir = tmp_path / "db"
+    cache_dir = tmp_path / "cache"
+    pdf_dir.mkdir()
+    db_dir.mkdir()
+    cache_dir.mkdir()
+
+    # 2. Create a dummy PDF
+    dummy_pdf_path = pdf_dir / "test.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_metadata({"/Title": "Test Manual"})
+    bm_ch1 = writer.add_outline_item("Chapter 1", page_number=0)
+    with open(dummy_pdf_path, "wb") as f:
+        writer.write(f)
+
+    # 3. Configure settings
+    from mcp_manual_walker import config
+    original_pdf_dir = config.settings.PDF_ROOT_DIR
+    original_db_path = config.settings.DB_FILE_PATH
+    original_cache_dir = config.settings.CACHE_DIR
+    config.settings.PDF_ROOT_DIR = pdf_dir
+    config.settings.DB_FILE_PATH = db_dir / "test.db"
+    config.settings.CACHE_DIR = cache_dir
+
+    # 4. Initialize app and database
+    from mcp_manual_walker.main import app, sync_database, get_markdown_content, list_manuals, get_manual_metadata
+    from mcp_manual_walker.database import init_db
+    init_db()
+    sync_database()
+
+    # 5. Get manual and bookmark IDs
+    manuals = list_manuals.fn()
+    manual_id = manuals[0]['id']
+    metadata = get_manual_metadata.fn(manual_id)
+    bookmark_id = metadata['table_of_contents'][0]['id']
+
+    # 6. Create a cache file
+    get_markdown_content.fn(bookmark_id)
+    cache_files = list(cache_dir.glob("*.md"))
+    assert len(cache_files) == 1
+    cache_file_path = cache_files[0]
+    assert cache_file_path.exists()
+
+    # 7. Delete the source PDF
+    dummy_pdf_path.unlink()
+
+    # 8. Run sync_database again to trigger the cleanup
+    sync_database()
+
+    # 9. Verify the cache file has been deleted
+    assert not cache_file_path.exists()
+
+    # Restore original settings
+    config.settings.PDF_ROOT_DIR = original_pdf_dir
+    config.settings.DB_FILE_PATH = original_db_path
+    config.settings.CACHE_DIR = original_cache_dir
