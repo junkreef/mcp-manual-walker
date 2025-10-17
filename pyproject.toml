@@ -19,7 +19,10 @@ dependencies = [
 dev = [
     "uv",
     "ruff",
-    "mypy"
+    "mypy",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
 ]
 
 [tool.ruff]
