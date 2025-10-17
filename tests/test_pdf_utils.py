@@ -10,8 +10,6 @@ from mcp_manual_walker.pdf_utils import (
     extract_pdf_metadata,
 )
 
-# A known hash for a specific PDF content
-KNOWN_HASH = "d41d8cd98f00b204e9800998ecf8427e"
 
 
 @pytest.fixture(scope="session")
