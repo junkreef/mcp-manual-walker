@@ -1,9 +1,12 @@
 import asyncio
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from fastmcp.client import Client
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
 
 @pytest.fixture(scope="function")
@@ -25,15 +28,11 @@ async def test_client(tmp_path: Path):
     dummy_pdf_path = pdf_dir / "integration_test_manual.pdf"
     writer = PdfWriter()
     # Add a page with some text
-    from io import BytesIO
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import letter
     packet = BytesIO()
     can = canvas.Canvas(packet, pagesize=letter)
     can.drawString(10, 100, "This is the content for 1.1 Intro.")
     can.save()
     packet.seek(0)
-    from pypdf import PdfReader
     new_pdf = PdfReader(packet)
     writer.add_page(new_pdf.pages[0])
 
