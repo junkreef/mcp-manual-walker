@@ -19,7 +19,11 @@ dependencies = [
 dev = [
     "uv",
     "ruff",
-    "mypy"
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "pytest-asyncio",
+    "reportlab",
 ]
 
 [tool.ruff]
@@ -30,3 +34,14 @@ select = ["E", "F", "I"]
 
 [tool.uv]
 package = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src/mcp_manual_walker"]
+
+[tool.coverage.report]
+fail_under = 70
