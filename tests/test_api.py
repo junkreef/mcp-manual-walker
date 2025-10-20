@@ -78,7 +78,9 @@ async def test_e2e_workflow(test_client: Client):
     manual_id = manual["id"]
 
     # 2. Get manual metadata
-    result = await test_client.call_tool("get_manual_metadata", {"manual_id": manual_id})
+    result = await test_client.call_tool(
+        "get_manual_metadata", {"manual_id": manual_id}
+    )
     metadata = result.structured_content
     assert metadata["id"] == manual_id
     assert "table_of_contents" in metadata
@@ -94,7 +96,9 @@ async def test_e2e_workflow(test_client: Client):
     bookmark_id = section1_1["id"]
 
     # 3. Get markdown content for a specific bookmark
-    result = await test_client.call_tool("get_markdown_content", {"bookmark_id": bookmark_id})
+    result = await test_client.call_tool(
+        "get_markdown_content", {"bookmark_id": bookmark_id}
+    )
     content = result.structured_content['result']
     assert isinstance(content, str)
     assert content  # Check that the content is not empty

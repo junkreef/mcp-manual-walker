@@ -1,8 +1,10 @@
-import pytest
 from pathlib import Path
-from reportlab.pdfgen import canvas
+
+import pytest
+from pypdf import PdfReader, PdfWriter
 from reportlab.lib.pagesizes import letter
-from pypdf import PdfWriter, PdfReader
+from reportlab.pdfgen import canvas
+
 
 @pytest.fixture(scope="session")
 def dummy_pdf_factory():
@@ -20,13 +22,15 @@ def dummy_pdf_factory():
 
         Args:
             path: The path to save the PDF file.
-            pages_content: A dictionary mapping page numbers (1-based) to content strings.
+            pages_content: A dictionary mapping page numbers (1-based) to content
+                strings.
             bookmarks: A dictionary for hierarchical bookmarks.
                 Format: {
                     "Bookmark Title": (page_number, parent_title | None),
                     ...
                 }
-            metadata: A dictionary for the document's metadata (e.g., {"/Title": "My Title"}).
+            metadata: A dictionary for the document's metadata
+                (e.g., {"/Title": "My Title"}).
         """
         # Create the PDF with page content using reportlab
         c = canvas.Canvas(str(path), pagesize=letter)
