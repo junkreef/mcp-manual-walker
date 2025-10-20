@@ -9,4 +9,7 @@ class Settings(BaseSettings):
     CACHE_DIR: Path = Path("./cache")
     LOG_LEVEL: str = "INFO"
 
+    HOST: str = "127.0.0.1"
+    PORT: int = 8000
+
 settings = Settings()

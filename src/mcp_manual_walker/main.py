@@ -289,4 +289,4 @@ def get_markdown_content(bookmark_id: str) -> str:
 
 
 if __name__ == "__main__":
-    app.run(transport="http", host="0.0.0.0", port=8000)
+    app.run(transport="http", host=settings.HOST, port=settings.PORT)
