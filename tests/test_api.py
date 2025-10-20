@@ -16,7 +16,7 @@ from mcp_manual_walker.main import (
 
 
 @pytest.fixture(scope="function")
-async def test_client(tmp_path: Path):
+async def test_client(tmp_path: Path, monkeypatch):
     """
     A comprehensive fixture for API integration testing. It sets up a temporary
     environment with a dummy PDF, a test database, and a cache directory.
@@ -41,28 +41,16 @@ async def test_client(tmp_path: Path):
     with open(pdf_path, "wb") as f:
         f.write(response.content)
 
-
     # 3. Configure app settings to use temporary paths
-    original_pdf_dir = config.settings.PDF_ROOT_DIR
-    original_db_path = config.settings.DB_FILE_PATH
-    original_cache_dir = config.settings.CACHE_DIR
+    monkeypatch.setattr(config.settings, "PDF_ROOT_DIR", pdf_dir)
+    monkeypatch.setattr(config.settings, "DB_FILE_PATH", db_dir / "test.db")
+    monkeypatch.setattr(config.settings, "CACHE_DIR", cache_dir)
 
-    config.settings.PDF_ROOT_DIR = pdf_dir
-    config.settings.DB_FILE_PATH = db_dir / "test.db"
-    config.settings.CACHE_DIR = cache_dir
-
-    try:
-        # 4. The app's lifespan manager will handle init_db and sync_database.
-        #    We just need to yield the client.
-        # 5. Yield an in-memory client
-        async with Client(app) as client:
-            yield client
-
-    finally:
-        # Restore original settings
-        config.settings.PDF_ROOT_DIR = original_pdf_dir
-        config.settings.DB_FILE_PATH = original_db_path
-        config.settings.CACHE_DIR = original_cache_dir
+    # 4. The app's lifespan manager will handle init_db and sync_database.
+    #    We just need to yield the client.
+    # 5. Yield an in-memory client
+    async with Client(app) as client:
+        yield client
 
 
 @pytest.mark.asyncio
@@ -113,7 +101,7 @@ async def test_e2e_workflow(test_client: Client):
 
 
 @pytest.mark.asyncio
-async def test_delete_orphaned_cache(tmp_path: Path):
+async def test_delete_orphaned_cache(tmp_path: Path, monkeypatch):
     """
     Tests that orphaned cache files are deleted when the source PDF is removed.
     """
@@ -133,12 +121,9 @@ async def test_delete_orphaned_cache(tmp_path: Path):
         f.write(response.content)
 
     # 3. Configure settings
-    original_pdf_dir = config.settings.PDF_ROOT_DIR
-    original_db_path = config.settings.DB_FILE_PATH
-    original_cache_dir = config.settings.CACHE_DIR
-    config.settings.PDF_ROOT_DIR = pdf_dir
-    config.settings.DB_FILE_PATH = db_dir / "test.db"
-    config.settings.CACHE_DIR = cache_dir
+    monkeypatch.setattr(config.settings, "PDF_ROOT_DIR", pdf_dir)
+    monkeypatch.setattr(config.settings, "DB_FILE_PATH", db_dir / "test.db")
+    monkeypatch.setattr(config.settings, "CACHE_DIR", cache_dir)
 
     # 4. Initialize app and database
     init_db()
@@ -172,8 +157,3 @@ async def test_delete_orphaned_cache(tmp_path: Path):
 
     # 9. Verify the cache file has been deleted
     assert not cache_file_path.exists()
-
-    # Restore original settings
-    config.settings.PDF_ROOT_DIR = original_pdf_dir
-    config.settings.DB_FILE_PATH = original_db_path
-    config.settings.CACHE_DIR = original_cache_dir
