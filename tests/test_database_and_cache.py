@@ -149,7 +149,7 @@ def test_find_valid_cache_miss_no_entry(db_session, test_data):
     assert content is None
 
 
-def test_create_cache(db_session, test_data, tmp_path):
+def test_create_cache(db_session, test_data, tmp_path, monkeypatch):
     """
     Tests the creation of a new cache entry.
     """
@@ -158,22 +158,17 @@ def test_create_cache(db_session, test_data, tmp_path):
 
     # Mock the settings to use the temporary directory
     from mcp_manual_walker import config
-    original_cache_dir = config.settings.CACHE_DIR
-    config.settings.CACHE_DIR = tmp_path
+    monkeypatch.setattr(config.settings, "CACHE_DIR", tmp_path)
 
-    try:
-        # Create the cache
-        create_cache(bookmark, content_to_cache, db_session)
+    # Create the cache
+    create_cache(bookmark, content_to_cache, db_session)
 
-        # Verify the cache entry in the database
-        cache_entry = db_session.query(Cache).filter_by(bookmark_id=bookmark.id).one()
-        assert cache_entry is not None
-        assert cache_entry.manual_hash == manual.file_hash
-        assert Path(cache_entry.markdown_file_path).name.endswith(".md")
+    # Verify the cache entry in the database
+    cache_entry = db_session.query(Cache).filter_by(bookmark_id=bookmark.id).one()
+    assert cache_entry is not None
+    assert cache_entry.manual_hash == manual.file_hash
+    assert Path(cache_entry.markdown_file_path).name.endswith(".md")
 
-        # Verify the content of the cache file
-        with open(cache_entry.markdown_file_path, "r") as f:
-            assert f.read() == content_to_cache
-    finally:
-        # Restore the original settings
-        config.settings.CACHE_DIR = original_cache_dir
+    # Verify the content of the cache file
+    with open(cache_entry.markdown_file_path, "r") as f:
+        assert f.read() == content_to_cache
