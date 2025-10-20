@@ -1,12 +1,8 @@
-import asyncio
-from io import BytesIO
 from pathlib import Path
 
 import pytest
+import requests
 from fastmcp.client import Client
-from pypdf import PdfReader, PdfWriter
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
 
 from mcp_manual_walker import config
 from mcp_manual_walker.database import init_db
@@ -38,23 +34,13 @@ async def test_client(tmp_path: Path):
         if item.is_file():
             item.unlink()
 
-    # 2. Create a dummy PDF with known content
-    dummy_pdf_path = pdf_dir / "integration_test_manual.pdf"
-    writer = PdfWriter()
-    # Add a page with some text
-    packet = BytesIO()
-    can = canvas.Canvas(packet, pagesize=letter)
-    can.drawString(10, 100, "This is the content for 1.1 Intro.")
-    can.save()
-    packet.seek(0)
-    new_pdf = PdfReader(packet)
-    writer.add_page(new_pdf.pages[0])
+    # 2. Download the reference PDF
+    pdf_url = "https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf"
+    pdf_path = pdf_dir / "PDF32000_2008.pdf"
+    response = requests.get(pdf_url)
+    with open(pdf_path, "wb") as f:
+        f.write(response.content)
 
-    writer.add_metadata({"/Title": "Integration Test Manual"})
-    bm_ch1 = writer.add_outline_item("Chapter 1", page_number=0)
-    writer.add_outline_item("1.1 Intro", page_number=0, parent=bm_ch1)
-    with open(dummy_pdf_path, "wb") as f:
-        writer.write(f)
 
     # 3. Configure app settings to use temporary paths
     original_pdf_dir = config.settings.PDF_ROOT_DIR
@@ -93,8 +79,8 @@ async def test_e2e_workflow(test_client: Client):
     assert isinstance(manuals, list)
     assert len(manuals) == 1
     manual = manuals[0]
-    assert manual["file_name"] == "integration_test_manual.pdf"
-    assert manual["document_title"] == "Integration Test Manual"
+    assert manual["file_name"] == "PDF32000_2008.pdf"
+    assert manual["document_title"] == "PDF32000.book"
     manual_id = manual["id"]
 
     # 2. Get manual metadata
@@ -103,20 +89,27 @@ async def test_e2e_workflow(test_client: Client):
     assert metadata["id"] == manual_id
     assert "table_of_contents" in metadata
     toc = metadata["table_of_contents"]
-    assert len(toc) == 1
-    assert toc[0]["title"] == "Chapter 1"
-    assert len(toc[0]["children"]) == 1
-    assert toc[0]["children"][0]["title"] == "1.1 Intro"
-    bookmark_id = toc[0]["children"][0]["id"]
+    assert len(toc) > 1
+
+    # Find a specific bookmark to test
+    # Let's find "1.1 Introduction"
+    intro_bookmark = None
+    for item in toc:
+        if "Introduction" in item["title"]:
+            intro_bookmark = item
+            break
+
+    assert intro_bookmark is not None, "Could not find 'Introduction' bookmark"
+    bookmark_id = intro_bookmark["id"]
+
 
     # 3. Get markdown content for a specific bookmark
     result = await test_client.call_tool("get_markdown_content", {"bookmark_id": bookmark_id})
     content = result.structured_content['result']
     assert isinstance(content, str)
     # Since markitdown adds a title, we check if it's in the content
-    assert "1.1 Intro" in content
-    # The dummy PDF is blank, so we don't expect much other content
-    assert len(content) > 10
+    assert "Introduction" in content
+    assert len(content) > 100
 
 
 @pytest.mark.asyncio
@@ -132,14 +125,12 @@ async def test_delete_orphaned_cache(tmp_path: Path):
     db_dir.mkdir()
     cache_dir.mkdir()
 
-    # 2. Create a dummy PDF
-    dummy_pdf_path = pdf_dir / "test.pdf"
-    writer = PdfWriter()
-    writer.add_blank_page(width=612, height=792)
-    writer.add_metadata({"/Title": "Test Manual"})
-    bm_ch1 = writer.add_outline_item("Chapter 1", page_number=0)
-    with open(dummy_pdf_path, "wb") as f:
-        writer.write(f)
+    # 2. Download the reference PDF
+    pdf_url = "https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf"
+    pdf_path = pdf_dir / "PDF32000_2008.pdf"
+    response = requests.get(pdf_url)
+    with open(pdf_path, "wb") as f:
+        f.write(response.content)
 
     # 3. Configure settings
     original_pdf_dir = config.settings.PDF_ROOT_DIR
@@ -157,7 +148,14 @@ async def test_delete_orphaned_cache(tmp_path: Path):
     manuals = list_manuals.fn()
     manual_id = manuals[0]['id']
     metadata = get_manual_metadata.fn(manual_id)
-    bookmark_id = metadata['table_of_contents'][0]['id']
+    toc = metadata['table_of_contents']
+    scope_bookmark = None
+    for item in toc:
+        if "Scope" in item["title"]:
+            scope_bookmark = item
+            break
+    assert scope_bookmark is not None, "Could not find 'Scope' bookmark"
+    bookmark_id = scope_bookmark['id']
 
     # 6. Create a cache file
     get_markdown_content.fn(bookmark_id)
@@ -167,7 +165,7 @@ async def test_delete_orphaned_cache(tmp_path: Path):
     assert cache_file_path.exists()
 
     # 7. Delete the source PDF
-    dummy_pdf_path.unlink()
+    pdf_path.unlink()
 
     # 8. Run sync_database again to trigger the cleanup
     sync_database()

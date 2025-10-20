@@ -1,15 +1,13 @@
 import hashlib
-import os
 from pathlib import Path
 
 import pytest
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfWriter
 
 from mcp_manual_walker.pdf_utils import (
     calculate_file_hash,
     extract_pdf_metadata,
 )
-
 
 
 @pytest.fixture(scope="session")

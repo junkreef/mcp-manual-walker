@@ -24,6 +24,7 @@ dev = [
     "pytest-cov",
     "pytest-asyncio",
     "reportlab",
+    "requests",
 ]
 
 [tool.ruff]
