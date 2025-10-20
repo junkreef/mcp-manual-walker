@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-import requests
 from fastmcp.client import Client
 
 from mcp_manual_walker import config
@@ -16,7 +15,7 @@ from mcp_manual_walker.main import (
 
 
 @pytest.fixture(scope="function")
-async def test_client(tmp_path: Path, monkeypatch):
+async def test_client(tmp_path: Path, monkeypatch, dummy_pdf_factory):
     """
     A comprehensive fixture for API integration testing. It sets up a temporary
     environment with a dummy PDF, a test database, and a cache directory.
@@ -29,17 +28,26 @@ async def test_client(tmp_path: Path, monkeypatch):
     pdf_dir.mkdir()
     db_dir.mkdir()
     cache_dir.mkdir()
-    # Clear the cache directory before each test
-    for item in cache_dir.iterdir():
-        if item.is_file():
-            item.unlink()
 
-    # 2. Download the reference PDF
-    pdf_url = "https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf"
-    pdf_path = pdf_dir / "PDF32000_2008.pdf"
-    response = requests.get(pdf_url)
-    with open(pdf_path, "wb") as f:
-        f.write(response.content)
+    # 2. Create a dummy PDF for testing
+    pdf_path = pdf_dir / "dummy_manual.pdf"
+    dummy_pdf_factory(
+        path=pdf_path,
+        pages_content={
+            1: "Content for page 1",
+            2: "Content for page 2",
+            3: "Content for page 3",
+            4: "Content for page 4",
+            5: "Content for page 5",
+        },
+        bookmarks={
+            "Chapter 1": (1, None),
+            "Section 1.1": (2, "Chapter 1"),
+            "Chapter 2": (3, None),
+            "Section 2.1": (4, "Chapter 2"),
+            "Section 2.2": (5, "Chapter 2"),
+        },
+    )
 
     # 3. Configure app settings to use temporary paths
     monkeypatch.setattr(config.settings, "PDF_ROOT_DIR", pdf_dir)
@@ -47,7 +55,6 @@ async def test_client(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(config.settings, "CACHE_DIR", cache_dir)
 
     # 4. The app's lifespan manager will handle init_db and sync_database.
-    #    We just need to yield the client.
     # 5. Yield an in-memory client
     async with Client(app) as client:
         yield client
@@ -67,8 +74,7 @@ async def test_e2e_workflow(test_client: Client):
     assert isinstance(manuals, list)
     assert len(manuals) == 1
     manual = manuals[0]
-    assert manual["file_name"] == "PDF32000_2008.pdf"
-    assert manual["document_title"] == "PDF32000.book"
+    assert manual["file_name"] == "dummy_manual.pdf"
     manual_id = manual["id"]
 
     # 2. Get manual metadata
@@ -77,31 +83,25 @@ async def test_e2e_workflow(test_client: Client):
     assert metadata["id"] == manual_id
     assert "table_of_contents" in metadata
     toc = metadata["table_of_contents"]
-    assert len(toc) > 1
+    assert len(toc) == 2  # Chapter 1 and Chapter 2
 
     # Find a specific bookmark to test
-    # Let's find "1.1 Introduction"
-    intro_bookmark = None
-    for item in toc:
-        if "Introduction" in item["title"]:
-            intro_bookmark = item
-            break
-
-    assert intro_bookmark is not None, "Could not find 'Introduction' bookmark"
-    bookmark_id = intro_bookmark["id"]
-
+    chapter1 = toc[0]
+    assert chapter1["title"] == "Chapter 1"
+    assert len(chapter1["children"]) == 1
+    section1_1 = chapter1["children"][0]
+    assert section1_1["title"] == "Section 1.1"
+    bookmark_id = section1_1["id"]
 
     # 3. Get markdown content for a specific bookmark
     result = await test_client.call_tool("get_markdown_content", {"bookmark_id": bookmark_id})
     content = result.structured_content['result']
     assert isinstance(content, str)
-    # Since markitdown adds a title, we check if it's in the content
-    assert "Introduction" in content
-    assert len(content) > 100
+    assert content  # Check that the content is not empty
 
 
 @pytest.mark.asyncio
-async def test_delete_orphaned_cache(tmp_path: Path, monkeypatch):
+async def test_delete_orphaned_cache(tmp_path: Path, monkeypatch, dummy_pdf_factory):
     """
     Tests that orphaned cache files are deleted when the source PDF is removed.
     """
@@ -113,12 +113,13 @@ async def test_delete_orphaned_cache(tmp_path: Path, monkeypatch):
     db_dir.mkdir()
     cache_dir.mkdir()
 
-    # 2. Download the reference PDF
-    pdf_url = "https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf"
-    pdf_path = pdf_dir / "PDF32000_2008.pdf"
-    response = requests.get(pdf_url)
-    with open(pdf_path, "wb") as f:
-        f.write(response.content)
+    # 2. Create a dummy PDF
+    pdf_path = pdf_dir / "dummy_manual.pdf"
+    dummy_pdf_factory(
+        path=pdf_path,
+        pages_content={1: "Page 1"},
+        bookmarks={"Chapter 1": (1, None)}
+    )
 
     # 3. Configure settings
     monkeypatch.setattr(config.settings, "PDF_ROOT_DIR", pdf_dir)
@@ -134,13 +135,7 @@ async def test_delete_orphaned_cache(tmp_path: Path, monkeypatch):
     manual_id = manuals[0]['id']
     metadata = get_manual_metadata.fn(manual_id)
     toc = metadata['table_of_contents']
-    scope_bookmark = None
-    for item in toc:
-        if "Scope" in item["title"]:
-            scope_bookmark = item
-            break
-    assert scope_bookmark is not None, "Could not find 'Scope' bookmark"
-    bookmark_id = scope_bookmark['id']
+    bookmark_id = toc[0]['id']
 
     # 6. Create a cache file
     get_markdown_content.fn(bookmark_id)

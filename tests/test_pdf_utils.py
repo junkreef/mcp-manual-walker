@@ -2,7 +2,6 @@ import hashlib
 from pathlib import Path
 
 import pytest
-from pypdf import PdfWriter
 
 from mcp_manual_walker.pdf_utils import (
     calculate_file_hash,
@@ -11,54 +10,35 @@ from mcp_manual_walker.pdf_utils import (
 
 
 @pytest.fixture(scope="session")
-def dummy_pdf_path(tmpdir_factory) -> Path:
+def pdf_for_utils_test(tmpdir_factory, dummy_pdf_factory):
     """
-    Creates a dummy PDF file with metadata and bookmarks for testing.
-    This fixture has a 'session' scope, so it runs only once per test session.
+    Creates a specific dummy PDF for testing the PDF utils, with metadata and bookmarks.
     """
-    pdf_path = Path(tmpdir_factory.mktemp("data").join("dummy_manual.pdf"))
-    writer = PdfWriter()
-
-    # Add a blank page to make it a valid PDF
-    writer.add_blank_page(width=612, height=792)  # Standard letter size
-
-    # Add document metadata
-    writer.add_metadata(
-        {
-            "/Title": "Dummy Test Manual",
-            "/Author": "Test Author",
-        }
+    pdf_path = Path(tmpdir_factory.mktemp("data").join("utils_test_manual.pdf"))
+    dummy_pdf_factory(
+        path=pdf_path,
+        pages_content={1: "This is a test page."},
+        metadata={"/Title": "Dummy Test Manual"},
+        bookmarks={
+            "Chapter 1: Introduction": (1, None),
+            "Section 1.1: Overview": (1, "Chapter 1: Introduction"),
+            "Section 1.2: Details": (1, "Chapter 1: Introduction"),
+            "Chapter 2: Advanced Topics": (1, None),
+        },
     )
-
-    # Add hierarchical bookmarks
-    parent_bookmark = writer.add_outline_item(
-        title="Chapter 1: Introduction", page_number=0
-    )
-    writer.add_outline_item(
-        title="Section 1.1: Overview", page_number=0, parent=parent_bookmark
-    )
-    writer.add_outline_item(
-        title="Section 1.2: Details", page_number=0, parent=parent_bookmark
-    )
-    writer.add_outline_item(title="Chapter 2: Advanced Topics", page_number=0)
-
-    # Write the PDF to a file
-    with open(pdf_path, "wb") as f:
-        writer.write(f)
-
     return pdf_path
 
 
-def test_calculate_file_hash(dummy_pdf_path: Path):
+def test_calculate_file_hash(pdf_for_utils_test: Path):
     """
     Tests that calculate_file_hash returns the correct SHA256 hash for a given file.
     """
     # Calculate hash using the utility function
-    file_hash = calculate_file_hash(dummy_pdf_path)
+    file_hash = calculate_file_hash(pdf_for_utils_test)
 
     # Calculate hash manually for verification
     hasher = hashlib.sha256()
-    with open(dummy_pdf_path, "rb") as f:
+    with open(pdf_for_utils_test, "rb") as f:
         buf = f.read()
         hasher.update(buf)
     expected_hash = hasher.hexdigest()
@@ -68,11 +48,11 @@ def test_calculate_file_hash(dummy_pdf_path: Path):
     assert len(file_hash) == 64  # SHA256 hashes are 64 hex characters
 
 
-def test_extract_pdf_metadata(dummy_pdf_path: Path):
+def test_extract_pdf_metadata(pdf_for_utils_test: Path):
     """
     Tests the extraction of metadata and bookmarks from a PDF file.
     """
-    pdf_data = extract_pdf_metadata(dummy_pdf_path)
+    pdf_data = extract_pdf_metadata(pdf_for_utils_test)
 
     # Verify document title
     assert pdf_data is not None
