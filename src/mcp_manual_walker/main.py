@@ -242,20 +242,21 @@ def get_markdown_content(bookmark_id: str) -> str:
         pdf_path = settings.PDF_ROOT_DIR.resolve() / manual.relative_path
         start_page = bookmark.page_num
 
-        # Find the next bookmark to determine the end page.
+        # Find the next bookmark at the same or higher level to determine the end page.
         next_bookmark = (
             db.query(Bookmark)
             .filter(
                 Bookmark.manual_id == manual.id,
                 Bookmark.ordering > bookmark.ordering,
+                Bookmark.level <= bookmark.level,
             )
             .order_by(Bookmark.ordering)
             .first()
         )
 
         end_page = (
-            next_bookmark.page_num - 1
-            if next_bookmark and next_bookmark.page_num > start_page
+            max(start_page, next_bookmark.page_num - 1)
+            if next_bookmark
             else None
         )
 
