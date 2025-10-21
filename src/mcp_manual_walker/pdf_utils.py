@@ -119,29 +119,33 @@ def create_temp_pdf_from_page_range(
 ) -> Optional[Path]:
     """
     Creates a temporary PDF file from a given page range (inclusive).
+    If end_page is None, it reads until the end of the document.
     Page numbers are 1-based.
     Returns the Path to the temporary file, or None on failure.
     """
-    if end_page is None or end_page < start_page:
-        end_page = start_page
-
     try:
         reader = PdfReader(str(file_path))
         writer = PdfWriter()
         num_pages = len(reader.pages)
 
-        # Validate page range
         start_idx = start_page - 1
-        end_idx = end_page - 1
 
+        # If end_page is not specified, use the last page of the document.
+        if end_page is None:
+            end_idx = num_pages - 1
+        else:
+            end_idx = end_page - 1
+
+        # Validate start page
         if not (0 <= start_idx < num_pages):
             logger.error(
                 f"Start page {start_page} is out of bounds for PDF with {num_pages} pages."
             )
             return None
 
-        # Add pages to the writer
-        for i in range(start_idx, min(end_idx, num_pages - 1) + 1):
+        # Add pages to the writer, ensuring the end index is within bounds.
+        end_idx = min(end_idx, num_pages - 1)
+        for i in range(start_idx, end_idx + 1):
             writer.add_page(reader.pages[i])
 
         # Create a temporary file

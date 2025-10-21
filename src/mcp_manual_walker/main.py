@@ -255,8 +255,8 @@ def get_markdown_content(bookmark_id: str) -> str:
         )
 
         end_page = (
-            next_bookmark.page_num - 1
-            if next_bookmark and next_bookmark.page_num > start_page
+            max(start_page, next_bookmark.page_num - 1)
+            if next_bookmark
             else None
         )
 
