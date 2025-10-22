@@ -3,6 +3,7 @@ name = "mcp-manual-walker"
 version = "0.1.0"
 description = "An MCP server to bridge the information gap between AI agents and PDF manuals."
 authors = [
+    { name = "Junpei Kishi", email = "junkreef@longarch.net" },
     { name = "Jules", email = "jules@example.com" },
 ]
 requires-python = ">=3.11"
