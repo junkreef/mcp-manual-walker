@@ -6,7 +6,7 @@ This server scans a directory for PDF files, extracts their bookmarks, and provi
 
 ## ✨ About The Project
 
-This project was created to solve a simple problem: AI Agents are great, but they struggle with large, unstructured data like PDF manuals. This server acts as a "librarian" for the AI, organizing the information in the manuals and and making it easy for the AI to find what it needs.
+This project was created to solve a simple problem: AI Agents are great, but they struggle with large, unstructured data like PDF manuals. This server acts as a "librarian" for the AI, organizing the information in the manuals and making it easy for the AI to find what it needs.
 
 The server will:
 
@@ -24,6 +24,7 @@ The server will:
 *   [markitdown](https://pypi.org/project/markitdown/)
 *   [SQLAlchemy](https://www.sqlalchemy.org/)
 *   [Pydantic](https://pydantic-docs.helpmanual.io/)
+*   [Pydantic-Settings](https://docs.pydantic.dev/latest/concepts/settings/)
 
 ## 🚀 Getting Started
 
