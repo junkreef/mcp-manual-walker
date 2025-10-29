@@ -1,17 +1,12 @@
+import shutil
 from pathlib import Path
 
 import pytest
 from fastmcp.client import Client
 
 from mcp_manual_walker import config
-from mcp_manual_walker.database import init_db
-from mcp_manual_walker.main import (
-    app,
-    get_manual_metadata,
-    get_markdown_content,
-    list_manuals,
-    sync_database,
-)
+from mcp_manual_walker.database import SessionLocal
+from mcp_manual_walker.main import app, sync_database
 
 
 @pytest.fixture(scope="function")
@@ -29,23 +24,18 @@ async def test_client(tmp_path: Path, monkeypatch, dummy_pdf_factory):
     db_dir.mkdir()
     cache_dir.mkdir()
 
-    # 2. Create a dummy PDF for testing
+    # 2. Create a dummy PDF with enough pages for pagination testing
     pdf_path = pdf_dir / "dummy_manual.pdf"
+    pages_content = {i: f"Content for page {i}" for i in range(1, 31)}
     dummy_pdf_factory(
         path=pdf_path,
-        pages_content={
-            1: "Content for page 1",
-            2: "Content for page 2",
-            3: "Content for page 3",
-            4: "Content for page 4",
-            5: "Content for page 5",
-        },
+        pages_content=pages_content,
         bookmarks={
-            "Chapter 1": (1, None),
+            "Chapter 1": (1, None),      # Spans pages 1-14
             "Section 1.1": (2, "Chapter 1"),
-            "Chapter 2": (3, None),
-            "Section 2.1": (4, "Chapter 2"),
-            "Section 2.2": (5, "Chapter 2"),
+            "Chapter 2": (15, None),     # Spans pages 15-24
+            "Section 2.1": (16, "Chapter 2"),
+            "Chapter 3": (25, None),     # Spans pages 25-30
         },
     )
 
@@ -53,6 +43,7 @@ async def test_client(tmp_path: Path, monkeypatch, dummy_pdf_factory):
     monkeypatch.setattr(config.settings, "PDF_ROOT_DIR", pdf_dir)
     monkeypatch.setattr(config.settings, "DB_FILE_PATH", db_dir / "test.db")
     monkeypatch.setattr(config.settings, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(config.settings, "MAX_PAGES_PER_REQUEST", 5) # For predictable tests
 
     # 4. The app's lifespan manager will handle init_db and sync_database.
     # 5. Yield an in-memory client
@@ -63,10 +54,7 @@ async def test_client(tmp_path: Path, monkeypatch, dummy_pdf_factory):
 @pytest.mark.asyncio
 async def test_e2e_workflow(test_client: Client):
     """
-    Tests the full end-to-end workflow:
-    1. list_manuals()
-    2. get_manual_metadata()
-    3. get_markdown_content()
+    Tests the basic end-to-end workflow with the new paginated response.
     """
     # 1. List manuals
     result = await test_client.call_tool("list_manuals")
@@ -78,38 +66,87 @@ async def test_e2e_workflow(test_client: Client):
     manual_id = manual["id"]
 
     # 2. Get manual metadata
-    result = await test_client.call_tool(
-        "get_manual_metadata", {"manual_id": manual_id}
-    )
+    result = await test_client.call_tool("get_manual_metadata", {"manual_id": manual_id})
     metadata = result.structured_content
     assert metadata["id"] == manual_id
-    assert "table_of_contents" in metadata
     toc = metadata["table_of_contents"]
-    assert len(toc) == 2  # Chapter 1 and Chapter 2
+    bookmark_id = toc[0]["children"][0]["id"]  # Section 1.1
 
-    # Find a specific bookmark to test
-    chapter1 = toc[0]
-    assert chapter1["title"] == "Chapter 1"
-    assert len(chapter1["children"]) == 1
-    section1_1 = chapter1["children"][0]
-    assert section1_1["title"] == "Section 1.1"
-    bookmark_id = section1_1["id"]
+    # 3. Get markdown content (first page)
+    result = await test_client.call_tool("get_markdown_content", {"bookmark_id": bookmark_id})
+    content_response = result.structured_content
+    assert isinstance(content_response, dict)
+    assert "markdown_content" in content_response
+    assert "Content for page 2" in content_response["markdown_content"]
 
-    # 3. Get markdown content for a specific bookmark
+
+@pytest.mark.asyncio
+async def test_pagination_workflow(test_client: Client):
+    """
+    Tests the new pagination feature thoroughly.
+    """
+    # 1. Get the bookmark ID for Chapter 1, which spans 14 pages.
+    result = await test_client.call_tool("list_manuals")
+    manual_id = result.structured_content['result'][0]["id"]
+    result = await test_client.call_tool("get_manual_metadata", {"manual_id": manual_id})
+    chapter1_bookmark_id = result.structured_content["table_of_contents"][0]["id"]
+
+    # 2. First request: should return the first 5 pages (due to MAX_PAGES_PER_REQUEST)
+    result = await test_client.call_tool("get_markdown_content", {"bookmark_id": chapter1_bookmark_id})
+    res1 = result.structured_content
+    assert res1["bookmark_total_pages"] == 14
+    assert res1["page_offset"] == 0
+    assert res1["page_limit"] == 5
+    assert res1["next_page_offset"] == 5
+    assert "Content for page 1" in res1["markdown_content"]
+    assert "Content for page 5" in res1["markdown_content"]
+    assert "Content for page 6" not in res1["markdown_content"]
+
+    # 3. Second request: use offset to get the next chunk
     result = await test_client.call_tool(
-        "get_markdown_content", {"bookmark_id": bookmark_id}
+        "get_markdown_content", {"bookmark_id": chapter1_bookmark_id, "page_offset": 5}
     )
-    content = result.structured_content['result']
-    assert isinstance(content, str)
-    assert content  # Check that the content is not empty
+    res2 = result.structured_content
+    assert res2["page_offset"] == 5
+    assert res2["page_limit"] == 5
+    assert res2["next_page_offset"] == 10
+    assert "Content for page 6" in res2["markdown_content"]
+    assert "Content for page 10" in res2["markdown_content"]
+    assert "Content for page 11" not in res2["markdown_content"]
+
+    # 4. Third request: get the last few pages
+    result = await test_client.call_tool(
+        "get_markdown_content", {"bookmark_id": chapter1_bookmark_id, "page_offset": 10}
+    )
+    res3 = result.structured_content
+    assert res3["page_offset"] == 10
+    assert res3["page_limit"] == 4 # Only 4 pages left
+    assert res3["next_page_offset"] is None # This is the last chunk
+    assert "Content for page 11" in res3["markdown_content"]
+    assert "Content for page 14" in res3["markdown_content"]
+
+    # 5. Request with a specific, smaller page_limit
+    result = await test_client.call_tool(
+        "get_markdown_content", {"bookmark_id": chapter1_bookmark_id, "page_limit": 2}
+    )
+    res4 = result.structured_content
+    assert res4["page_limit"] == 2
+    assert res4["next_page_offset"] == 2
+
+    # 6. Out of bounds request
+    result = await test_client.call_tool(
+        "get_markdown_content", {"bookmark_id": chapter1_bookmark_id, "page_offset": 99}
+    )
+    res5 = result.structured_content
+    assert "error" in res5
+    assert "out of bounds" in res5["error"]
 
 
 @pytest.mark.asyncio
 async def test_delete_orphaned_cache(tmp_path: Path, monkeypatch, dummy_pdf_factory):
     """
-    Tests that orphaned cache files are deleted when the source PDF is removed.
+    Tests that the orphaned cache directory is deleted when the source PDF is removed.
     """
-    # 1. Create a temporary environment
     pdf_dir = tmp_path / "pdfs"
     db_dir = tmp_path / "db"
     cache_dir = tmp_path / "cache"
@@ -117,42 +154,33 @@ async def test_delete_orphaned_cache(tmp_path: Path, monkeypatch, dummy_pdf_fact
     db_dir.mkdir()
     cache_dir.mkdir()
 
-    # 2. Create a dummy PDF
     pdf_path = pdf_dir / "dummy_manual.pdf"
-    dummy_pdf_factory(
-        path=pdf_path,
-        pages_content={1: "Page 1"},
-        bookmarks={"Chapter 1": (1, None)}
-    )
+    dummy_pdf_factory(path=pdf_path, pages_content={1: "Page 1"}, bookmarks={"Ch1": (1, None)})
 
-    # 3. Configure settings
     monkeypatch.setattr(config.settings, "PDF_ROOT_DIR", pdf_dir)
     monkeypatch.setattr(config.settings, "DB_FILE_PATH", db_dir / "test.db")
     monkeypatch.setattr(config.settings, "CACHE_DIR", cache_dir)
 
-    # 4. Initialize app and database
-    init_db()
-    sync_database()
+    # Run sync and get IDs
+    async with Client(app) as client:
+        result = await client.call_tool("list_manuals")
+        manual_id = result.structured_content['result'][0]["id"]
+        result = await client.call_tool("get_manual_metadata", {"manual_id": manual_id})
+        bookmark_id = result.structured_content["table_of_contents"][0]["id"]
 
-    # 5. Get manual and bookmark IDs
-    manuals = list_manuals.fn()
-    manual_id = manuals[0]['id']
-    metadata = get_manual_metadata.fn(manual_id)
-    toc = metadata['table_of_contents']
-    bookmark_id = toc[0]['id']
+        # Create a cache entry and directory
+        await client.call_tool("get_markdown_content", {"bookmark_id": bookmark_id})
+    
+    manual_cache_dir = cache_dir / manual_id
+    assert manual_cache_dir.exists()
+    assert manual_cache_dir.is_dir()
+    assert len(list(manual_cache_dir.iterdir())) > 0
 
-    # 6. Create a cache file
-    get_markdown_content.fn(bookmark_id)
-    cache_files = list(cache_dir.glob("*.md"))
-    assert len(cache_files) == 1
-    cache_file_path = cache_files[0]
-    assert cache_file_path.exists()
-
-    # 7. Delete the source PDF
+    # Delete the source PDF
     pdf_path.unlink()
 
-    # 8. Run sync_database again to trigger the cleanup
+    # Run sync_database again to trigger the cleanup
     sync_database()
 
-    # 9. Verify the cache file has been deleted
-    assert not cache_file_path.exists()
+    # Verify the cache directory has been deleted
+    assert not manual_cache_dir.exists()

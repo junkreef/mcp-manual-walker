@@ -1,11 +1,17 @@
+import time
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from mcp_manual_walker.cache_utils import create_cache, find_valid_cache
+from mcp_manual_walker import config
+from mcp_manual_walker.cache_utils import (
+    batch_update_last_accessed,
+    create_page_cache,
+    find_page_cache,
+    get_cache_filepath,
+)
 from mcp_manual_walker.models import Base, Bookmark, Cache, Manual
 
 
@@ -13,7 +19,6 @@ from mcp_manual_walker.models import Base, Bookmark, Cache, Manual
 def db_session():
     """
     Fixture to set up an in-memory SQLite database for each test function.
-    This ensures that tests are isolated and don't interfere with each other.
     """
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -25,9 +30,9 @@ def db_session():
 
 
 @pytest.fixture(scope="function")
-def test_data(db_session):
+def test_manual(db_session):
     """
-    Populates the database with a manual and a bookmark for testing.
+    Populates the database with a manual for testing.
     """
     manual = Manual(
         id="manual-1",
@@ -35,140 +40,119 @@ def test_data(db_session):
         document_title="Test Manual",
         relative_path="test.pdf",
         file_hash="hash-123",
-    )
-    bookmark = Bookmark(
-        id="bookmark-1",
-        manual_id=manual.id,
-        ordering=1,
-        title="Chapter 1",
-        level=1,
-        page_num=1,
+        page_count=10,
     )
     db_session.add(manual)
-    db_session.add(bookmark)
     db_session.commit()
-    return manual, bookmark
+    db_session.refresh(manual)
+    return manual
 
 
-def test_cascade_delete(db_session, test_data, tmp_path):
+def test_cascade_delete(db_session, test_manual):
     """
-    Tests that deleting a Manual also deletes its associated Bookmarks and Caches.
-    This verifies the `cascade="all, delete-orphan"` setting in the models.
+    Tests that deleting a Manual also deletes its associated Cache entries.
     """
-    manual, bookmark = test_data
-    manual_id = manual.id
-    bookmark_id = bookmark.id
+    manual = test_manual
+    page_to_cache = 1
 
-    # Create a dummy cache entry to test cascade deletion
-    cache_path = tmp_path / "test_cache.md"
-    cache_path.write_text("cached content")
-
+    # Create a dummy cache entry
     cache_entry = Cache(
-        id="cache-1",
-        bookmark_id=bookmark_id,
+        manual_id=manual.id,
+        page_num=page_to_cache,
         manual_hash=manual.file_hash,
-        markdown_file_path=str(cache_path),
     )
     db_session.add(cache_entry)
     db_session.commit()
 
-    # Ensure everything is in the database before deletion
-    assert db_session.query(Manual).filter_by(id=manual_id).first() is not None
-    assert db_session.query(Bookmark).filter_by(id=bookmark_id).first() is not None
-    assert db_session.query(Cache).filter_by(id="cache-1").first() is not None
+    assert db_session.query(Cache).filter_by(manual_id=manual.id).first() is not None
 
     # Delete the manual
     db_session.delete(manual)
     db_session.commit()
 
-    # Verify that the manual and all its children are deleted
-    assert db_session.query(Manual).filter_by(id=manual_id).first() is None
-    assert db_session.query(Bookmark).filter_by(id=bookmark_id).first() is None
-    assert db_session.query(Cache).filter_by(id="cache-1").first() is None
+    # Verify that the cache entry is also deleted
+    assert db_session.query(Cache).filter_by(manual_id=manual.id).first() is None
 
 
-def test_find_valid_cache_hit(db_session, test_data, tmp_path):
+def test_find_page_cache_hit(db_session, test_manual, tmp_path, monkeypatch):
     """
-    Tests a cache hit scenario where a valid cache entry exists.
+    Tests a cache hit scenario for find_page_cache.
     """
-    manual, bookmark = test_data
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    cache_file = cache_dir / f"{uuid4()}.md"
-    expected_content = "This is cached content."
-    cache_file.write_text(expected_content)
+    monkeypatch.setattr(config.settings, "CACHE_DIR", tmp_path)
+    manual = test_manual
+    page_num = 3
+    expected_content = "This is cached content for page 3."
 
-    cache_entry = Cache(
-        bookmark_id=bookmark.id,
-        manual_hash=manual.file_hash,
-        markdown_file_path=str(cache_file),
-    )
-    bookmark.cache_entry = cache_entry  # Associate cache with bookmark
-    db_session.add(cache_entry)
+    # Manually create cache file and DB entry
+    cache_path = get_cache_filepath(manual.id, page_num)
+    cache_path.write_text(expected_content)
+    db_session.add(Cache(manual_id=manual.id, page_num=page_num, manual_hash=manual.file_hash))
     db_session.commit()
 
-    # The bookmark object needs to be refreshed to load the new relationship
-    db_session.refresh(bookmark)
-
-    # find_valid_cache should return the content
-    content = find_valid_cache(bookmark, db_session)
+    content = find_page_cache(manual, page_num, db_session)
     assert content == expected_content
 
 
-def test_find_valid_cache_miss_hash_mismatch(db_session, test_data, tmp_path):
+def test_find_page_cache_miss_hash_mismatch(db_session, test_manual, tmp_path, monkeypatch):
     """
-    Tests a cache miss scenario where the manual's hash has changed.
+    Tests a cache miss due to a hash mismatch.
     """
-    manual, bookmark = test_data
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    cache_file = cache_dir / f"{uuid4()}.md"
-    cache_file.write_text("outdated content")
-
-    cache_entry = Cache(
-        bookmark_id=bookmark.id,
-        manual_hash="old-hash-456",  # Different from the manual's current hash
-        markdown_file_path=str(cache_file),
-    )
-    bookmark.cache_entry = cache_entry
-    db_session.add(cache_entry)
-    db_session.commit()
-    db_session.refresh(bookmark)
-
-    # find_valid_cache should return None because the hash is invalid
-    content = find_valid_cache(bookmark, db_session)
-    assert content is None
-
-
-def test_find_valid_cache_miss_no_entry(db_session, test_data):
-    """
-    Tests a cache miss scenario where no cache entry exists for the bookmark.
-    """
-    manual, bookmark = test_data
-    content = find_valid_cache(bookmark, db_session)
-    assert content is None
-
-
-def test_create_cache(db_session, test_data, tmp_path, monkeypatch):
-    """
-    Tests the creation of a new cache entry.
-    """
-    manual, bookmark = test_data
-    content_to_cache = "Newly generated markdown content."
-
-    # Mock the settings to use the temporary directory
-    from mcp_manual_walker import config
     monkeypatch.setattr(config.settings, "CACHE_DIR", tmp_path)
+    manual = test_manual
+    page_num = 4
 
-    # Create the cache
-    create_cache(bookmark, content_to_cache, db_session)
+    # Create a cache entry with an old hash
+    db_session.add(Cache(manual_id=manual.id, page_num=page_num, manual_hash="old-hash-456"))
+    db_session.commit()
 
-    # Verify the cache entry in the database
-    cache_entry = db_session.query(Cache).filter_by(bookmark_id=bookmark.id).one()
+    content = find_page_cache(manual, page_num, db_session)
+    assert content is None
+
+
+def test_create_page_cache(db_session, test_manual, tmp_path, monkeypatch):
+    """
+    Tests the creation of a new page cache entry.
+    """
+    monkeypatch.setattr(config.settings, "CACHE_DIR", tmp_path)
+    manual = test_manual
+    page_num = 5
+    content_to_cache = "Content for page 5."
+
+    create_page_cache(manual, page_num, content_to_cache, db_session)
+
+    # Verify DB entry
+    cache_entry = db_session.query(Cache).filter_by(manual_id=manual.id, page_num=page_num).one()
     assert cache_entry is not None
     assert cache_entry.manual_hash == manual.file_hash
-    assert Path(cache_entry.markdown_file_path).name.endswith(".md")
 
-    # Verify the content of the cache file
-    with open(cache_entry.markdown_file_path, "r") as f:
-        assert f.read() == content_to_cache
+    # Verify file content
+    cache_path = get_cache_filepath(manual.id, page_num)
+    assert cache_path.read_text() == content_to_cache
+
+
+def test_batch_update_last_accessed(db_session, test_manual):
+    """
+    Tests that last_accessed_at is updated in a batch.
+    """
+    manual = test_manual
+    pages_to_update = [1, 2, 3]
+
+    # Create initial entries
+    for page_num in pages_to_update:
+        db_session.add(Cache(manual_id=manual.id, page_num=page_num, manual_hash=manual.file_hash))
+    db_session.commit()
+
+    # Get initial timestamps
+    initial_entries = db_session.query(Cache).filter(Cache.page_num.in_(pages_to_update)).all()
+    initial_timestamp = initial_entries[0].last_accessed_at
+
+    # Wait a bit to ensure the new timestamp is different
+    time.sleep(0.01)
+
+    # Run batch update
+    batch_update_last_accessed(manual.id, pages_to_update, db_session)
+
+    # Verify timestamps are updated
+    updated_entries = db_session.query(Cache).filter(Cache.page_num.in_(pages_to_update)).all()
+    for entry in updated_entries:
+        assert entry.last_accessed_at > initial_timestamp
