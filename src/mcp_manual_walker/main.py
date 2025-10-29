@@ -299,6 +299,9 @@ def get_markdown_content(
         # 5. Batch update access times
         batch_update_last_accessed(manual.id, processed_page_nums, db)
 
+        # All DB operations for the chunk are complete, commit them.
+        db.commit()
+
         # 6. Construct the response
         final_content = "\n\n---\n\n".join(markdown_parts)
         actual_limit = len(processed_page_nums)
@@ -315,6 +318,7 @@ def get_markdown_content(
         }
 
     except Exception as e:
+        db.rollback()
         logger.exception(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
         return {"error": "An internal error occurred while fetching content."}
     finally:
