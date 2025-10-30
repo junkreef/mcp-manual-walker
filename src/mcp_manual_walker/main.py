@@ -1,16 +1,22 @@
 import logging
 import os
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastmcp import FastMCP
 from markitdown import MarkItDown
 from sqlalchemy.orm import Session, joinedload
 
-from .cache_utils import create_cache, find_valid_cache
+from .cache_utils import (
+    batch_update_last_accessed,
+    create_page_cache,
+    find_page_cache,
+)
 from .config import settings
 from .database import SessionLocal, init_db
-from .models import Bookmark, Cache, Manual
+from .models import Bookmark, Manual
 from .pdf_utils import (
     calculate_file_hash,
     create_temp_pdf_from_page_range,
@@ -50,9 +56,13 @@ def sync_database():
                 continue
 
             if relative_path not in db_paths or db_manuals[relative_path].file_hash != file_hash:
-                if relative_path in db_paths:
+                manual_to_delete = db_manuals.get(relative_path)
+                if manual_to_delete:
                     logger.info(f"'{relative_path}' has been updated. Re-processing.")
-                    db.delete(db_manuals[relative_path])
+                    # Delete old cache files on disk first
+                    shutil.rmtree(settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True)
+                    # Deletion of the manual object will cascade in the DB
+                    db.delete(manual_to_delete)
                     db.commit()
                 else:
                     logger.info(f"New manual found: '{relative_path}'")
@@ -67,6 +77,7 @@ def sync_database():
                     document_title=pdf_data["document_title"],
                     relative_path=relative_path,
                     file_hash=file_hash,
+                    page_count=pdf_data["page_count"],
                 )
                 db.add(new_manual)
                 db.flush()
@@ -95,29 +106,9 @@ def sync_database():
         for path_to_delete in deleted_paths:
             manual_to_delete = db_manuals[path_to_delete]
             logger.info(f"'{path_to_delete}' has been removed. Deleting from database.")
-
-            # Query for all cache entries related to the manual being deleted
-            cache_files_to_delete = (
-                db.query(Cache.markdown_file_path)
-                .join(Bookmark)
-                .filter(Bookmark.manual_id == manual_to_delete.id)
-                .all()
-            )
-
-            # Delete the physical cache files
-            for cache_file in cache_files_to_delete:
-                try:
-                    file_path = Path(cache_file[0])
-                    if file_path.is_file():
-                        os.remove(file_path)
-                        logger.info(f"Deleted orphaned cache file: {file_path}")
-                except FileNotFoundError:
-                    logger.warning(
-                        f"Cache file not found, skipping deletion: {cache_file[0]}"
-                    )
-                except Exception as e:
-                    logger.error(f"Error deleting cache file {cache_file[0]}: {e}")
-
+            # Delete the physical cache directory for the manual
+            shutil.rmtree(settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True)
+            # Deletion of the manual object will cascade in the DB
             db.delete(manual_to_delete)
 
         db.commit()
@@ -217,32 +208,27 @@ def get_manual_metadata(manual_id: str) -> dict:
 
 
 @app.tool()
-def get_markdown_content(bookmark_id: str) -> str:
+def get_markdown_content(
+    bookmark_id: str, page_offset: int = 0, page_limit: Optional[int] = None
+) -> dict:
     """
-    Returns the Markdown content for a specific bookmark.
-    Uses a cache to speed up repeated requests.
+    Returns the Markdown content for a specific bookmark, with pagination.
     """
     db: Session = SessionLocal()
     markdown_converter = MarkItDown()
     temp_pdf_path: Path | None = None
     try:
         bookmark = (
-            db.query(Bookmark)
-            .filter(Bookmark.id == bookmark_id)
-            .options(joinedload(Bookmark.manual), joinedload(Bookmark.cache_entry))
-            .first()
+            db.query(Bookmark).filter(Bookmark.id == bookmark_id).options(joinedload(Bookmark.manual)).first()
         )
         if not bookmark:
-            return f"Error: Bookmark with id '{bookmark_id}' not found."
-
-        if cached_content := find_valid_cache(bookmark, db):
-            return cached_content
+            return {"error": f"Bookmark with id '{bookmark_id}' not found."}
 
         manual = bookmark.manual
         pdf_path = settings.PDF_ROOT_DIR.resolve() / manual.relative_path
-        start_page = bookmark.page_num
 
-        # Find the next bookmark at the same or higher level to determine the end page.
+        # 1. Determine the full page range of the bookmark
+        bookmark_start_page = bookmark.page_num
         next_bookmark = (
             db.query(Bookmark)
             .filter(
@@ -254,38 +240,88 @@ def get_markdown_content(bookmark_id: str) -> str:
             .first()
         )
 
-        end_page = (
-            max(start_page, next_bookmark.page_num - 1)
-            if next_bookmark
-            else None
-        )
+        if next_bookmark:
+            bookmark_end_page = next_bookmark.page_num - 1
+        else:
+            # If it's the last bookmark, go to the end of the PDF
+            bookmark_end_page = manual.page_count
+        
+        bookmark_total_pages = (bookmark_end_page - bookmark_start_page) + 1
+        if bookmark_total_pages <= 0:
+            return {
+                "markdown_content": "",
+                "bookmark_total_pages": 0,
+                "page_offset": 0,
+                "page_limit": 0,
+                "next_page_offset": None,
+            }
 
-        logger.info(
-            f"Cache miss for bookmark '{bookmark.title}'. "
-            f"Creating temporary PDF for pages {start_page}-{end_page or 'end'} from '{pdf_path.name}'."
-        )
+        # 2. Determine the processing chunk based on limits
+        limit = min(page_limit or settings.MAX_PAGES_PER_REQUEST, settings.MAX_PAGES_PER_REQUEST)
+        
+        if page_offset >= bookmark_total_pages:
+            return {"error": "page_offset is out of bounds."}
 
-        temp_pdf_path = create_temp_pdf_from_page_range(pdf_path, start_page, end_page)
-        if not temp_pdf_path:
-            return f"Error: Could not create temporary PDF for bookmark '{bookmark.title}'."
+        # 3. Calculate absolute page numbers for the chunk
+        chunk_start_page = bookmark_start_page + page_offset
+        chunk_end_page = min(chunk_start_page + limit - 1, bookmark_end_page)
+        
+        # 4. Process pages in the chunk
+        markdown_parts = []
+        processed_page_nums = []
+        for page_num in range(chunk_start_page, chunk_end_page + 1):
+            processed_page_nums.append(page_num)
+            cached_content = find_page_cache(manual, page_num, db)
+            if cached_content is not None:
+                markdown_parts.append(cached_content)
+                continue
 
-        markdown_content = markdown_converter.convert(str(temp_pdf_path))
-        if not markdown_content:
-            return f"Error: Failed to convert content for bookmark '{bookmark.title}' to Markdown."
+            # Cache miss: process the single page
+            logger.info(f"Cache miss for page {page_num} of '{manual.file_name}'. Processing.")
+            temp_pdf_path = create_temp_pdf_from_page_range(pdf_path, page_num, page_num)
+            if not temp_pdf_path:
+                error_msg = f"Page {page_num} could not be processed: failed to create temporary PDF."
+                logger.error(error_msg)
+                return {"error": error_msg}
 
-        create_cache(bookmark, markdown_content.markdown, db)
-        return markdown_content.markdown
+            try:
+                conversion_result = markdown_converter.convert(str(temp_pdf_path))
+                page_content = conversion_result.markdown if conversion_result else ""
+                if not page_content:
+                    logger.warning(f"Page {page_num} of '{manual.file_name}' converted to empty content.")
+                
+                markdown_parts.append(page_content)
+                create_page_cache(manual, page_num, page_content, db)
+            finally:
+                if os.path.exists(temp_pdf_path):
+                    os.remove(temp_pdf_path)
+
+        # 5. Batch update access times
+        batch_update_last_accessed(manual.id, processed_page_nums, db)
+
+        # All DB operations for the chunk are complete, commit them.
+        db.commit()
+
+        # 6. Construct the response
+        final_content = "\n\n---\n\n".join(markdown_parts)
+        actual_limit = len(processed_page_nums)
+        next_page_offset = page_offset + actual_limit
+        if next_page_offset >= bookmark_total_pages:
+            next_page_offset = None
+
+        return {
+            "markdown_content": final_content,
+            "bookmark_total_pages": bookmark_total_pages,
+            "page_offset": page_offset,
+            "page_limit": actual_limit,
+            "next_page_offset": next_page_offset,
+        }
 
     except Exception as e:
-        logger.error(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
-        return "Error: An internal error occurred while fetching content."
+        db.rollback()
+        logger.exception(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
+        return {"error": "An internal error occurred while fetching content."}
     finally:
-        if temp_pdf_path and os.path.exists(temp_pdf_path):
-            try:
-                os.remove(temp_pdf_path)
-                logger.info(f"Successfully removed temporary file: {temp_pdf_path}")
-            except OSError as e:
-                logger.error(f"Error removing temporary file {temp_pdf_path}: {e}")
         db.close()
 
 

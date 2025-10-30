@@ -31,13 +31,14 @@ def calculate_file_hash(file_path: Path) -> str:
 def extract_pdf_metadata(file_path: Path) -> Dict[str, Any]:
     """
     Extracts metadata and bookmarks from a PDF file.
-    Returns a dictionary with document title and a list of bookmarks.
+    Returns a dictionary with document title, a list of bookmarks, and page count.
     """
     try:
         reader = PdfReader(str(file_path))
 
         # Extract document title
         document_title = reader.metadata.title if reader.metadata and reader.metadata.title else None
+        page_count = len(reader.pages)
 
         # Extract bookmarks
         bookmarks = []
@@ -69,6 +70,7 @@ def extract_pdf_metadata(file_path: Path) -> Dict[str, Any]:
         return {
             "document_title": document_title,
             "bookmarks": bookmarks,
+            "page_count": page_count,
         }
 
     except PdfReadError as e:
