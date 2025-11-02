@@ -26,7 +26,7 @@ class Manual(Base):
     file_hash: Mapped[str] = Column(String, nullable=False)
     page_count: Mapped[int] = Column(Integer, nullable=False)
     updated_at: Mapped[datetime] = Column(
-        DateTime, default=datetime.now(UTC), onupdate=datetime.now(UTC)
+        DateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)
     )
 
     bookmarks: Mapped[List["Bookmark"]] = relationship("Bookmark", back_populates="manual", cascade="all, delete-orphan")
@@ -53,8 +53,8 @@ class Cache(Base):
     manual_id: Mapped[str] = Column(String(36), ForeignKey("manuals.id"), nullable=False)
     page_num: Mapped[int] = Column(Integer, nullable=False)
     manual_hash: Mapped[str] = Column(String, nullable=False)
-    created_at: Mapped[datetime] = Column(DateTime, default=datetime.now(UTC), nullable=False)
-    last_accessed_at: Mapped[datetime] = Column(DateTime, default=datetime.now(UTC), nullable=False)
+    created_at: Mapped[datetime] = Column(DateTime, default=lambda: datetime.now(UTC), nullable=False)
+    last_accessed_at: Mapped[datetime] = Column(DateTime, default=lambda: datetime.now(UTC), nullable=False)
 
     manual: Mapped["Manual"] = relationship("Manual", back_populates="cache_entries")
 
