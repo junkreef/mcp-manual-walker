@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from datetime import UTC
 
 from mcp_manual_walker import config
 from mcp_manual_walker.cache_utils import (
@@ -146,14 +145,13 @@ def test_batch_update_last_accessed(db_session, test_manual):
     # Get initial timestamps
     initial_entries = db_session.query(Cache).filter(Cache.page_num.in_(pages_to_update)).all()
     initial_timestamp = initial_entries[0].last_accessed_at
-    # Make initial_timestamp timezone-aware for comparison
-    initial_timestamp = initial_timestamp.replace(tzinfo=UTC)
 
     # Wait a bit to ensure the new timestamp is different
     time.sleep(0.01)
 
     # Run batch update
     batch_update_last_accessed(manual.id, pages_to_update, db_session)
+    db_session.commit()
 
     # Verify timestamps are updated
     updated_entries = db_session.query(Cache).filter(Cache.page_num.in_(pages_to_update)).all()
