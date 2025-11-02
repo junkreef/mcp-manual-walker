@@ -151,6 +151,7 @@ def test_batch_update_last_accessed(db_session, test_manual):
 
     # Run batch update
     batch_update_last_accessed(manual.id, pages_to_update, db_session)
+    db_session.commit()
 
     # Verify timestamps are updated
     updated_entries = db_session.query(Cache).filter(Cache.page_num.in_(pages_to_update)).all()

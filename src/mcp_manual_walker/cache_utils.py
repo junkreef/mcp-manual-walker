@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime, UTC
 import logging
 import os
 from pathlib import Path
@@ -55,7 +55,7 @@ def create_page_cache(manual: Manual, page_num: int, content: str, db: Session) 
     Does not commit the transaction; caller is responsible.
     """
     cache_filepath = get_cache_filepath(manual.id, page_num)
-    now = datetime.datetime.utcnow()
+    now = datetime.now(UTC)
 
     # Write the content to the cache file
     cache_filepath.write_text(content, encoding="utf-8")
@@ -85,7 +85,7 @@ def batch_update_last_accessed(manual_id: str, page_nums: List[int], db: Session
         update(Cache)
         .where(Cache.manual_id == manual_id)
         .where(Cache.page_num.in_(page_nums))
-        .values(last_accessed_at=datetime.datetime.utcnow())
+        .values(last_accessed_at=datetime.now(UTC))
     )
     db.execute(stmt)
     logger.debug(f"Updated last_accessed_at for {len(page_nums)} pages in manual {manual_id}.")
