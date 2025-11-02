@@ -6,7 +6,8 @@ from fastmcp.client import Client
 
 from mcp_manual_walker import config
 from mcp_manual_walker.database import SessionLocal
-from mcp_manual_walker.main import app, sync_database
+from mcp_manual_walker.main import app
+from mcp_manual_walker.sync import sync_database
 
 
 @pytest.fixture(scope="function")
@@ -45,7 +46,9 @@ async def test_client(tmp_path: Path, monkeypatch, dummy_pdf_factory):
     monkeypatch.setattr(config.settings, "CACHE_DIR", cache_dir)
     monkeypatch.setattr(config.settings, "MAX_PAGES_PER_REQUEST", 5) # For predictable tests
 
-    # 4. The app's lifespan manager will handle init_db and sync_database.
+    # 4. Manually run sync_database to populate the test DB
+    sync_database()
+
     # 5. Yield an in-memory client
     async with Client(app) as client:
         yield client
@@ -143,44 +146,31 @@ async def test_pagination_workflow(test_client: Client):
 
 
 @pytest.mark.asyncio
-async def test_delete_orphaned_cache(tmp_path: Path, monkeypatch, dummy_pdf_factory):
+async def test_delete_orphaned_cache(test_client: Client):
     """
     Tests that the orphaned cache directory is deleted when the source PDF is removed.
     """
-    pdf_dir = tmp_path / "pdfs"
-    db_dir = tmp_path / "db"
-    cache_dir = tmp_path / "cache"
-    pdf_dir.mkdir()
-    db_dir.mkdir()
-    cache_dir.mkdir()
+    # The test_client fixture has already run sync_database once.
+    # 1. Get IDs and create a cache entry to ensure the cache directory exists.
+    result = await test_client.call_tool("list_manuals")
+    manual_id = result.structured_content['result'][0]["id"]
+    result = await test_client.call_tool("get_manual_metadata", {"manual_id": manual_id})
+    bookmark_id = result.structured_content["table_of_contents"][0]["id"]
 
-    pdf_path = pdf_dir / "dummy_manual.pdf"
-    dummy_pdf_factory(path=pdf_path, pages_content={1: "Page 1"}, bookmarks={"Ch1": (1, None)})
+    await test_client.call_tool("get_markdown_content", {"bookmark_id": bookmark_id})
 
-    monkeypatch.setattr(config.settings, "PDF_ROOT_DIR", pdf_dir)
-    monkeypatch.setattr(config.settings, "DB_FILE_PATH", db_dir / "test.db")
-    monkeypatch.setattr(config.settings, "CACHE_DIR", cache_dir)
-
-    # Run sync and get IDs
-    async with Client(app) as client:
-        result = await client.call_tool("list_manuals")
-        manual_id = result.structured_content['result'][0]["id"]
-        result = await client.call_tool("get_manual_metadata", {"manual_id": manual_id})
-        bookmark_id = result.structured_content["table_of_contents"][0]["id"]
-
-        # Create a cache entry and directory
-        await client.call_tool("get_markdown_content", {"bookmark_id": bookmark_id})
-    
-    manual_cache_dir = cache_dir / manual_id
+    # 2. Verify the cache directory now exists
+    manual_cache_dir = config.settings.CACHE_DIR / manual_id
     assert manual_cache_dir.exists()
     assert manual_cache_dir.is_dir()
     assert len(list(manual_cache_dir.iterdir())) > 0
 
-    # Delete the source PDF
+    # 3. Delete the source PDF
+    pdf_path = config.settings.PDF_ROOT_DIR / "dummy_manual.pdf"
     pdf_path.unlink()
 
-    # Run sync_database again to trigger the cleanup
+    # 4. Run sync_database again to trigger the cleanup
     sync_database()
 
-    # Verify the cache directory has been deleted
+    # 5. Verify the cache directory has been deleted
     assert not manual_cache_dir.exists()
