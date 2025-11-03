@@ -1,3 +1,4 @@
+import logging
 import shutil
 from sqlalchemy.orm import Session
 
@@ -10,6 +11,10 @@ from .pdf_utils import (
     scan_pdfs,
 )
 
+# Configure logging
+logging.basicConfig(level=settings.LOG_LEVEL)
+logger = logging.getLogger(__name__)
+
 
 def sync_database():
     """
@@ -18,7 +23,7 @@ def sync_database():
     - Updates manuals that have changed.
     - Deletes manuals that are no longer on the filesystem.
     """
-    print("Starting database synchronization...")
+    logger.info("Starting database synchronization...")
 
     # Ensure DB and tables exist
     init_db()
@@ -38,7 +43,7 @@ def sync_database():
             try:
                 file_hash = calculate_file_hash(pdf_path)
             except IOError as e:
-                print(f"ERROR: Could not calculate hash for {pdf_path}: {e}")
+                logger.error(f"Could not calculate hash for {pdf_path}: {e}")
                 continue
 
             if (
@@ -47,20 +52,18 @@ def sync_database():
             ):
                 manual_to_delete = db_manuals.get(relative_path)
                 if manual_to_delete:
-                    print(f"INFO: '{relative_path}' has been updated. Re-processing.")
+                    logger.info(f"'{relative_path}' has been updated. Re-processing.")
                     shutil.rmtree(
                         settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True
                     )
                     db.delete(manual_to_delete)
                     db.commit()
                 else:
-                    print(f"INFO: New manual found: '{relative_path}'")
+                    logger.info(f"New manual found: '{relative_path}'")
 
                 pdf_data = extract_pdf_metadata(pdf_path)
                 if not pdf_data:
-                    print(
-                        f"WARNING: Could not extract metadata from {pdf_path}. Skipping."
-                    )
+                    logger.warning(f"Could not extract metadata from {pdf_path}. Skipping.")
                     continue
 
                 new_manual = Manual(
@@ -91,23 +94,23 @@ def sync_database():
                     keys_to_del = [k for k in parent_stack if k > level]
                     for k in keys_to_del:
                         del parent_stack[k]
-                print(f"INFO: Successfully processed and added '{relative_path}'.")
+                logger.info(f"Successfully processed and added '{relative_path}'.")
 
         deleted_paths = db_paths - fs_paths
         for path_to_delete in deleted_paths:
             manual_to_delete = db_manuals[path_to_delete]
-            print(f"INFO: '{path_to_delete}' has been removed. Deleting from database.")
+            logger.info(f"'{path_to_delete}' has been removed. Deleting from database.")
             shutil.rmtree(settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True)
             db.delete(manual_to_delete)
 
         db.commit()
 
     except Exception as e:
-        print(f"ERROR: An error occurred during database synchronization: {e}")
+        logger.error(f"An error occurred during database synchronization: {e}")
         db.rollback()
     finally:
         db.close()
-    print("Database synchronization complete.")
+    logger.info("Database synchronization complete.")
 
 
 if __name__ == "__main__":
