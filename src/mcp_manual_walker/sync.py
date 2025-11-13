@@ -21,9 +21,6 @@ def sync_database() -> None:
     - Adds new manuals.
     - Updates manuals that have changed.
     - Deletes manuals that are no longer on the filesystem.
-
-    If a db session is provided, it will be used. Otherwise, a new session
-    will be created and managed internally.
     """
     logger.info("Starting database synchronization...")
     init_db()
@@ -51,6 +48,22 @@ def sync_database() -> None:
                 relative_path not in db_paths
                 or db_manuals[relative_path].file_hash != file_hash
             ):
+                # An existing manual has been updated, or this is a new manual.
+                # In both cases, we'll delete the old one (if it exists) and create a new one.
+                # This simplifies logic and ensures bookmarks and cache are correctly handled.
+                manual_to_delete = db_manuals.get(relative_path)
+                if manual_to_delete:
+                    logger.info(f"'{relative_path}' has been updated. Re-processing.")
+                    # Delete old cache files on disk first
+                    shutil.rmtree(settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True)
+                    # Deletion of the manual object will cascade in the DB
+                    session.delete(manual_to_delete)
+                    # We need to flush to ensure the delete is processed before we add a new
+                    # manual with potentially the same unique constraints.
+                    session.flush()
+                else:
+                    logger.info(f"New manual found: '{relative_path}'")
+
                 pdf_data = extract_pdf_metadata(pdf_path)
                 if not pdf_data:
                     logger.warning(
@@ -58,7 +71,6 @@ def sync_database() -> None:
                     )
                     continue
 
-                # Create a new manual instance to replace the old one or for a new file
                 new_manual = Manual(
                     file_name=pdf_path.name,
                     document_title=pdf_data["document_title"],
@@ -66,18 +78,7 @@ def sync_database() -> None:
                     file_hash=file_hash,
                     page_count=pdf_data["page_count"],
                 )
-
-                manual_to_update = db_manuals.get(relative_path)
-                if manual_to_update:
-                    logger.info(
-                        f"'{relative_path}' has been updated. Updating existing manual."
-                    )
-                    # Since bookmarks are re-added, clear old ones.
-                    # Cascade delete handles this.
-                    manual_to_update.file_hash = file_hash
-                else:
-                    session.add(new_manual)
-
+                session.add(new_manual)
                 session.flush()  # Flush to get the new_manual.id for bookmark relations
 
                 parent_stack = {}
