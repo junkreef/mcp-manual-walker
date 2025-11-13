@@ -1,8 +1,6 @@
-import shutil
 from pathlib import Path
 
 import pytest
-from sqlalchemy.orm import Session
 
 from mcp_manual_walker import config
 from mcp_manual_walker.database import SessionLocal, init_db
@@ -38,7 +36,6 @@ def test_sync_environment(tmp_path: Path, monkeypatch, dummy_pdf_factory):
     # 4. Yield the paths for the test function to use
     yield pdf_dir, cache_dir, dummy_pdf_factory
 
-
 def test_sync_database_lifecycle(test_sync_environment):
     """
     Tests the full lifecycle of the sync_database function:
@@ -47,7 +44,6 @@ def test_sync_database_lifecycle(test_sync_environment):
     3. Third sync: Deletes a removed file and its cache.
     """
     pdf_dir, cache_dir, dummy_pdf_factory = test_sync_environment
-    db: Session = SessionLocal()
 
     # --- 1. Initial Sync (Addition) ---
     print("\n--- Running Initial Sync ---")
@@ -59,13 +55,17 @@ def test_sync_database_lifecycle(test_sync_environment):
 
     sync_database()
 
-    manuals = db.query(Manual).order_by(Manual.file_name).all()
-    assert len(manuals) == 2
-    manual_a, manual_b = manuals
-    assert manual_a.file_name == "manual_A.pdf"
-    assert manual_b.file_name == "manual_B.pdf"
-    hash_a_v1 = manual_a.file_hash
-    print("Initial sync successful.")
+    db_session = SessionLocal()
+    try:
+        manuals = db_session.query(Manual).order_by(Manual.file_name).all()
+        assert len(manuals) == 2
+        manual_a, manual_b = manuals
+        assert manual_a.file_name == "manual_A.pdf"
+        assert manual_b.file_name == "manual_B.pdf"
+        hash_a_v1 = manual_a.file_hash
+        print("Initial sync successful.")
+    finally:
+        db_session.close()
 
     # Create a dummy cache directory for manual_b to test cleanup later
     manual_b_cache_dir = cache_dir / manual_b.id
@@ -85,15 +85,18 @@ def test_sync_database_lifecycle(test_sync_environment):
     )
 
     sync_database()
-
-    manuals = db.query(Manual).order_by(Manual.file_name).all()
-    assert len(manuals) == 3
-    manual_a, manual_b, manual_c = manuals
-    assert manual_a.file_name == "manual_A.pdf"
-    assert manual_a.file_hash != hash_a_v1  # Hash should be updated
-    assert manual_b.file_name == "manual_B.pdf"
-    assert manual_c.file_name == "manual_C.pdf"
-    print("Update and add sync successful.")
+    db_session = SessionLocal()
+    try:
+        manuals = db_session.query(Manual).order_by(Manual.file_name).all()
+        assert len(manuals) == 3
+        manual_a, manual_b, manual_c = manuals
+        assert manual_a.file_name == "manual_A.pdf"
+        assert manual_a.file_hash != hash_a_v1  # Hash should be updated
+        assert manual_b.file_name == "manual_B.pdf"
+        assert manual_c.file_name == "manual_C.pdf"
+        print("Update and add sync successful.")
+    finally:
+        db_session.close()
 
     # --- 3. Third Sync (Deletion) ---
     print("\n--- Running Third Sync (Deletion) ---")
@@ -101,13 +104,15 @@ def test_sync_database_lifecycle(test_sync_environment):
 
     sync_database()
 
-    manuals = db.query(Manual).order_by(Manual.file_name).all()
-    assert len(manuals) == 2
-    assert manuals[0].file_name == "manual_A.pdf"
-    assert manuals[1].file_name == "manual_C.pdf"
-    
+    db_session = SessionLocal()
+    try:
+        manuals = db_session.query(Manual).order_by(Manual.file_name).all()
+        assert len(manuals) == 2
+        assert manuals[0].file_name == "manual_A.pdf"
+        assert manuals[1].file_name == "manual_C.pdf"
+    finally:
+        db_session.close()
+
     # Check that the cache directory for the deleted manual is also gone
     assert not manual_b_cache_dir.exists()
     print("Deletion sync successful.")
-
-    db.close()
