@@ -79,26 +79,27 @@ def sync_database() -> None:
                     page_count=pdf_data["page_count"],
                 )
                 session.add(new_manual)
-                session.flush()  # Flush to get the new_manual.id for bookmark relations
 
                 parent_stack = {}
+                bookmarks_to_add = []
                 for i, bm_data in enumerate(pdf_data["bookmarks"]):
                     level = bm_data["level"]
                     parent = parent_stack.get(level - 1)
                     bookmark = Bookmark(
-                        manual_id=new_manual.id,
+                        manual=new_manual,
                         ordering=i,
                         title=bm_data["title"],
                         level=level,
                         page_num=bm_data["page_num"],
-                        parent_id=parent.id if parent else None,
+                        parent=parent,
                     )
-                    session.add(bookmark)
-                    session.flush()  # Necessary to get parent IDs for nested bookmarks
+                    bookmarks_to_add.append(bookmark)
                     parent_stack[level] = bookmark
                     keys_to_del = [k for k in parent_stack if k > level]
                     for k in keys_to_del:
                         del parent_stack[k]
+                session.add_all(bookmarks_to_add)
+                session.flush()
                 logger.info(f"Successfully processed and added '{relative_path}'.")
 
         deleted_paths = db_paths - fs_paths
