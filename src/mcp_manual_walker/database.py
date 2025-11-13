@@ -5,7 +5,7 @@ from .config import settings
 from .models import Base
 
 engine = None
-SessionLocal = sessionmaker(autocommit=False, autoflush=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False)
 
 def init_db():
     global engine
