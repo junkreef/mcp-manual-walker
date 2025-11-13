@@ -73,7 +73,6 @@ def test_sync_database_lifecycle(test_sync_environment, db_session: Session):
     assert manual_a.file_name == "manual_A.pdf"
     assert manual_b.file_name == "manual_B.pdf"
     hash_a_v1 = manual_a.file_hash
-    print("Initial sync successful.")
 
     # Create a dummy cache directory for manual_b to test cleanup later
     manual_b_cache_dir = cache_dir / manual_b.id
@@ -82,7 +81,6 @@ def test_sync_database_lifecycle(test_sync_environment, db_session: Session):
     assert manual_b_cache_dir.exists()
 
     # --- 2. Second Sync (Update and Addition) ---
-    print("\n--- Running Second Sync (Update and Add) ---")
     # Update manual_A.pdf
     dummy_pdf_factory(
         pdf_a_path, {1: "Content A v2"}, metadata={"/Title": "Manual A Updated"}
@@ -101,10 +99,8 @@ def test_sync_database_lifecycle(test_sync_environment, db_session: Session):
     assert manual_a.file_hash != hash_a_v1  # Hash should be updated
     assert manual_b.file_name == "manual_B.pdf"
     assert manual_c.file_name == "manual_C.pdf"
-    print("Update and add sync successful.")
 
     # --- 3. Third Sync (Deletion) ---
-    print("\n--- Running Third Sync (Deletion) ---")
     pdf_b_path.unlink()  # Remove manual_B.pdf from filesystem
 
     sync_database()
@@ -113,7 +109,6 @@ def test_sync_database_lifecycle(test_sync_environment, db_session: Session):
     assert len(manuals) == 2
     assert manuals[0].file_name == "manual_A.pdf"
     assert manuals[1].file_name == "manual_C.pdf"
-    
+
     # Check that the cache directory for the deleted manual is also gone
     assert not manual_b_cache_dir.exists()
-    print("Deletion sync successful.")
