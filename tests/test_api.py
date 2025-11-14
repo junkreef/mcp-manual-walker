@@ -63,6 +63,7 @@ async def test_e2e_workflow(test_client: Client):
     """
     # 1. List manuals
     result = await test_client.call_tool("list_manuals")
+    assert result.structured_content is not None
     manuals = [ManualInfo(**manual) for manual in result.structured_content["result"]]
     assert isinstance(manuals, list)
     assert len(manuals) == 1
@@ -74,6 +75,7 @@ async def test_e2e_workflow(test_client: Client):
     result = await test_client.call_tool(
         "get_manual_metadata", {"manual_id": manual_id}
     )
+    assert result.structured_content is not None
     metadata = ManualMetadata.model_validate(result.structured_content)
     assert metadata.id == manual_id
     toc = metadata.table_of_contents
@@ -83,6 +85,7 @@ async def test_e2e_workflow(test_client: Client):
     result = await test_client.call_tool(
         "get_markdown_content", {"bookmark_id": bookmark_id}
     )
+    assert result.structured_content is not None
     content_response = MarkdownContent.model_validate(result.structured_content)
     assert content_response is not None
     assert "markdown_content" in content_response.model_dump()
@@ -96,11 +99,13 @@ async def test_pagination_workflow(test_client: Client):
     """
     # 1. Get the bookmark ID for Chapter 1, which spans 14 pages.
     result = await test_client.call_tool("list_manuals")
+    assert result.structured_content is not None
     manuals = [ManualInfo(**manual) for manual in result.structured_content["result"]]
     manual_id = manuals[0].id
     result = await test_client.call_tool(
         "get_manual_metadata", {"manual_id": manual_id}
     )
+    assert result.structured_content is not None
     chapter1_bookmark_id = (
         ManualMetadata.model_validate(result.structured_content).table_of_contents[0].id
     )
@@ -109,6 +114,7 @@ async def test_pagination_workflow(test_client: Client):
     result = await test_client.call_tool(
         "get_markdown_content", {"bookmark_id": chapter1_bookmark_id}
     )
+    assert result.structured_content is not None
     res1 = MarkdownContent.model_validate(result.structured_content)
     assert res1.bookmark_total_pages == 14
     assert res1.page_offset == 0
@@ -122,6 +128,7 @@ async def test_pagination_workflow(test_client: Client):
     result = await test_client.call_tool(
         "get_markdown_content", {"bookmark_id": chapter1_bookmark_id, "page_offset": 5}
     )
+    assert result.structured_content is not None
     res2 = MarkdownContent.model_validate(result.structured_content)
     assert res2.page_offset == 5
     assert res2.page_limit == 5
@@ -134,6 +141,7 @@ async def test_pagination_workflow(test_client: Client):
     result = await test_client.call_tool(
         "get_markdown_content", {"bookmark_id": chapter1_bookmark_id, "page_offset": 10}
     )
+    assert result.structured_content is not None
     res3 = MarkdownContent.model_validate(result.structured_content)
     assert res3.page_offset == 10
     assert res3.page_limit == 4  # Only 4 pages left
@@ -145,6 +153,7 @@ async def test_pagination_workflow(test_client: Client):
     result = await test_client.call_tool(
         "get_markdown_content", {"bookmark_id": chapter1_bookmark_id, "page_limit": 2}
     )
+    assert result.structured_content is not None
     res4 = MarkdownContent.model_validate(result.structured_content)
     assert res4.page_limit == 2
     assert res4.next_page_offset == 2
@@ -165,11 +174,13 @@ async def test_delete_orphaned_cache(test_client: Client):
     # The test_client fixture has already run sync_database once.
     # 1. Get IDs and create a cache entry to ensure the cache directory exists.
     result = await test_client.call_tool("list_manuals")
+    assert result.structured_content is not None
     manuals = [ManualInfo(**manual) for manual in result.structured_content["result"]]
     manual_id = manuals[0].id
     result = await test_client.call_tool(
         "get_manual_metadata", {"manual_id": manual_id}
     )
+    assert result.structured_content is not None
     bookmark_id = (
         ManualMetadata.model_validate(result.structured_content).table_of_contents[0].id
     )
