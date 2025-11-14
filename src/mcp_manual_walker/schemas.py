@@ -36,14 +36,14 @@ class MarkdownContent(BaseModel):
     )
     page_offset: int = Field(
         ...,
-        description="The starting page offset of the returned content, " \
-        "0-indexed from the beginning of the bookmark section.",
+        description="""The starting page offset of the returned content, 
+        0-indexed from the beginning of the bookmark section.""",
     )
     page_limit: int = Field(
         ..., description="The number of pages returned in this response."
     )
     next_page_offset: Optional[int] = Field(
         None,
-        description="The offset to use in the next request to get the following pages. " \
-        "If null, this is the last page of the section.",
+        description="""The offset to use in the next request 
+        to get the following pages. If null, this is the last page of the section.""",
     )

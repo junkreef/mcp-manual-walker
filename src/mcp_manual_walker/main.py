@@ -47,16 +47,16 @@ app = FastMCP(lifespan=lifespan)
 
 @app.tool(
     name="list_manuals",
-    description="""Provides a comprehensive list of all available manuals. This tool is the
-primary entry point for discovering content. It returns a list of all manuals
-found in the system, each with a unique ID that is required by other tools
-like `get_manual_metadata`.
+    description="""Provides a comprehensive list of all available manuals. This tool is
+    the primary entry point for discovering content. It returns a list of all manuals
+    found in the system, each with a unique ID that is required by other tools
+    like `get_manual_metadata`.
 
-Workflow Example:
-1. Call `list_manuals()` to get a list of all available manuals.
-2. Identify the manual you are interested in from the list.
-3. Use the `id` of that manual to call `get_manual_metadata()` to retrieve its
-   table of contents and other details.""",
+    Workflow Example:
+    1. Call `list_manuals()` to get a list of all available manuals.
+    2. Identify the manual you are interested in from the list.
+    3. Use the `id` of that manual to call `get_manual_metadata()` to retrieve its
+       table of contents and other details.""",
     tags={"manual", "discovery"},
     annotations={"readOnlyHint": True},
 )
@@ -98,13 +98,18 @@ def _build_toc(bookmarks: list[Bookmark]) -> list[BookmarkNode]:
 
 @app.tool(
     name="get_manual_metadata",
-    description="""Retrieves detailed metadata and a hierarchical table of contents for a specific manual. Use this tool after you have identified a manual of interest using `list_manuals()`. It provides the full structure of the manual's bookmarks, which is essential for navigating its content. Each bookmark in the table of contents has its own unique ID, which is required by the `get_markdown_content` tool to fetch the actual content of that section.
+    description="""Retrieves detailed metadata and a hierarchical table of contents for
+    a specific manual. Use this tool after you have identified a manual of interest
+    using `list_manuals()`. It provides the full structure of the manual's bookmarks,
+    which is essential for navigating its content. Each bookmark in the table of
+    contents has its own unique ID, which is required by the `get_markdown_content`
+    tool to fetch the actual content of that section.
 
-Workflow Example:
-1. Get a `manual_id` from the output of `list_manuals()`.
-2. Call `get_manual_metadata(manual_id=...)` to get the manual's structure.
-3. Browse the `table_of_contents` to find the specific section you need.
-4. Use the `id` of the desired bookmark to call `get_markdown_content()`.""",
+    Workflow Example:
+    1. Get a `manual_id` from the output of `list_manuals()`.
+    2. Call `get_manual_metadata(manual_id=...)` to get the manual's structure.
+    3. Browse the `table_of_contents` to find the specific section you need.
+    4. Use the `id` of the desired bookmark to call `get_markdown_content()`.""",
     tags={"manual", "metadata", "toc"},
     annotations={"readOnlyHint": True},
 )
@@ -112,7 +117,8 @@ def get_manual_metadata(
     manual_id: Annotated[
         str,
         Field(
-            description="The unique ID of the manual, obtained from the `list_manuals` tool."
+            description="""The unique ID of the manual, 
+            obtained from the `list_manuals` tool."""
         ),
     ],
 ) -> ManualMetadata:
@@ -148,13 +154,19 @@ def get_manual_metadata(
 
 @app.tool(
     name="get_markdown_content",
-    description="""Fetches the Markdown content for a specific bookmark (section) within a manual. The content is returned in paginated form to handle large sections efficiently. Use the `page_offset` and `page_limit` parameters to control pagination. The response includes the `next_page_offset` which should be used in subsequent calls to retrieve the rest of the content for that section.
+    description="""Fetches the Markdown content for a specific bookmark (section) within
+      a manual. The content is returned in paginated form to handle large sections
+      efficiently. Use the `page_offset` and `page_limit` parameters to control
+      pagination. The response includes the `next_page_offset` which should be used in
+      subsequent calls to retrieve the rest of the content for that section.
 
-Workflow Example:
-1. Get a `bookmark_id` from the `table_of_contents` provided by `get_manual_metadata()`.
-2. Call `get_markdown_content(bookmark_id=...)` to get the first chunk of content.
-3. If `next_page_offset` in the response is not null, call `get_markdown_content()` again with the same `bookmark_id` and the new `page_offset` to get the next page.
-4. Repeat until `next_page_offset` is null.""",
+    Workflow Example:
+    1. Get a `bookmark_id` from the `table_of_contents` provided by
+      `get_manual_metadata()`.
+    2. Call `get_markdown_content(bookmark_id=...)` to get the first chunk of content.
+    3. If `next_page_offset` in the response is not null, call `get_markdown_content()`
+      again with the same `bookmark_id` and the new `page_offset` to get the next page.
+    4. Repeat until `next_page_offset` is null.""",
     tags={"manual", "content", "markdown"},
     annotations={"readOnlyHint": True},
 )
@@ -162,13 +174,15 @@ def get_markdown_content(
     bookmark_id: Annotated[
         str,
         Field(
-            description="The unique ID of the bookmark, obtained from `get_manual_metadata`."
+            description="""The unique ID of the bookmark, 
+            obtained from `get_manual_metadata`."""
         ),
     ],
     page_offset: Annotated[
         int,
         Field(
-            description="The starting page offset within the bookmark section (0-indexed).",
+            description="""The starting page offset within 
+            the bookmark section (0-indexed).""",
             default=0,
             ge=0,
         ),
@@ -176,7 +190,8 @@ def get_markdown_content(
     page_limit: Annotated[
         Optional[int],
         Field(
-            description="The maximum number of pages to return. Defaults to the server-side setting.",
+            description="""The maximum number of pages to return.
+            Defaults to the server-side setting.""",
             default=None,
             ge=1,
         ),
@@ -259,7 +274,8 @@ def get_markdown_content(
                 pdf_path, page_num, page_num
             )
             if not temp_pdf_path:
-                error_msg = f"Page {page_num} could not be processed: failed to create temporary PDF."
+                error_msg = f"""Page {page_num} could not be processed: 
+                failed to create temporary PDF."""
                 logger.error(error_msg)
                 raise ToolError(error_msg)
 
@@ -268,7 +284,8 @@ def get_markdown_content(
                 page_content = conversion_result.markdown if conversion_result else ""
                 if not page_content:
                     logger.warning(
-                        f"Page {page_num} of '{manual.file_name}' converted to empty content."
+                        f"""Page {page_num} of '{manual.file_name}' 
+                        converted to empty content."""
                     )
 
                 markdown_parts.append(page_content)
