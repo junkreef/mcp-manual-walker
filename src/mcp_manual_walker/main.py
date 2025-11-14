@@ -2,10 +2,12 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, List, Optional
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from markitdown import MarkItDown
+from pydantic import Field
 from sqlalchemy.orm import Session, joinedload
 
 from .cache_utils import (
@@ -19,6 +21,7 @@ from .models import Bookmark, Manual
 from .pdf_utils import (
     create_temp_pdf_from_page_range,
 )
+from .schemas import BookmarkNode, ManualInfo, ManualMetadata, MarkdownContent
 
 # Configure logging
 logging.basicConfig(level=settings.LOG_LEVEL)
@@ -42,51 +45,89 @@ async def lifespan(app: FastMCP):
 app = FastMCP(lifespan=lifespan)
 
 
-@app.tool()
-def list_manuals() -> list[dict]:
-    """Returns a list of all available manuals, including their ID, filename, and title."""
+@app.tool(
+    name="list_manuals",
+    description="""Provides a comprehensive list of all available manuals. This tool is
+    the primary entry point for discovering content. It returns a list of all manuals
+    found in the system, each with a unique ID that is required by other tools
+    like `get_manual_metadata`.
+
+    Workflow Example:
+    1. Call `list_manuals()` to get a list of all available manuals.
+    2. Identify the manual you are interested in from the list.
+    3. Use the `id` of that manual to call `get_manual_metadata()` to retrieve its
+       table of contents and other details.""",
+    tags={"manual", "discovery"},
+    annotations={"readOnlyHint": True},
+)
+def list_manuals() -> List[ManualInfo]:
+    """Returns a list of all available manuals."""
     db: Session = SessionLocal()
     try:
         manuals = db.query(Manual).order_by(Manual.file_name).all()
         return [
-            {
-                "id": m.id,
-                "file_name": m.file_name,
-                "document_title": m.document_title,
-            }
+            ManualInfo(
+                id=m.id,
+                file_name=m.file_name,
+                document_title=m.document_title,
+            )
             for m in manuals
         ]
     except Exception as e:
         logger.error(f"Error fetching list of manuals: {e}")
-        return []
+        raise ToolError(e)
     finally:
         db.close()
 
 
-def _build_toc(bookmarks: list[Bookmark]) -> list[dict]:
+def _build_toc(bookmarks: list[Bookmark]) -> list[BookmarkNode]:
     """Builds a nested table of contents from a flat list of bookmarks."""
     toc = []
     bookmark_map = {
-        bm.id: {"id": bm.id, "title": bm.title, "page": bm.page_num, "children": []}
+        bm.id: BookmarkNode(id=bm.id, title=bm.title, page=bm.page_num, children=[])
         for bm in bookmarks
     }
     for bm in bookmarks:
         if bm.parent_id:
             if parent := bookmark_map.get(bm.parent_id):
-                parent["children"].append(bookmark_map[bm.id])
+                parent.children.append(bookmark_map[bm.id])
         else:
             toc.append(bookmark_map[bm.id])
     return toc
 
 
-@app.tool()
-def get_manual_metadata(manual_id: str) -> dict:
-    """Returns metadata and hierarchical bookmark info for a specified manual."""
+@app.tool(
+    name="get_manual_metadata",
+    description="""Retrieves detailed metadata and a hierarchical table of contents for
+    a specific manual. Use this tool after you have identified a manual of interest
+    using `list_manuals()`. It provides the full structure of the manual's bookmarks,
+    which is essential for navigating its content. Each bookmark in the table of
+    contents has its own unique ID, which is required by the `get_markdown_content`
+    tool to fetch the actual content of that section.
+
+    Workflow Example:
+    1. Get a `manual_id` from the output of `list_manuals()`.
+    2. Call `get_manual_metadata(manual_id=...)` to get the manual's structure.
+    3. Browse the `table_of_contents` to find the specific section you need.
+    4. Use the `id` of the desired bookmark to call `get_markdown_content()`.""",
+    tags={"manual", "metadata", "toc"},
+    annotations={"readOnlyHint": True},
+)
+def get_manual_metadata(
+    manual_id: Annotated[
+        str,
+        Field(
+            description="""The unique ID of the manual, 
+            obtained from the `list_manuals` tool."""
+        ),
+    ],
+) -> ManualMetadata:
+    """Returns metadata and a hierarchical table of contents for a specified manual."""
     db: Session = SessionLocal()
     try:
         manual = db.query(Manual).filter(Manual.id == manual_id).first()
         if not manual:
-            return {"error": f"Manual with id '{manual_id}' not found."}
+            raise ToolError(f"Manual with id '{manual_id}' not found.")
 
         bookmarks = (
             db.query(Bookmark)
@@ -96,36 +137,79 @@ def get_manual_metadata(manual_id: str) -> dict:
         )
         table_of_contents = _build_toc(bookmarks)
 
-        return {
+        manual_data = {
             "id": manual.id,
             "file_name": manual.file_name,
             "document_title": manual.document_title,
             "file_hash": manual.file_hash,
             "table_of_contents": table_of_contents,
         }
+        return ManualMetadata.model_validate(manual_data)
     except Exception as e:
         logger.error(f"Error fetching metadata for manual_id '{manual_id}': {e}")
-        return {"error": "An internal error occurred."}
+        raise ToolError(e)
     finally:
         db.close()
 
 
-@app.tool()
+@app.tool(
+    name="get_markdown_content",
+    description="""Fetches the Markdown content for a specific bookmark (section) within
+      a manual. The content is returned in paginated form to handle large sections
+      efficiently. Use the `page_offset` and `page_limit` parameters to control
+      pagination. The response includes the `next_page_offset` which should be used in
+      subsequent calls to retrieve the rest of the content for that section.
+
+    Workflow Example:
+    1. Get a `bookmark_id` from the `table_of_contents` provided by
+      `get_manual_metadata()`.
+    2. Call `get_markdown_content(bookmark_id=...)` to get the first chunk of content.
+    3. If `next_page_offset` in the response is not null, call `get_markdown_content()`
+      again with the same `bookmark_id` and the new `page_offset` to get the next page.
+    4. Repeat until `next_page_offset` is null.""",
+    tags={"manual", "content", "markdown"},
+    annotations={"readOnlyHint": True},
+)
 def get_markdown_content(
-    bookmark_id: str, page_offset: int = 0, page_limit: Optional[int] = None
-) -> dict:
-    """
-    Returns the Markdown content for a specific bookmark, with pagination.
-    """
+    bookmark_id: Annotated[
+        str,
+        Field(
+            description="""The unique ID of the bookmark, 
+            obtained from `get_manual_metadata`."""
+        ),
+    ],
+    page_offset: Annotated[
+        int,
+        Field(
+            description="""The starting page offset within 
+            the bookmark section (0-indexed).""",
+            default=0,
+            ge=0,
+        ),
+    ] = 0,
+    page_limit: Annotated[
+        Optional[int],
+        Field(
+            description="""The maximum number of pages to return.
+            Defaults to the server-side setting.""",
+            default=None,
+            ge=1,
+        ),
+    ] = None,
+) -> MarkdownContent:
+    """Returns the Markdown content for a specific bookmark, with pagination."""
     db: Session = SessionLocal()
     markdown_converter = MarkItDown()
     temp_pdf_path: Path | None = None
     try:
         bookmark = (
-            db.query(Bookmark).filter(Bookmark.id == bookmark_id).options(joinedload(Bookmark.manual)).first()
+            db.query(Bookmark)
+            .filter(Bookmark.id == bookmark_id)
+            .options(joinedload(Bookmark.manual))
+            .first()
         )
         if not bookmark:
-            return {"error": f"Bookmark with id '{bookmark_id}' not found."}
+            raise ToolError(f"Bookmark with id '{bookmark_id}' not found.")
 
         manual = bookmark.manual
         pdf_path = settings.PDF_ROOT_DIR.resolve() / manual.relative_path
@@ -148,27 +232,30 @@ def get_markdown_content(
         else:
             # If it's the last bookmark, go to the end of the PDF
             bookmark_end_page = manual.page_count
-        
+
         bookmark_total_pages = (bookmark_end_page - bookmark_start_page) + 1
         if bookmark_total_pages <= 0:
-            return {
+            content_data = {
                 "markdown_content": "",
                 "bookmark_total_pages": 0,
                 "page_offset": 0,
                 "page_limit": 0,
                 "next_page_offset": None,
             }
+            return MarkdownContent.model_validate(content_data)
 
         # 2. Determine the processing chunk based on limits
-        limit = min(page_limit or settings.MAX_PAGES_PER_REQUEST, settings.MAX_PAGES_PER_REQUEST)
-        
+        limit = min(
+            page_limit or settings.MAX_PAGES_PER_REQUEST, settings.MAX_PAGES_PER_REQUEST
+        )
+
         if page_offset >= bookmark_total_pages:
-            return {"error": "page_offset is out of bounds."}
+            raise ToolError("page_offset is out of bounds.")
 
         # 3. Calculate absolute page numbers for the chunk
         chunk_start_page = bookmark_start_page + page_offset
         chunk_end_page = min(chunk_start_page + limit - 1, bookmark_end_page)
-        
+
         # 4. Process pages in the chunk
         markdown_parts = []
         processed_page_nums = []
@@ -180,19 +267,27 @@ def get_markdown_content(
                 continue
 
             # Cache miss: process the single page
-            logger.info(f"Cache miss for page {page_num} of '{manual.file_name}'. Processing.")
-            temp_pdf_path = create_temp_pdf_from_page_range(pdf_path, page_num, page_num)
+            logger.info(
+                f"Cache miss for page {page_num} of '{manual.file_name}'. Processing."
+            )
+            temp_pdf_path = create_temp_pdf_from_page_range(
+                pdf_path, page_num, page_num
+            )
             if not temp_pdf_path:
-                error_msg = f"Page {page_num} could not be processed: failed to create temporary PDF."
+                error_msg = f"""Page {page_num} could not be processed: 
+                failed to create temporary PDF."""
                 logger.error(error_msg)
-                return {"error": error_msg}
+                raise ToolError(error_msg)
 
             try:
                 conversion_result = markdown_converter.convert(str(temp_pdf_path))
                 page_content = conversion_result.markdown if conversion_result else ""
                 if not page_content:
-                    logger.warning(f"Page {page_num} of '{manual.file_name}' converted to empty content.")
-                
+                    logger.warning(
+                        f"""Page {page_num} of '{manual.file_name}' 
+                        converted to empty content."""
+                    )
+
                 markdown_parts.append(page_content)
                 create_page_cache(manual, page_num, page_content, db)
             finally:
@@ -212,18 +307,19 @@ def get_markdown_content(
         if next_page_offset >= bookmark_total_pages:
             next_page_offset = None
 
-        return {
+        content_data = {
             "markdown_content": final_content,
             "bookmark_total_pages": bookmark_total_pages,
             "page_offset": page_offset,
             "page_limit": actual_limit,
             "next_page_offset": next_page_offset,
         }
+        return MarkdownContent.model_validate(content_data)
 
     except Exception as e:
         db.rollback()
         logger.exception(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
-        return {"error": "An internal error occurred while fetching content."}
+        raise ToolError(e)
     finally:
         db.close()
 
