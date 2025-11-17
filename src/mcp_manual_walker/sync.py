@@ -1,5 +1,11 @@
 import logging
+import multiprocessing as mp
 import shutil
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import Optional, TypedDict
+
+from pypdf import errors
 
 from .config import settings
 from .database import SessionLocal, init_db
@@ -13,6 +19,46 @@ from .pdf_utils import (
 # Configure logging
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+
+# Type definition for the result of PDF processing
+class PDFProcessResult(TypedDict):
+    relative_path: str
+    file_hash: Optional[str]
+    pdf_data: Optional[dict]
+    error: Optional[str]
+
+
+def process_pdf_file(pdf_path_dict: dict) -> PDFProcessResult:
+    """
+    Processes a single PDF file to extract its hash and metadata.
+    Designed to be run in a separate process.
+    """
+    
+    relative_path = pdf_path_dict['relative_path']
+    pdf_path = pdf_path_dict['data_root'] / relative_path
+
+    try:
+        file_hash = calculate_file_hash(pdf_path)
+        pdf_data = None
+        if file_hash != pdf_path_dict['current_hash']:
+            pdf_data = extract_pdf_metadata(pdf_path)
+
+        return {
+            "relative_path": relative_path,
+            "file_hash": file_hash,
+            "pdf_data": pdf_data,
+            "error": None,
+        }
+
+    except (IOError, errors.PdfReadError) as e:
+        logger.error(f"Failed to process {relative_path}: {e}")
+        return {
+            "relative_path": relative_path,
+            "file_hash": None,
+            "pdf_data": None,
+            "error": str(e),
+        }
 
 
 def sync_database() -> None:
@@ -31,48 +77,70 @@ def sync_database() -> None:
         db_manuals = {m.relative_path: m for m in session.query(Manual).all()}
         db_paths = set(db_manuals.keys())
 
-        fs_paths = set()
         pdf_root_path = settings.PDF_ROOT_DIR.resolve()
+        all_pdf_paths = []
+        for p in scan_pdfs(pdf_root_path):
+            relative_path_str = str(p.relative_to(pdf_root_path))
+            manual = db_manuals.get(relative_path_str)
+            all_pdf_paths.append({
+                'data_root': pdf_root_path,
+                'relative_path': relative_path_str,
+                'current_hash': manual.file_hash if manual else None
+            })
 
-        for pdf_path in scan_pdfs(pdf_root_path):
-            relative_path = str(pdf_path.relative_to(pdf_root_path))
+        fs_paths: set[str] = set()
+
+        # Use ProcessPoolExecutor for parallel PDF processing
+        with ProcessPoolExecutor(mp_context=mp.get_context('spawn')) as executor:
+            # Map process_pdf_file to all PDF paths and collect results
+            processed_results = list(executor.map(process_pdf_file, all_pdf_paths))
+
+        # Process results and synchronize database in the main thread
+        for result in processed_results:
+            relative_path = result["relative_path"]
+
+            # If the result indicates error, the database record will be removed
+            # because it will be treat as deleted by missing records in fs_paths.
+            if result["error"]:
+                logger.error(
+                    f"Skipping '{relative_path}' due to processing error: "
+                    f"{result['error']}"
+                )
+                continue
+            
             fs_paths.add(relative_path)
 
-            try:
-                file_hash = calculate_file_hash(pdf_path)
-            except IOError as e:
-                logger.error(f"Could not calculate hash for {pdf_path}: {e}")
-                continue
+            file_hash = result["file_hash"]
+            pdf_data = result["pdf_data"]
 
+            # Check if manual needs to be added or updated
             if (
                 relative_path not in db_paths
                 or db_manuals[relative_path].file_hash != file_hash
             ):
-                # An existing manual has been updated, or this is a new manual.
-                # In both cases, we'll delete the old one (if it exists) and create a new one.
-                # This simplifies logic and ensures bookmarks and cache are correctly handled.
                 manual_to_delete = db_manuals.get(relative_path)
                 if manual_to_delete:
                     logger.info(f"'{relative_path}' has been updated. Re-processing.")
                     # Delete old cache files on disk first
-                    shutil.rmtree(settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True)
+                    shutil.rmtree(
+                        settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True
+                    )
                     # Deletion of the manual object will cascade in the DB
                     session.delete(manual_to_delete)
-                    # We need to flush to ensure the delete is processed before we add a new
-                    # manual with potentially the same unique constraints.
+                    # We need to flush to ensure the delete is processed before 
+                    # we add a new manual with potentially the same unique constraints.
                     session.flush()
                 else:
                     logger.info(f"New manual found: '{relative_path}'")
 
-                pdf_data = extract_pdf_metadata(pdf_path)
                 if not pdf_data:
                     logger.warning(
-                        f"Could not extract metadata from {pdf_path}. Skipping."
+                        f"Could not extract metadata from {relative_path}. Skipping."
                     )
                     continue
 
                 new_manual = Manual(
-                    file_name=pdf_path.name,
+                    file_name=Path(relative_path).name,
                     document_title=pdf_data["document_title"],
                     relative_path=relative_path,
                     file_hash=file_hash,
@@ -102,11 +170,14 @@ def sync_database() -> None:
                 session.flush()
                 logger.info(f"Successfully processed and added '{relative_path}'.")
 
+        # Handle deleted manuals
         deleted_paths = db_paths - fs_paths
         for path_to_delete in deleted_paths:
             manual_to_delete = db_manuals[path_to_delete]
             logger.info(f"'{path_to_delete}' has been removed. Deleting from database.")
-            shutil.rmtree(settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True)
+            shutil.rmtree(
+                settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True
+            )
             session.delete(manual_to_delete)
 
         session.commit()
