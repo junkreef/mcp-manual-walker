@@ -6,7 +6,12 @@ from fastmcp.exceptions import ToolError
 
 from mcp_manual_walker import config
 from mcp_manual_walker.main import app
-from mcp_manual_walker.schemas import ManualInfo, ManualMetadata, MarkdownContent
+from mcp_manual_walker.schemas import (
+    ManualInfo,
+    ManualMetadata,
+    MarkdownContent,
+    SearchResult,
+)
 from mcp_manual_walker.sync import sync_database
 
 
@@ -202,3 +207,141 @@ async def test_delete_orphaned_cache(test_client: Client):
 
     # 5. Verify the cache directory has been deleted
     assert not manual_cache_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_search_manual(test_client: Client):
+    """
+    Tests the search_manual tool.
+    """
+    # 1. Get manual ID
+    result = await test_client.call_tool("list_manuals")
+    manuals = [ManualInfo(**manual) for manual in result.structured_content["result"]]
+    manual_id = manuals[0].id
+    
+    # 2. Search for "Chapter 1" (which is in the content of page 1-14 in dummy_manual)
+    # Note: The dummy_pdf_factory in test_client fixture creates content like "Content for page X".
+    # It does NOT put the bookmark titles in the text content automatically.
+    # So we should search for "Content for page" or specific page numbers.
+    
+    # Search for "Content for page 2" - should be on page 2.
+    # Page 2 is under "Section 1.1" (starts on page 2).
+    # Note: "Content for page 2" will also match "Content for page 20", etc.
+    result = await test_client.call_tool(
+        "search_manual", {"manual_id": manual_id, "query": "Content for page 2"}
+    )
+    assert result.structured_content is not None
+    search_result = SearchResult.model_validate(result.structured_content)
+    
+    # Find the match for page 2
+    match = next((m for m in search_result.results if m.page_num == 2), None)
+    assert match is not None, "Could not find match on page 2"
+    assert "Content for page 2" in match.context
+    
+    # Verify hierarchy
+    # Page 2 is the start of "Section 1.1", which is a child of "Chapter 1"
+    assert len(match.bookmarks) == 2
+    assert match.bookmarks[0].title == "Chapter 1"
+    assert match.bookmarks[1].title == "Section 1.1"
+    
+    # Verify page_offset
+    # Section 1.1 starts on page 2. Match is on page 2. Offset should be 0.
+    assert match.page_offset == 0
+    
+    # 3. Search for "Content for page 3" - should be on page 3.
+    # Page 3 is still under "Section 1.1" (which starts on page 2).
+    result = await test_client.call_tool(
+        "search_manual", {"manual_id": manual_id, "query": "Content for page 3"}
+    )
+    search_result = SearchResult.model_validate(result.structured_content)
+    match = next((m for m in search_result.results if m.page_num == 3), None)
+    assert match is not None, "Could not find match on page 3"
+    
+    # Verify hierarchy
+    assert len(match.bookmarks) == 2
+    assert match.bookmarks[1].title == "Section 1.1"
+    
+    # Verify page_offset
+    # Section 1.1 starts on page 2. Match is on page 3. Offset should be 1.
+    assert match.page_offset == 1
+    
+    # 4. Search for something that doesn't exist
+    result = await test_client.call_tool(
+        "search_manual", {"manual_id": manual_id, "query": "NonExistent"}
+    )
+    search_result = SearchResult.model_validate(result.structured_content)
+    assert len(search_result.results) == 0
+
+
+@pytest.mark.asyncio
+async def test_search_manual_with_bookmark_filter(test_client: Client):
+    """
+    Tests the search_manual tool with bookmark filtering.
+    """
+    # 1. Get manual ID and bookmarks
+    result = await test_client.call_tool("list_manuals")
+    manual_id = ManualInfo(**result.structured_content["result"][0]).id
+    
+    result = await test_client.call_tool("get_manual_metadata", {"manual_id": manual_id})
+    toc = ManualMetadata.model_validate(result.structured_content).table_of_contents
+    
+    # "Chapter 1" (page 1-14)
+    chapter1_id = toc[0].id
+    
+    # "Section 1.1" (page 2-14, child of Chapter 1)
+    section1_1_id = toc[0].children[0].id
+    
+    # 2. Search for "Content for page 1" restricted to Chapter 1
+    # Should be found (page 1 is in Chapter 1)
+    # Note: "Content for page 1" matches "Content for page 1", "Content for page 10", etc.
+    # Chapter 1 spans pages 1-14.
+    # Page 1 is in Chapter 1.
+    # Page 10, 11, 12, 13, 14 are also in Chapter 1.
+    # So we expect multiple matches.
+    # Let's verify that page 1 is among them.
+    result = await test_client.call_tool(
+        "search_manual", 
+        {"manual_id": manual_id, "query": "Content for page 1", "bookmark_id": chapter1_id}
+    )
+    search_result = SearchResult.model_validate(result.structured_content)
+    assert len(search_result.results) > 0
+    match_page_1 = next((m for m in search_result.results if m.page_num == 1), None)
+    assert match_page_1 is not None
+    assert match_page_1.page_num == 1
+    
+    # 3. Search for "Content for page 1" restricted to Section 1.1
+    # Should NOT be found (Section 1.1 starts on page 2)
+    # But wait, "Content for page 10" is on page 10, which IS in Section 1.1 (page 2-14).
+    # So "Content for page 1" WILL match "Content for page 10" in Section 1.1.
+    # We need a query that ONLY appears on page 1.
+    # The dummy content is "Content for page X".
+    # "Content for page 1 " (with space) might work if there is a space after number.
+    # Or search for "Content for page 1." (if there is a dot, but dummy factory doesn't add dot).
+    # Let's search for "Content for page 1" and verify that NO result has page_num == 1.
+    result = await test_client.call_tool(
+        "search_manual", 
+        {"manual_id": manual_id, "query": "Content for page 1", "bookmark_id": section1_1_id}
+    )
+    search_result = SearchResult.model_validate(result.structured_content)
+    # We expect matches for page 10, 11, etc., but NOT page 1.
+    match_page_1 = next((m for m in search_result.results if m.page_num == 1), None)
+    assert match_page_1 is None
+    
+    # 4. Search for "Content for page 2" restricted to Section 1.1
+    # Should be found
+    result = await test_client.call_tool(
+        "search_manual", 
+        {"manual_id": manual_id, "query": "Content for page 2", "bookmark_id": section1_1_id}
+    )
+    search_result = SearchResult.model_validate(result.structured_content)
+    assert len(search_result.results) == 1
+    assert search_result.results[0].page_num == 2
+    
+    # 5. Test invalid bookmark ID
+    with pytest.raises(ToolError, match="Bookmark with id 'invalid_id' not found"):
+        await test_client.call_tool(
+            "search_manual", 
+            {"manual_id": manual_id, "query": "test", "bookmark_id": "invalid_id"}
+        )
+
+

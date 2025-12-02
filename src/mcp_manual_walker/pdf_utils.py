@@ -2,7 +2,8 @@ import hashlib
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Dict, Generator, List, Optional
+from dataclasses import dataclass
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
@@ -162,3 +163,74 @@ def create_temp_pdf_from_page_range(
     except Exception as e:
         logger.error(f"Failed to create temporary PDF from {file_path}: {e}")
         return None
+
+
+@dataclass
+class PdfPageMatch:
+    page_num: int
+    context: str
+    match_index: int
+
+
+def search_pdf(
+    file_path: Path, 
+    query: str, 
+    start_page: Optional[int] = None, 
+    end_page: Optional[int] = None
+) -> List[PdfPageMatch]:
+    """
+    Searches for a query string in a PDF file and returns a list of matches.
+    The search is case-insensitive.
+    If start_page and/or end_page are provided (1-based, inclusive), 
+    only searches within that range.
+    If start_page > end_page, returns an empty list.
+    """
+    matches = []
+    
+    if start_page is not None and end_page is not None and start_page > end_page:
+        logger.warning(f"search_pdf: start_page ({start_page}) > end_page ({end_page}). Returning empty results.")
+        return []
+
+    try:
+        reader = PdfReader(str(file_path))
+        num_pages = len(reader.pages)
+        query_lower = query.lower()
+
+        # Determine start and end indices (0-based)
+        start_idx = 0
+        if start_page is not None:
+            start_idx = max(0, start_page - 1)
+        
+        end_idx = num_pages - 1
+        if end_page is not None:
+            end_idx = min(num_pages - 1, end_page - 1)
+
+        for i in range(start_idx, end_idx + 1):
+            page = reader.pages[i]
+            text = page.extract_text() or ""
+            text_lower = text.lower()
+            
+            start_index = 0
+            while True:
+                index = text_lower.find(query_lower, start_index)
+                if index == -1:
+                    break
+                
+                # Extract context (50 chars before and after)
+                context_start = max(0, index - 50)
+                context_end = min(len(text), index + len(query) + 50)
+                context = text[context_start:context_end]
+                
+                matches.append(PdfPageMatch(
+                    page_num=i + 1, # 1-based page number
+                    context=context.replace("\n", " "), # Clean up newlines for better display
+                    match_index=index
+                ))
+                
+                start_index = index + len(query)
+
+    except Exception as e:
+        logger.error(f"Error searching PDF {file_path}: {e}")
+        return []
+
+    return matches

@@ -47,3 +47,30 @@ class MarkdownContent(BaseModel):
         description="""The offset to use in the next request 
         to get the following pages. If null, this is the last page of the section.""",
     )
+
+
+class SearchResultItem(BaseModel):
+    page_num: int = Field(
+        ..., description="The absolute page number in the PDF (1-based)."
+    )
+    page_offset: int = Field(
+        ...,
+        description="The offset from the start of the bookmark section (0-based).",
+    )
+    bookmarks: List[BookmarkNode] = Field(
+        ..., description="The hierarchy of bookmarks leading to this result."
+    )
+    context: str = Field(
+        ..., description="A text snippet showing the search term in context."
+    )
+    match_index: int = Field(
+        ..., description="The character index of the match within the page text."
+    )
+
+
+class SearchResult(BaseModel):
+    manual_id: str = Field(..., description="The unique identifier of the manual.")
+    query: str = Field(..., description="The search query used.")
+    results: List[SearchResultItem] = Field(
+        ..., description="A list of search results found in the manual."
+    )

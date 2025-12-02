@@ -6,6 +6,7 @@ import pytest
 from mcp_manual_walker.pdf_utils import (
     calculate_file_hash,
     extract_pdf_metadata,
+    search_pdf,
 )
 
 
@@ -17,13 +18,16 @@ def pdf_for_utils_test(tmpdir_factory, dummy_pdf_factory):
     pdf_path = Path(tmpdir_factory.mktemp("data").join("utils_test_manual.pdf"))
     dummy_pdf_factory(
         path=pdf_path,
-        pages_content={1: "This is a test page."},
+        pages_content={
+            1: "This is a test page. Chapter 1: Introduction. Section 1.1: Overview.",
+            2: "Section 1.2: Details. More content here."
+        },
         metadata={"/Title": "Dummy Test Manual"},
         bookmarks={
             "Chapter 1: Introduction": (1, None),
             "Section 1.1: Overview": (1, "Chapter 1: Introduction"),
-            "Section 1.2: Details": (1, "Chapter 1: Introduction"),
-            "Chapter 2: Advanced Topics": (1, None),
+            "Section 1.2: Details": (2, "Chapter 1: Introduction"),
+            "Chapter 2: Advanced Topics": (2, None),
         },
     )
     return pdf_path
@@ -79,8 +83,10 @@ def test_extract_pdf_metadata(pdf_for_utils_test: Path):
     assert actual_levels == expected_levels
 
     # Check page numbers
-    for bm in bookmarks:
-        assert bm["page_num"] == 1  # pypdf returns 1-based page numbers
+    # Expected page numbers are [1, 1, 2, 2] based on the updated fixture
+    expected_page_nums = [1, 1, 2, 2]
+    actual_page_nums = [bm["page_num"] for bm in bookmarks]
+    assert actual_page_nums == expected_page_nums
 
 
 def test_extract_metadata_file_not_found():
@@ -91,3 +97,55 @@ def test_extract_metadata_file_not_found():
     assert not non_existent_path.exists()
     result = extract_pdf_metadata(non_existent_path)
     assert result is None
+
+
+def test_search_pdf(pdf_for_utils_test: Path):
+    """
+    Tests the search_pdf function.
+    """
+    # 1. Search for a term that exists
+    matches = search_pdf(pdf_for_utils_test, "Overview")
+    assert len(matches) == 1
+    assert matches[0].page_num == 1
+    assert "Overview" in matches[0].context
+    
+    # 2. Search for a term that doesn't exist
+    matches = search_pdf(pdf_for_utils_test, "NonExistentTerm")
+    assert len(matches) == 0
+    
+    # 3. Case insensitive search
+    matches = search_pdf(pdf_for_utils_test, "overview")
+    assert len(matches) == 1
+    assert matches[0].page_num == 1
+    
+    # 4. Search for a term that appears multiple times
+    matches = search_pdf(pdf_for_utils_test, "Section")
+    assert len(matches) == 2
+    # One on page 1, one on page 2
+    page_nums = sorted([m.page_num for m in matches])
+    assert page_nums == [1, 2]
+
+    # 5. Search with page range
+    # "Section" is on page 1 and 2.
+    
+    # Restrict to page 1
+    matches = search_pdf(pdf_for_utils_test, "Section", start_page=1, end_page=1)
+    assert len(matches) == 1
+    assert matches[0].page_num == 1
+    
+    # Restrict to page 2
+    matches = search_pdf(pdf_for_utils_test, "Section", start_page=2, end_page=2)
+    assert len(matches) == 1
+    assert matches[0].page_num == 2
+    
+    # Restrict to page 1-2 (should find both)
+    matches = search_pdf(pdf_for_utils_test, "Section", start_page=1, end_page=2)
+    assert len(matches) == 2
+    
+    # Restrict to page 3 (out of bounds/empty)
+    matches = search_pdf(pdf_for_utils_test, "Section", start_page=3, end_page=3)
+    assert len(matches) == 0
+
+    # 6. Invalid page range (start > end)
+    matches = search_pdf(pdf_for_utils_test, "Section", start_page=2, end_page=1)
+    assert len(matches) == 0
