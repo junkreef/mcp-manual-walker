@@ -2,6 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+import bisect
 from typing import Annotated, List, Optional
 
 from fastmcp import FastMCP
@@ -422,19 +423,19 @@ def search_manual(
             .all()
         )
         
+        # Let's just use a map for O(1) lookup since we have all bookmarks.
+        bookmark_map = {bm.id: bm for bm in all_bookmarks}
+        
         for match in pdf_matches:
             # Find the deepest bookmark that starts on or before the match page
-            # Since bookmarks are ordered by page_num, we can iterate to find the best candidate
-            current_bookmark = None
-            for bm in all_bookmarks:
-                if bm.page_num <= match.page_num:
-                    current_bookmark = bm
-                else:
-                    # We've passed the possible bookmarks for this page
-                    break
+            # Use binary search for optimization
+            idx = bisect.bisect_right(all_bookmarks, match.page_num, key=lambda b: b.page_num)
+            if idx > 0:
+                current_bookmark = all_bookmarks[idx - 1]
+            else:
+                current_bookmark = None
             
             # Build hierarchy
-            hierarchy = []
             bookmark_node_list = []
             page_offset = 0
             
@@ -446,8 +447,6 @@ def search_manual(
                 # We need to reconstruct the path. Since we have the parent_id, we can do this.
                 # However, our Bookmark model has a parent relationship, so we can use that if loaded.
                 # But we didn't eager load parents in the bulk query.
-                # Let's just use a map for O(1) lookup since we have all bookmarks.
-                bookmark_map = {bm.id: bm for bm in all_bookmarks}
                 
                 temp_bm = current_bookmark
                 path_nodes = []
