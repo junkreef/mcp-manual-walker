@@ -56,11 +56,12 @@ def extract_pdf_metadata(file_path: Path) -> Dict[str, Any]:
                             # get_destination_page_number can raise an error if the destination is invalid
                             page_num = reader.get_destination_page_number(item)
                             if page_num is not None:
-                                flat_list.append({
-                                    "title": item.title,
-                                    "level": level,
-                                    "page_num": page_num + 1,  # pypdf is 0-indexed
-                                })
+                                    flat_list.append({
+                                        "title": item.title,
+                                        "level": level,
+                                        "page_num": page_num + 1,  # pypdf is 0-indexed
+                                        "top": getattr(item, 'top', None), # Extract Y-coordinate
+                                    })
                         except Exception as e:
                             logger.warning(f"Could not resolve page for bookmark '{item.title}' in {file_path}. Skipping. Error: {e}")
 

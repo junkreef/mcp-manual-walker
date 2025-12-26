@@ -5,6 +5,7 @@ from sqlalchemy import (
     Column,
     Integer,
     String,
+    Float,
     DateTime,
     ForeignKey,
     PrimaryKeyConstraint,
@@ -41,6 +42,7 @@ class Bookmark(Base):
     title: Mapped[str] = Column(String, nullable=False)
     level: Mapped[int] = Column(Integer, nullable=False)
     page_num: Mapped[int] = Column(Integer, nullable=False)
+    page_top: Mapped[Optional[float]] = Column(Float, nullable=True)
     parent_id: Mapped[Optional[str]] = Column(String(36), ForeignKey("bookmarks.id"))
 
     manual: Mapped["Manual"] = relationship("Manual", back_populates="bookmarks")
