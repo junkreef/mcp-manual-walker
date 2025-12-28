@@ -73,9 +73,11 @@ def get_embedding_function():
     )
 
 
-def sync_manual_to_db(session: Session, pdf_path: Path, pdf_root: Path) -> Manual:
+def sync_manual_to_db(session: Session, pdf_path: Path, pdf_root: Path) -> tuple[Manual, bool]:
     """
     Syncs the Manual and Bookmarks to the SQLite DB.
+    Returns:
+        (Manual, bool): The manual object and a boolean indicating if it was updated/new (True) or unchanged (False).
     """
     # Use consistent relative path from the root PDF directory
     try:
@@ -114,7 +116,7 @@ def sync_manual_to_db(session: Session, pdf_path: Path, pdf_root: Path) -> Manua
         logger.info(f"Manual {pdf_path.name} found in DB. Checking hash...")
         if manual.file_hash == file_hash:
             logger.info("Hash match. Skipping DB sync (bookmarks).")
-            return manual
+            return manual, False
         else:
             logger.info("Hash mismatch. Updating...")
             # Delete old bookmarks
@@ -169,7 +171,7 @@ def sync_manual_to_db(session: Session, pdf_path: Path, pdf_root: Path) -> Manua
 
     session.commit()
     logger.info(f"Synced {len(bookmarks_data)} bookmarks to DB.")
-    return manual
+    return manual, True
 
 
 def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
@@ -229,7 +231,11 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
 
         try:
             # 1. Sync to Relational DB
-            manual = sync_manual_to_db(session, pdf_path, pdf_dir)
+            manual, updated = sync_manual_to_db(session, pdf_path, pdf_dir)
+
+            if not updated and not reset:
+                logger.info(f"File {pdf_path.name} unchanged. Skipping DB registration processing.")
+                continue
 
             # 2. Convert to Markdown (Docling)
             # We need the doc object for chunking
