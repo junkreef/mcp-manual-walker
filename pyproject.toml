@@ -54,5 +54,8 @@ filterwarnings = [
 [tool.coverage.run]
 source = ["src/mcp_manual_walker"]
 
+[project.scripts]
+db_manager = "mcp_manual_walker.db_manager:main"
+
 [tool.coverage.report]
 fail_under = 70
