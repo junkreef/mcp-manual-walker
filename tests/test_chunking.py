@@ -1,0 +1,121 @@
+from unittest.mock import MagicMock
+
+import pytest
+
+from mcp_manual_walker.chunking import chunk_text_by_coordinates
+from mcp_manual_walker.models import Bookmark, Manual
+
+
+@pytest.fixture
+def mock_manual():
+    manual = MagicMock(spec=Manual)
+    manual.id = "test_manual_id"
+    manual.bookmarks = []
+    # Configure bookmarks (lazy loaded usually, but mock list)
+    return manual
+
+
+def test_chunking_fallback_no_prov(mock_manual):
+    """Test chunking when docling items have no provenance (fallback)."""
+    # Create doc mock
+    doc = MagicMock()
+    item1 = MagicMock()
+    item1.text = "Start Text"
+    item1.prov = []  # No prov
+
+    item2 = MagicMock()
+    item2.text = "More Text"
+    item2.prov = []
+
+    doc.texts = [item1, item2]
+
+    chunks = chunk_text_by_coordinates(doc, mock_manual)
+
+    assert len(chunks) == 1
+    assert "Start Text" in chunks[0]["text"]
+    assert "More Text" in chunks[0]["text"]
+    assert chunks[0]["metadata"]["manual_id"] == "test_manual_id"
+    assert chunks[0]["metadata"]["bookmark_id"] is None
+
+
+def test_chunking_with_bookmarks(mock_manual):
+    """Test chunking with bookmarks and provenance."""
+    # Setup Bookmarks
+    # Page 1, Top 800 (Header 1)
+    # Page 1, Top 600 (Header 2)
+    bm1 = MagicMock(spec=Bookmark)
+    bm1.id = "bm1"
+    bm1.page_num = 1
+    bm1.page_top = 800.0
+    bm1.title = "Header 1"
+
+    bm2 = MagicMock(spec=Bookmark)
+    bm2.id = "bm2"
+    bm2.page_num = 1
+    bm2.page_top = 600.0
+    bm2.title = "Header 2"
+
+    # Needs to be iterable
+    mock_manual.bookmarks = [bm1, bm2]
+
+    # Setup Doc Items
+    doc = MagicMock()
+
+    # Item 1: Top 750 (Below Header 1 (800), Above Header 2 (600)) -> bm1
+    item1 = MagicMock()
+    item1.text = "Content for Header 1"
+    item1.prov = [MagicMock(page_no=1, bbox=MagicMock(t=750.0))]
+
+    # Item 2: Top 550 (Below Header 2 (600)) -> bm2
+    item2 = MagicMock()
+    item2.text = "Content for Header 2"
+    item2.prov = [MagicMock(page_no=1, bbox=MagicMock(t=550.0))]
+
+    # Item 3: Page 2, Top 800 (No BMs on page 2) -> Should continue bm2 (current)
+    # Or reset?
+    # Logic: if no candidate found on page, context persists?
+    # Logic says: if bms_by_page.get(page_no) is empty, candidate=None.
+    # if candidate: update current.
+    # So if candidate is None, current_bookmark stays same.
+    item3 = MagicMock()
+    item3.text = "Content on Page 2"
+    item3.prov = [MagicMock(page_no=2, bbox=MagicMock(t=800.0))]
+
+    doc.texts = [item1, item2, item3]
+
+    chunks = chunk_text_by_coordinates(doc, mock_manual)
+
+    # Expectation:
+    # 1. First text -> Matches bm1.
+    # Buffer: ["Content for Header 1"] (current=bm1)
+    # 2. Second text -> Matches bm2. Context switch!
+    # Chunk 1 emitted (bm1, "Content for Header 1")
+    # Buffer: ["Content for Header 2"] (current=bm2)
+    # 3. Third text -> Page 2. No BMs. Candidate=None.
+    # Context stays bm2.
+    # Buffer: ["Content for Header 2", "Content on Page 2"]
+    # End -> Flush Chunk 2 (bm2, "Content for Header 2\n\nContent on Page 2")
+
+    assert len(chunks) == 2
+
+    # Chunk 1
+    assert chunks[0]["metadata"]["bookmark_id"] == "bm1"
+    assert "Content for Header 1" in chunks[0]["text"]
+
+    # Chunk 2
+    assert chunks[1]["metadata"]["bookmark_id"] == "bm2"
+    assert "Content for Header 2" in chunks[1]["text"]
+    assert "Content on Page 2" in chunks[1]["text"]
+
+
+def test_chunking_no_doc_texts(mock_manual):
+    """Test fallback when doc has no texts attribute (e.g. Scanned PDF fallback not fully supported)."""
+    doc = MagicMock()
+    del doc.texts  # Ensure no texts attr
+    doc.export_to_markdown.return_value = "Full Generic Text"
+
+    chunks = chunk_text_by_coordinates(doc, mock_manual)
+
+    assert len(chunks) == 1
+    assert chunks[0]["text"] == "Full Generic Text"
+    assert chunks[0]["metadata"]["bookmark_id"] is None

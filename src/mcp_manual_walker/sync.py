@@ -1,6 +1,5 @@
 import logging
 import multiprocessing as mp
-import shutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional, TypedDict
@@ -34,14 +33,14 @@ def process_pdf_file(pdf_path_dict: dict) -> PDFProcessResult:
     Processes a single PDF file to extract its hash and metadata.
     Designed to be run in a separate process.
     """
-    
-    relative_path = pdf_path_dict['relative_path']
-    pdf_path = pdf_path_dict['data_root'] / relative_path
+
+    relative_path = pdf_path_dict["relative_path"]
+    pdf_path = pdf_path_dict["data_root"] / relative_path
 
     try:
         file_hash = calculate_file_hash(pdf_path)
         pdf_data = None
-        if file_hash != pdf_path_dict['current_hash']:
+        if file_hash != pdf_path_dict["current_hash"]:
             pdf_data = extract_pdf_metadata(pdf_path)
 
         return {
@@ -82,16 +81,18 @@ def sync_database() -> None:
         for p in scan_pdfs(pdf_root_path):
             relative_path_str = str(p.relative_to(pdf_root_path))
             manual = db_manuals.get(relative_path_str)
-            all_pdf_paths.append({
-                'data_root': pdf_root_path,
-                'relative_path': relative_path_str,
-                'current_hash': manual.file_hash if manual else None
-            })
+            all_pdf_paths.append(
+                {
+                    "data_root": pdf_root_path,
+                    "relative_path": relative_path_str,
+                    "current_hash": manual.file_hash if manual else None,
+                }
+            )
 
         fs_paths: set[str] = set()
 
         # Use ProcessPoolExecutor for parallel PDF processing
-        with ProcessPoolExecutor(mp_context=mp.get_context('spawn')) as executor:
+        with ProcessPoolExecutor(mp_context=mp.get_context("spawn")) as executor:
             # Map process_pdf_file to all PDF paths and collect results
             processed_results = list(executor.map(process_pdf_file, all_pdf_paths))
 
@@ -107,7 +108,7 @@ def sync_database() -> None:
                     f"{result['error']}"
                 )
                 continue
-            
+
             fs_paths.add(relative_path)
 
             file_hash = result["file_hash"]
@@ -121,13 +122,9 @@ def sync_database() -> None:
                 manual_to_delete = db_manuals.get(relative_path)
                 if manual_to_delete:
                     logger.info(f"'{relative_path}' has been updated. Re-processing.")
-                    # Delete old cache files on disk first
-                    shutil.rmtree(
-                        settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True
-                    )
                     # Deletion of the manual object will cascade in the DB
                     session.delete(manual_to_delete)
-                    # We need to flush to ensure the delete is processed before 
+                    # We need to flush to ensure the delete is processed before
                     # we add a new manual with potentially the same unique constraints.
                     session.flush()
                 else:
@@ -175,9 +172,6 @@ def sync_database() -> None:
         for path_to_delete in deleted_paths:
             manual_to_delete = db_manuals[path_to_delete]
             logger.info(f"'{path_to_delete}' has been removed. Deleting from database.")
-            shutil.rmtree(
-                settings.CACHE_DIR / manual_to_delete.id, ignore_errors=True
-            )
             session.delete(manual_to_delete)
 
         session.commit()

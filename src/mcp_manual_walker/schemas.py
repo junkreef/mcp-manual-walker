@@ -29,42 +29,21 @@ class ManualMetadata(ManualInfo):
 
 class MarkdownContent(BaseModel):
     markdown_content: str = Field(
-        ..., description="The converted Markdown content for the requested page range."
-    )
-    bookmark_total_pages: int = Field(
-        ..., description="The total number of pages within this bookmark section."
-    )
-    page_offset: int = Field(
         ...,
-        description="""The starting page offset of the returned content, 
-        0-indexed from the beginning of the bookmark section.""",
-    )
-    page_limit: int = Field(
-        ..., description="The number of pages returned in this response."
-    )
-    next_page_offset: Optional[int] = Field(
-        None,
-        description="""The offset to use in the next request 
-        to get the following pages. If null, this is the last page of the section.""",
+        description="The complete Markdown content for the requested bookmark section and its subsections.",
     )
 
 
 class SearchResultItem(BaseModel):
-    page_num: int = Field(
-        ..., description="The absolute page number in the PDF (1-based)."
-    )
-    page_offset: int = Field(
-        ...,
-        description="The offset from the start of the bookmark section (0-based).",
-    )
     bookmarks: List[BookmarkNode] = Field(
         ..., description="The hierarchy of bookmarks leading to this result."
     )
     context: str = Field(
-        ..., description="A text snippet showing the search term in context."
+        ..., description="The full text content of the matching chunk."
     )
-    match_index: int = Field(
-        ..., description="The character index of the match within the page text."
+    manual_id: str = Field(..., description="The unique identifier of the manual.")
+    bookmark_id: Optional[str] = Field(
+        None, description="The unique identifier of the bookmark this chunk belongs to."
     )
 
 

@@ -1,156 +1,144 @@
+import importlib
 import sys
-import shutil
-from pathlib import Path
-import pytest
 from unittest.mock import MagicMock, patch
 
-# Mock dependencies if they don't exist, so we can test the logic flow
-from unittest.mock import MagicMock
-import sys
+import pytest
 
-def mock_module(module_name):
-    if module_name not in sys.modules:
-        m = MagicMock()
-        sys.modules[module_name] = m
-        return m
-    return sys.modules[module_name]
-
-# Mocking modules before importing builder
-# We need to ensure nested modules exist too
-docling = mock_module("docling")
-docling_converter = mock_module("docling.document_converter")
-docling_models = mock_module("docling.datamodel.base_models")
-docling_opts = mock_module("docling.datamodel.pipeline_options")
-
-chromadb = mock_module("chromadb")
-chromadb_utils = mock_module("chromadb.utils")
-chromadb_ef = mock_module("chromadb.utils.embedding_functions")
-chromadb_config = mock_module("chromadb.config")
-
-lts = mock_module("langchain_text_splitters")
-
-# Now we can import builder, and it should find "docling" etc.
-docling_converter.DocumentConverter = MagicMock()
-lts.MarkdownHeaderTextSplitter = MagicMock()
-chromadb.PersistentClient = MagicMock()
-
-# Reload builder if it was already imported (unlikely in fresh pytest run but good practice)
-if "mcp_manual_walker.builder" in sys.modules:
-    del sys.modules["mcp_manual_walker.builder"]
-from mcp_manual_walker import builder
+from mcp_manual_walker import database
+from mcp_manual_walker.config import settings
 
 
 @pytest.fixture
-def sample_pdf(tmp_path):
-    """Creates a simple text file pretending to be PDF for logic test."""
-    # We don't need real PDF content since we mock the converter
-    pdf_path = tmp_path / "test.pdf"
-    pdf_path.write_text("dummy pdf content")
-    return pdf_path
+def mock_settings(tmp_path):
+    # Patch attributes of the existing settings object so that
+    # all modules (including database.py which presumably has already imported it)
+    # see the updated values.
+
+    new_db_path = tmp_path / "test.db"
+    new_pdf_dir = tmp_path / "pdfs"
+    new_chroma_path = tmp_path / "chroma_db"
+
+    new_markdown_path = tmp_path / "markdown"
+
+    # Use patch.object on the instance
+    with (
+        patch.object(settings, "DB_FILE_PATH", new_db_path),
+        patch.object(settings, "PDF_ROOT_DIR", new_pdf_dir),
+        patch.object(settings, "CHROMADB_PATH", new_chroma_path),
+        patch.object(settings, "MARKDOWN_OUTPUT_DIR", new_markdown_path),
+    ):
+        yield settings
+
+    # Cleanup: dispose engine created by builder.init_db() via database module
+    if database.engine:
+        database.engine.dispose()
 
 
-def test_builder_smoke(tmp_path, sample_pdf):
+def test_builder_smoke(tmp_path, mock_settings):
     """Smoke test for builder.py using MOCKED dependencies."""
-    
-    output_dir = tmp_path / "output"
-    # Create nested PDF structure to test recursive scan
+
+    # 1. Prepare Paths
+    # 1. Prepare Paths
     pdf_dir = tmp_path / "pdfs"
-    pdf_dir.mkdir()
+    pdf_dir.mkdir(exist_ok=True)
     sub_dir = pdf_dir / "subdir"
-    sub_dir.mkdir()
-    
-    shutil.copy(sample_pdf, pdf_dir / "sample.pdf")
-    shutil.copy(sample_pdf, sub_dir / "nested.pdf")
-    
-    # Configure Mocks
-    
-    # 1. Docling Converter
+    sub_dir.mkdir(exist_ok=True)
+
+    # Create dummy PDFs
+    (pdf_dir / "sample.pdf").write_text("dummy")
+    (sub_dir / "nested.pdf").write_text("dummy")
+
+    # 2. Prepare Mocks
+    mock_docling = MagicMock()
+    mock_docling_conv = MagicMock()
+    mock_docling.document_converter = mock_docling_conv
+
+    mock_lts = MagicMock()
+
+    mock_chromadb = MagicMock()
+    mock_chromadb.utils = MagicMock()
+    mock_chromadb.utils.embedding_functions = MagicMock()
+
+    # Mock Docling behavior
     mock_inst = MagicMock()
-    mock_doc = MagicMock()
-    # Export returns markdown
-    mock_doc.export_to_markdown.return_value = "# Header 1\n\nContent"
-    
-    # Mock doc.texts for chunking logic
-    # Structure:
-    # Header 1 (Level 1)
-    #   Text 1
-    #   Header 2 (Level 2)
-    #     Text 2
-    
-    item1 = MagicMock()
-    item1.text = "Header 1"
-    item1.label = "section_header"
-    item1.level = 1
-    
-    item2 = MagicMock()
-    item2.text = "Text 1"
-    item2.label = "text"
-    # No level attr usually on text
-    
-    item3 = MagicMock()
-    item3.text = "Header 2"
-    item3.label = "section_header"
-    item3.level = 2
-    
-    item4 = MagicMock()
-    item4.text = "Text 2"
-    item4.label = "text"
-    
-    mock_doc.texts = [item1, item2, item3, item4]
-    
     mock_res = MagicMock()
-    mock_res.document = mock_doc
+    mock_res.document.export_to_markdown.return_value = "MD Content"
     mock_inst.convert.return_value = mock_res
-    
-    builder.DocumentConverter.return_value = mock_inst
-    
-    # 2. Text Splitter - No longer used, but import mocked anyway
-    
-    # 3. ChromaDB
-    # get_embedding_function returns an object
-    # client.get_or_create_collection returns collection
-    mock_client = MagicMock()
+    mock_docling_conv.DocumentConverter.return_value = mock_inst
+
+    # Mock ChromaDB behavior
+    mock_client_inst = MagicMock()
     mock_coll = MagicMock()
-    mock_client.get_or_create_collection.return_value = mock_coll
-    builder.chromadb.PersistentClient.return_value = mock_client
-    
-    # Run the build
-    builder.build(pdf_dir, output_dir, reset=True)
-    
-    # Verify Interactions
-    
-    # Did we convert both files?
-    assert mock_inst.convert.call_count == 2
-    
-    # Did we add to Chroma?
-    # Each file should produce chunks.
-    # File 1: Header 1 (+ Text 1), Header 2 (+ Text 2) -> 2 chunks (because flush happens at next header or end)
-    # Wait, simple logic:
-    # 1. H1 -> Buffer=[# H1]
-    # 2. T1 -> Buffer=[# H1, T1]
-    # 3. H2 -> Flush (# H1\nT1) to Chunk 1. Buffer=[# H2]
-    # 4. T2 -> Buffer=[# H2, T2]
-    # End -> Flush (# H2\nT2) to Chunk 2.
-    # Total 2 chunks per file.
-    # 2 files => 4 chunks. But mock might be reset or reused.
-    # Since we mocked builder.DocumentConverter(), it returns same instance mock_inst.
-    # So add is called twice (batch likely per file in current impl).
-    
-    assert mock_coll.add.call_count == 2 
-    
-    # Check args of last call
-    call_args = mock_coll.add.call_args
-    kwargs = call_args[1]
-    
-    assert len(kwargs["ids"]) == 2
-    # Check hierarchy
-    # Chunk 1 meta: Header 1
-    # Chunk 2 meta: Header 1 > Header 2
-    metas = kwargs["metadatas"]
-    assert metas[0]["section_hierarchy"] == "Header 1"
-    assert metas[1]["section_hierarchy"] == "Header 1 > Header 2"
-    
-    # Check source path relative
-    # We don't know which file was processed last (glob order), but it should be relative
-    source = metas[0]["source"]
-    assert source in ["sample.pdf", "subdir/nested.pdf"]
+    mock_client_inst.get_or_create_collection.return_value = mock_coll
+    mock_chromadb.PersistentClient.return_value = mock_client_inst
+
+    # 3. Patch sys.modules and Run
+    with patch.dict(
+        sys.modules,
+        {
+            "docling": mock_docling,
+            "docling.document_converter": mock_docling_conv,
+            "langchain_text_splitters": mock_lts,
+            "chromadb": mock_chromadb,
+            "chromadb.utils": mock_chromadb.utils,
+            "chromadb.utils.embedding_functions": mock_chromadb.utils.embedding_functions,
+        },
+    ):
+        # Import/Reload builder inside patched environment
+        from mcp_manual_walker import builder
+
+        importlib.reload(builder)
+
+        # Patch local imports inside builder (which are now 'real' imports in the module object)
+        with (
+            patch("mcp_manual_walker.builder.extract_pdf_metadata") as mock_meta,
+            patch("mcp_manual_walker.builder.calculate_file_hash") as mock_hash,
+            patch("mcp_manual_walker.builder.chunk_text_by_coordinates") as mock_chunk,
+        ):
+            mock_hash.return_value = "dummy_hash"
+            mock_meta.return_value = {
+                "document_title": "Test Doc",
+                "page_count": 5,
+                "bookmarks": [
+                    {"title": "Intro", "level": 1, "page_num": 1, "top": 800.0}
+                ],
+            }
+            mock_chunk.return_value = [
+                {
+                    "text": "Chunk 1",
+                    "metadata": {"manual_id": "id", "bookmark_id": "bm1"},
+                },
+                {
+                    "text": "Chunk 2",
+                    "metadata": {"manual_id": "id", "bookmark_id": "bm2"},
+                },
+            ]
+
+            # Use the mocked dependencies via builder attribute if they were imported directly
+            # builder.DocumentConverter is from docling.document_converter
+            # Since we patched sys.modules BEFORE reload, builder should have picked up the mocks.
+            # builder.py:
+            # try: from docling.document_converter import DocumentConverter ...
+
+            # Since mock_docling_conv is in sys.modules, import should succeed and grab the mock.
+
+            # Run build twice to check coverage? Or just once with True
+            builder.build(pdf_dir, reset=True, save_markdown=True)
+
+            # Verify
+            assert mock_inst.convert.call_count == 2
+            assert mock_coll.add.call_count == 2
+
+            # Check args of last call
+            call_args = mock_coll.add.call_args
+            kwargs = call_args[1]
+
+            assert len(kwargs["ids"]) == 2
+            metas = kwargs["metadatas"]
+            # Check metadata keys
+            assert "bookmark_id" in metas[0]
+            assert metas[0]["bookmark_id"] == "bm1"
+            assert metas[1]["bookmark_id"] == "bm2"
+
+            # Check manual_id
+            assert "manual_id" in metas[0]

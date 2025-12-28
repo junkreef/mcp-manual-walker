@@ -15,6 +15,7 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "chromadb",
+    "sentence-transformers>=5.2.0",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +47,9 @@ package = true
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::ResourceWarning",
+]
 
 [tool.coverage.run]
 source = ["src/mcp_manual_walker"]

@@ -1707,6 +1707,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pypdf" },
+    { name = "sentence-transformers" },
     { name = "sqlalchemy" },
 ]
 
@@ -1742,6 +1743,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "reportlab", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "sentence-transformers", specifier = ">=5.2.0" },
     { name = "sentence-transformers", marker = "extra == 'builder'" },
     { name = "sqlalchemy" },
     { name = "uv", marker = "extra == 'dev'" },

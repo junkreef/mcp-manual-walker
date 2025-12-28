@@ -11,6 +11,7 @@ def dummy_pdf_factory():
     """
     A factory fixture to create dummy PDF files with hierarchical bookmarks for testing.
     """
+
     def _create_pdf(
         path: Path,
         pages_content: dict[int, str],
@@ -64,7 +65,7 @@ def dummy_pdf_factory():
                     child_item = writer.add_outline_item(
                         title, page_num - 1, parent=parent_item
                     )
-                    outline_map[title] = child_item # Allow for deeper nesting
+                    outline_map[title] = child_item  # Allow for deeper nesting
 
         with open(path, "wb") as f:
             writer.write(f)
