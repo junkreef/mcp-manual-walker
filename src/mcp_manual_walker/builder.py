@@ -6,8 +6,13 @@ import uuid
 import warnings
 from pathlib import Path
 
+# Imports for dependencies
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 # Suppress warnings from libraries
 warnings.filterwarnings("ignore")
+
 
 # Configure logging
 logging.basicConfig(
@@ -16,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("builder")
 
-# Imports for dependencies
+
 try:
     from docling.document_converter import DocumentConverter
     # We might need specific options if we want to speed up or customize
@@ -30,20 +35,17 @@ except ImportError:
 
 try:
     import chromadb
-    from chromadb.utils import embedding_functions
 except ImportError:
     chromadb = None
 
 # Imports for DB Sync
-from sqlalchemy import select
-from sqlalchemy.orm import Session
-
 # Local imports
 try:
     from mcp_manual_walker.chunking import chunk_text_by_coordinates
     from mcp_manual_walker.config import settings
-    from mcp_manual_walker.database import SessionLocal, engine, init_db
-    from mcp_manual_walker.models import Base, Bookmark, Manual
+    from mcp_manual_walker.database import SessionLocal, init_db
+    from mcp_manual_walker.embeddings import get_embedding_function as get_ef
+    from mcp_manual_walker.models import Bookmark, Manual
     from mcp_manual_walker.pdf_utils import calculate_file_hash, extract_pdf_metadata
 except ImportError as e:
     logger.error(f"Failed to import local modules: {e}")
@@ -66,14 +68,19 @@ def check_dependencies():
 
 
 def get_embedding_function():
-    # Helper to get the embedding function
-    # Using intfloat/multilingual-e5-small as requested
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="intfloat/multilingual-e5-small"
-    )
+    # Helper to get the embedding function via factory
+    ef = get_ef()
+    if ef is None:
+        logger.error(
+            "Could not load any embedding function. Please install 'fastembed' or 'sentence-transformers'."
+        )
+        sys.exit(1)
+    return ef
 
 
-def sync_manual_to_db(session: Session, pdf_path: Path, pdf_root: Path) -> tuple[Manual, bool]:
+def sync_manual_to_db(
+    session: Session, pdf_path: Path, pdf_root: Path
+) -> tuple[Manual, bool]:
     """
     Syncs the Manual and Bookmarks to the SQLite DB.
     Returns:
@@ -85,7 +92,7 @@ def sync_manual_to_db(session: Session, pdf_path: Path, pdf_root: Path) -> tuple
     except ValueError:
         # Fallback if path is not relative to root (should be rare in current usage)
         rel_path_str = pdf_path.name
-        
+
     file_hash = calculate_file_hash(pdf_path)
 
     # Extract metadata including bookmarks with TOP coordinates
@@ -234,7 +241,9 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
             manual, updated = sync_manual_to_db(session, pdf_path, pdf_dir)
 
             if not updated and not reset:
-                logger.info(f"File {pdf_path.name} unchanged. Skipping DB registration processing.")
+                logger.info(
+                    f"File {pdf_path.name} unchanged. Skipping DB registration processing."
+                )
                 continue
 
             # 2. Convert to Markdown (Docling)
@@ -265,12 +274,6 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
             rel_path = pdf_path.relative_to(
                 pdf_dir
             )  # Needed for metadata source if we want it relative
-
-            base_metadata = {
-                "source": str(rel_path),
-                "manual_id": str(manual.id),
-                "page": 0,
-            }
 
             for c in chunks:
                 meta = {

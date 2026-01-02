@@ -3,7 +3,6 @@ from contextlib import asynccontextmanager
 from typing import Annotated, List, Optional
 
 import chromadb
-from chromadb.utils import embedding_functions
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
@@ -11,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import SessionLocal, init_db
+from .embeddings import get_embedding_function
 from .models import Bookmark, Manual
 from .schemas import (
     BookmarkNode,
@@ -28,14 +28,7 @@ logger = logging.getLogger(__name__)
 # Global ChromaDB client and collection
 chroma_client = None
 collection = None
-
-
-def get_embedding_function():
-    # Helper to get the embedding function
-    # Using intfloat/multilingual-e5-small as configured in builder
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="intfloat/multilingual-e5-small"
-    )
+embedding_fn = None
 
 
 @asynccontextmanager
@@ -51,16 +44,18 @@ async def lifespan(app: FastMCP):
     init_db()
 
     logger.info("Initializing ChromaDB...")
-    global chroma_client, collection
+    global chroma_client, collection, embedding_fn
     try:
         chroma_client = chromadb.PersistentClient(
             path=str(settings.CHROMADB_PATH.resolve())
         )
+
+        # Load embedding function using factory
         embedding_fn = get_embedding_function()
-        # Expect collection to exist from builder
-        collection = chroma_client.get_collection(
-            name="manual_chunks", embedding_function=embedding_fn
-        )
+
+        # Get collection without enforcing EF to avoid strict validation mismatch
+        # We will handle embedding manually in search_manual
+        collection = chroma_client.get_collection(name="manual_chunks")
     except Exception as e:
         logger.error(f"Failed to initialize ChromaDB: {e}")
         # We don't raise here to allow server to start, but tools will fail if not fixed.
@@ -347,6 +342,9 @@ def search_manual(
     if collection is None:
         raise ToolError("Vector database is not initialized.")
 
+    if embedding_fn is None:
+        raise ToolError("Embedding function is not initialized.")
+
     db: Session = SessionLocal()
     try:
         where_clause = {"manual_id": manual_id}
@@ -358,8 +356,11 @@ def search_manual(
                 "$and": [{"manual_id": manual_id}, {"bookmark_id": {"$in": target_ids}}]
             }
 
-        # Query ChromaDB
-        results = collection.query(query_texts=[query], n_results=5, where=where_clause)
+        # Query ChromaDB with manual embedding
+        query_vec = embedding_fn([query])
+        results = collection.query(
+            query_embeddings=query_vec, n_results=5, where=where_clause
+        )
 
         # results is a dict with lists of lists (for documents, metadatas, etc.)
         # Structure: {'ids': [['id1', ...]], 'metadatas': [[{...}, ...]], 'documents': [['text', ...]]}
