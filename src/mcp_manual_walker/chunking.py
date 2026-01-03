@@ -137,7 +137,7 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
                 # Context Switch!
                 # Flush buffer
                 if current_text_buffer:
-                    chunk_content = "\\n\\n".join(current_text_buffer)
+                    chunk_content = "\n\n".join(current_text_buffer)
                     chunks.append(
                         {
                             "text": chunk_content,
@@ -156,7 +156,7 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
 
     # Flush final buffer
     if current_text_buffer:
-        chunk_content = "\\n\\n".join(current_text_buffer)
+        chunk_content = "\n\n".join(current_text_buffer)
         chunks.append(
             {
                 "text": chunk_content,

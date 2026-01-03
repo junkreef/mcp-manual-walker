@@ -295,31 +295,25 @@ def command_import(args):
                 mid = meta.get("manual_id")
                 # Add only if we imported the manual (avoid duplication scenarios or partial updates)
                 if mid in accepted_manual_ids:
-                    ids_to_add.append(chroma_data["ids"][i])
-                    # ChromaDB expects embeddings to be present if we pass them.
-                    # Json load gives us lists of floats.
-                    if chroma_data["embeddings"] and chroma_data["embeddings"][i]:
-                        embeddings_to_add.append(chroma_data["embeddings"][i])
+                    # Check embedding availability
+                    emb = None
+                    if chroma_data["embeddings"] and i < len(chroma_data["embeddings"]):
+                        emb = chroma_data["embeddings"][i]
+
+                    if emb:
+                        ids_to_add.append(chroma_data["ids"][i])
+                        embeddings_to_add.append(emb)
+                        metadatas_to_add.append(meta)
+                        documents_to_add.append(chroma_data["documents"][i])
                     else:
-                        # Ensure we don't pass mixed empty/non-empty if collection expects them?
-                        # If we don't pass embeddings, Chroma computes them.
-                        # But we want to avoid computation.
-                        # Export should have captured them.
-                        pass
-
-                    metadatas_to_add.append(meta)
-                    documents_to_add.append(chroma_data["documents"][i])
-
-            # Check lengths consistency
-            if len(embeddings_to_add) != len(ids_to_add):
-                # If embeddings were not in export for some reason, we might skip passing them.
-                # But our export includes them.
-                pass
+                        logger.warning(
+                            f"Skipping import of chunk {chroma_data['ids'][i]}: missing embedding."
+                        )
 
             if ids_to_add:
                 collection.add(
                     ids=ids_to_add,
-                    embeddings=embeddings_to_add if embeddings_to_add else None,
+                    embeddings=embeddings_to_add,
                     metadatas=metadatas_to_add,
                     documents=documents_to_add,
                 )

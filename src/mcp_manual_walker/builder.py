@@ -275,10 +275,11 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
                 pdf_dir
             )  # Needed for metadata source if we want it relative
 
-            for c in chunks:
+            for i, c in enumerate(chunks):
                 meta = {
                     "source": str(rel_path),
                     "manual_id": str(manual.id),
+                    "chunk_index": float(i),
                 }
 
                 if c["metadata"].get("bookmark_id"):

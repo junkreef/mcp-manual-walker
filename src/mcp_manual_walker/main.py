@@ -279,17 +279,25 @@ def get_markdown_content(
 
         # Safely zip and sort
         combined = []
-        if results["ids"] and results["documents"]:
+        if results["ids"] and results["documents"] and results["metadatas"]:
             for i, doc_id in enumerate(results["ids"]):
-                # doc_id format expected: "{manual_id}_{index}"
-                parts = doc_id.rsplit("_", 1)
+                meta = results["metadatas"][i]
+                # Default to a high number or -1? Or use loop index?
+                # If we rely on chunk_index, it should be there for new builds.
+                # Fallback to current index 'i' if missing might not be correct if results are shuffled?
+                # But 'get' usually returns in insertion order if no sort? No, 'get' order is not guaranteed.
+                # If chunk_index is missing, we might want to try parsing ID as legacy fallback?
+                # Let's assign priority: chunk_index > ID parse > 0
+                
                 idx = 0
-                if len(parts) == 2 and parts[1].isdigit():
-                    idx = int(parts[1])
-                elif len(parts) == 2:
-                    # fallback if manual_id contains _
-                    pass
-
+                if "chunk_index" in meta:
+                    idx = meta["chunk_index"]
+                else:
+                    # Legacy fallback
+                    parts = doc_id.rsplit("_", 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        idx = int(parts[1])
+                
                 combined.append((idx, results["documents"][i]))
 
         # Sort by index
