@@ -23,9 +23,9 @@ class Manual(Base):
     __tablename__ = "manuals"
 
     id: Mapped[str] = Column(String(36), primary_key=True, default=generate_uuid)
-    file_name: Mapped[str] = Column(String, unique=True, nullable=False)
+    file_name: Mapped[str] = Column(String, nullable=False)
     document_title: Mapped[Optional[str]] = Column(String)
-    relative_path: Mapped[str] = Column(String, nullable=False)
+    relative_path: Mapped[str] = Column(String, unique=True, nullable=False)
     file_hash: Mapped[str] = Column(String, nullable=False)
     page_count: Mapped[int] = Column(Integer, nullable=False)
     updated_at: Mapped[datetime] = Column(
