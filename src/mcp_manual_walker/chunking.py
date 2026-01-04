@@ -40,18 +40,11 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
     current_bookmark: Optional[Bookmark] = None
     current_text_buffer: List[str] = []
 
-    # Iterate Docling Text Items
-    # doc.texts is an iterator
-    count_items = 0
-
     for item in doc.texts:
-        count_items += 1
         text = item.text.strip()
         if not text:
             continue
 
-        # Get item location
-        # item.prov is a list of ProvenanceItem
         if not item.prov:
             # Fallback: keep current bookmark
             current_text_buffer.append(text)

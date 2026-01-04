@@ -100,22 +100,6 @@ def sync_manual_to_db(
     if not metadata:
         raise ValueError(f"Failed to extract metadata from {pdf_path}")
 
-    # Check existence by file_hash or relative_path?
-    # Duplicate filenames in different folders possible? Yes.
-    # We need a stable identifier. relative_path is good.
-    # In builder logic, we know the relative path from the root data dir ideally.
-    # But here we just assume pdf_dir is the root.
-
-    # Let's assume pdf_dir passed to build is the root for relative paths.
-    # For now, let's look up by hash to find exact duplicate content, OR look up by filename?
-    # unique=True on file_name in models.py suggests unique filenames.
-    # But usually relative_path is safer.
-
-    # Let's search by file_name for now as per models.py uniqueness?
-    # models.py: file_name: Mapped[str] = Column(String, unique=True, nullable=False)
-    # This might be restrictive if folder structure matters.
-    # But let's stick to it.
-
     stmt = select(Manual).where(Manual.relative_path == str(pdf_path.relative_to(pdf_root)))
     manual = session.execute(stmt).scalars().first()
 
