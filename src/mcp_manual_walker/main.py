@@ -27,9 +27,14 @@ logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # Global ChromaDB client and collection
-chroma_client = None
-collection = None
-embedding_fn = None
+# Global AppState
+class AppState:
+    def __init__(self):
+        self.chroma_client = None
+        self.collection = None
+        self.embedding_fn = None
+
+app_state = AppState()
 
 
 @asynccontextmanager
@@ -45,7 +50,6 @@ async def lifespan(app: FastMCP):
     init_db()
 
     logger.info("Initializing ChromaDB...")
-    global chroma_client, collection, embedding_fn
     try:
         chroma_client = chromadb.PersistentClient(
             path=str(settings.CHROMADB_PATH.resolve())
@@ -57,6 +61,12 @@ async def lifespan(app: FastMCP):
         # Get collection without enforcing EF to avoid strict validation mismatch
         # We will handle embedding manually in search_manual
         collection = chroma_client.get_collection(name="manual_chunks")
+        
+        # Store in explicit app_state
+        app_state.chroma_client = chroma_client
+        app_state.embedding_fn = embedding_fn
+        app_state.collection = collection
+        
     except Exception as e:
         logger.error(f"Failed to initialize ChromaDB: {e}")
         # We don't raise here to allow server to start, but tools will fail if not fixed.
@@ -242,8 +252,9 @@ def get_markdown_content(
     ],
 ) -> MarkdownContent:
     """Returns the Markdown content for a specific bookmark from the Vector DB."""
-    if collection is None:
+    if app_state.collection is None:
         raise ToolError("Vector database is not initialized.")
+    collection = app_state.collection
 
     db: Session = SessionLocal()
     try:
@@ -348,11 +359,15 @@ def search_manual(
     ] = None,
 ) -> SearchResult:
     """Searches for text in a manual and returns matches with context and hierarchy."""
-    if collection is None:
+    """Searches for text in a manual and returns matches with context and hierarchy."""
+    if app_state.collection is None:
         raise ToolError("Vector database is not initialized.")
 
-    if embedding_fn is None:
+    if app_state.embedding_fn is None:
         raise ToolError("Embedding function is not initialized.")
+
+    collection = app_state.collection
+    embedding_fn = app_state.embedding_fn
 
     db: Session = SessionLocal()
     try:
