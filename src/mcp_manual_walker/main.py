@@ -6,6 +6,7 @@ import chromadb
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -304,8 +305,8 @@ def get_markdown_content(
         combined.sort(key=lambda x: x[0])
 
         # Join text
-        avg_text = [t for _, t in combined]
-        final_content = "\n\n".join(avg_text)
+        sorted_texts = [t for _, t in combined]
+        final_content = "\n\n".join(sorted_texts)
 
         return MarkdownContent(markdown_content=final_content)
 
@@ -384,7 +385,7 @@ def search_manual(
             # We can't easily pre-fetch just the parents needed without knowing them.
             # But we can cache the manual's bookmarks map.
             all_bookmarks = (
-                db.query(Bookmark).filter(Bookmark.manual_id == manual_id).all()
+                db.scalars(select(Bookmark).where(Bookmark.manual_id == manual_id)).all()
             )
             bookmark_map = {bm.id: bm for bm in all_bookmarks}
 

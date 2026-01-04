@@ -25,20 +25,6 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
     # Filter out bookmarks without page_num (should n't happen if inserted correctly)
     raw_bookmarks = [bm for bm in manual.bookmarks]
 
-    # Sort: Primary = Page Num (ASC), Secondary = Top (DESC)
-    # Note: Top can be None? (e.g. root bookmark without destination).
-    # If Top is None, it effectively spans the whole page? Or handled via parentage?
-    # pypdf usually gives destination. If missing, assume Top=842 (A4 height) or 0?
-    # For now, treat None as "Top of page" (High value) to be safe?
-    # Or ignore for coordinate matching?
-    # If a chapter starts at page 5, top=None -> It's at the start.
-
-    def get_sort_key(bm):
-        p = bm.page_num
-        t = bm.page_top if bm.page_top is not None else 9999.0  # Assume top of page
-        return (p, t)
-
-    # We need efficient lookup per page
     bms_by_page: Dict[int, List[Bookmark]] = {}
     for bm in raw_bookmarks:
         if bm.page_num not in bms_by_page:

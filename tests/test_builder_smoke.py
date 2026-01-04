@@ -142,3 +142,4 @@ def test_builder_smoke(tmp_path, mock_settings):
 
             # Check manual_id
             assert "manual_id" in metas[0]
+

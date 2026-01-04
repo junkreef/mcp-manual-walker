@@ -193,7 +193,7 @@ def test_command_import(mock_session, mock_chroma):
         patch("builtins.open", mock_open()),
         patch("json.load") as mock_json_load,
         patch("mcp_manual_walker.db_manager.Path") as MockPath,
-        patch("mcp_manual_walker.builder.get_embedding_function"),
+        patch("mcp_manual_walker.db_manager.get_embedding_function"),
     ):
         # Setup mocks
         mock_path_inst = MockPath.return_value
@@ -202,7 +202,7 @@ def test_command_import(mock_session, mock_chroma):
         mock_json_load.side_effect = [manifest_data, sqlite_data, chroma_data]
 
         # FIX: Ensure query returns None so it doesn't skip
-        mock_session.query.return_value.filter_by.return_value.first.return_value = None
+        mock_session.scalars.return_value.first.return_value = None
 
         # Act
         command_import(args)

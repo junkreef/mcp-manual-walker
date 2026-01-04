@@ -242,7 +242,7 @@ def command_import(args):
 
         for manual_dict in sqlite_data:
             # Check existence
-            existing = session.query(Manual).filter_by(id=manual_dict["id"]).first()
+            existing = session.scalars(select(Manual).where(Manual.id == manual_dict["id"])).first()
             if existing:
                 logger.warning(
                     f"Manual {manual_dict['relative_path']} (ID: {manual_dict['id']}) already exists. Skipping."

@@ -98,7 +98,7 @@ def sync_manual_to_db(
     # Extract metadata including bookmarks with TOP coordinates
     metadata = extract_pdf_metadata(pdf_path)
     if not metadata:
-        raise Exception(f"Failed to extract metadata from {pdf_path}")
+        raise ValueError(f"Failed to extract metadata from {pdf_path}")
 
     # Check existence by file_hash or relative_path?
     # Duplicate filenames in different folders possible? Yes.
@@ -116,21 +116,20 @@ def sync_manual_to_db(
     # This might be restrictive if folder structure matters.
     # But let's stick to it.
 
-    stmt = select(Manual).where(Manual.file_name == pdf_path.name)
+    stmt = select(Manual).where(Manual.relative_path == str(pdf_path.relative_to(pdf_root)))
     manual = session.execute(stmt).scalars().first()
 
     if manual:
-        logger.info(f"Manual {pdf_path.name} found in DB. Checking hash...")
+        logger.info(f"Manual {str(pdf_path.relative_to(pdf_root))} found in DB. Checking hash...")
         if manual.file_hash == file_hash:
             logger.info("Hash match. Skipping DB sync (bookmarks).")
             return manual, False
         else:
             logger.info("Hash mismatch. Updating...")
             # Delete old bookmarks
-            for bm in manual.bookmarks:
-                session.delete(bm)
+            manual.bookmarks.clear()
     else:
-        logger.info(f"Creating new Manual entry for {pdf_path.name}")
+        logger.info(f"Creating new Manual entry for {str(pdf_path.relative_to(pdf_root))}")
         manual = Manual(id=str(uuid.uuid4()))
         session.add(manual)
 
@@ -234,7 +233,7 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
     converter = DocumentConverter()
 
     for pdf_path in pdf_files:
-        logger.info(f"Processing {pdf_path.name}...")
+        logger.info(f"Processing {str(pdf_path.relative_to(pdf_dir))}...")
 
         try:
             # 1. Sync to Relational DB
@@ -242,7 +241,7 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
 
             if not updated and not reset:
                 logger.info(
-                    f"File {pdf_path.name} unchanged. Skipping DB registration processing."
+                    f"File {str(pdf_path.relative_to(pdf_dir))} unchanged. Skipping DB registration processing."
                 )
                 continue
 
@@ -261,7 +260,7 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
 
             # 3. Coordinate-Based Chunking
             chunks = chunk_text_by_coordinates(result.document, manual)
-            logger.info(f"Generated {len(chunks)} chunks for {pdf_path.name}")
+            logger.info(f"Generated {len(chunks)} chunks for {pdf_path.relative_to(pdf_dir)}")
 
             if not chunks:
                 continue
