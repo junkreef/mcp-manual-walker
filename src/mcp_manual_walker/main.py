@@ -1,28 +1,18 @@
 import logging
-import os
 from contextlib import asynccontextmanager
-from pathlib import Path
-import bisect
 from typing import Annotated, List, Optional
 
+import chromadb
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from markitdown import MarkItDown
 from pydantic import Field
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from .cache_utils import (
-    batch_update_last_accessed,
-    create_page_cache,
-    find_page_cache,
-)
 from .config import settings
 from .database import SessionLocal, init_db
+from .embeddings import get_embedding_function
 from .models import Bookmark, Manual
-from .pdf_utils import (
-    create_temp_pdf_from_page_range,
-    search_pdf,
-)
 from .schemas import (
     BookmarkNode,
     ManualInfo,
@@ -36,6 +26,16 @@ from .schemas import (
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
+# Global ChromaDB client and collection
+# Global AppState
+class AppState:
+    def __init__(self):
+        self.chroma_client = None
+        self.collection = None
+        self.embedding_fn = None
+
+app_state = AppState()
+
 
 @asynccontextmanager
 async def lifespan(app: FastMCP):
@@ -44,10 +44,33 @@ async def lifespan(app: FastMCP):
     # Ensure all necessary directories exist before initializing the database
     settings.DB_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     settings.PDF_ROOT_DIR.mkdir(parents=True, exist_ok=True)
-    settings.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    settings.CHROMADB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Initializing database...")
     init_db()
+
+    logger.info("Initializing ChromaDB...")
+    try:
+        chroma_client = chromadb.PersistentClient(
+            path=str(settings.CHROMADB_PATH.resolve())
+        )
+
+        # Load embedding function using factory
+        embedding_fn = get_embedding_function()
+
+        # Get collection without enforcing EF to avoid strict validation mismatch
+        # We will handle embedding manually in search_manual
+        collection = chroma_client.get_collection(name="manual_chunks")
+        
+        # Store in explicit app_state
+        app_state.chroma_client = chroma_client
+        app_state.embedding_fn = embedding_fn
+        app_state.collection = collection
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB: {e}")
+        # We don't raise here to allow server to start, but tools will fail if not fixed.
+
     yield
 
 
@@ -161,21 +184,61 @@ def get_manual_metadata(
         db.close()
 
 
+def _get_descendant_bookmark_ids(
+    manual_id: str, bookmark_id: str, db: Session
+) -> List[str]:
+    """Retrieves the list of bookmark IDs for the given bookmark and all its descendants."""
+    target_bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
+    if not target_bookmark:
+        raise ToolError(f"Bookmark with id '{bookmark_id}' not found.")
+
+    if target_bookmark.manual_id != manual_id:
+        raise ToolError(
+            f"Bookmark '{bookmark_id}' does not belong to manual '{manual_id}'."
+        )
+
+    # Efficiently find descendants.
+    # Since we have 'ordering' and 'level', descendants follow immediately
+    # and have level > target.level.
+    # We stop when we hit a bookmark with level <= target.level.
+
+    # Get all subsequent bookmarks for this manual
+    subsequent_bookmarks = (
+        db.query(Bookmark)
+        .filter(
+            Bookmark.manual_id == manual_id,
+            Bookmark.ordering >= target_bookmark.ordering,
+        )
+        .order_by(Bookmark.ordering)
+        .all()
+    )
+
+    descendant_ids = []
+    # The first one is the target itself
+    for bm in subsequent_bookmarks:
+        if bm.id == bookmark_id:
+            descendant_ids.append(bm.id)
+            continue
+
+        if bm.level > target_bookmark.level:
+            descendant_ids.append(bm.id)
+        else:
+            # We reached a sibling or parent (level <= target), so we stop
+            break
+
+    return descendant_ids
+
+
 @app.tool(
     name="get_markdown_content",
     description="""Fetches the Markdown content for a specific bookmark (section) within
-      a manual. The content is returned in paginated form to handle large sections
-      efficiently. Use the `page_offset` and `page_limit` parameters to control
-      pagination. The response includes the `next_page_offset` which should be used in
-      subsequent calls to retrieve the rest of the content for that section.
-
+      a manual using the Vector DB. This returns the pre-processed text chunks associated
+      with the bookmark and its sub-sections.
+      
     Workflow Example:
     1. Get a `bookmark_id` from the `table_of_contents` provided by
       `get_manual_metadata()`.
-    2. Call `get_markdown_content(bookmark_id=...)` to get the first chunk of content.
-    3. If `next_page_offset` in the response is not null, call `get_markdown_content()`
-      again with the same `bookmark_id` and the new `page_offset` to get the next page.
-    4. Repeat until `next_page_offset` is null.""",
+    2. Call `get_markdown_content(bookmark_id=...)` to get the content.""",
     tags={"manual", "content", "markdown"},
     annotations={"readOnlyHint": True},
 )
@@ -187,146 +250,78 @@ def get_markdown_content(
             obtained from `get_manual_metadata`."""
         ),
     ],
-    page_offset: Annotated[
-        int,
-        Field(
-            description="""The starting page offset within 
-            the bookmark section (0-indexed).""",
-            default=0,
-            ge=0,
-        ),
-    ] = 0,
-    page_limit: Annotated[
-        Optional[int],
-        Field(
-            description="""The maximum number of pages to return.
-            Defaults to the server-side setting.""",
-            default=None,
-            ge=1,
-        ),
-    ] = None,
 ) -> MarkdownContent:
-    """Returns the Markdown content for a specific bookmark, with pagination."""
+    """Returns the Markdown content for a specific bookmark from the Vector DB."""
+    if app_state.collection is None:
+        raise ToolError("Vector database is not initialized.")
+    collection = app_state.collection
+
     db: Session = SessionLocal()
-    markdown_converter = MarkItDown()
-    temp_pdf_path: Path | None = None
     try:
-        bookmark = (
-            db.query(Bookmark)
-            .filter(Bookmark.id == bookmark_id)
-            .options(joinedload(Bookmark.manual))
-            .first()
-        )
+        # Resolve bookmark and manual
+        bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
         if not bookmark:
             raise ToolError(f"Bookmark with id '{bookmark_id}' not found.")
 
-        manual = bookmark.manual
-        pdf_path = settings.PDF_ROOT_DIR.resolve() / manual.relative_path
+        manual_id = bookmark.manual_id
 
-        # 1. Determine the full page range of the bookmark
-        bookmark_start_page = bookmark.page_num
-        next_bookmark = (
-            db.query(Bookmark)
-            .filter(
-                Bookmark.manual_id == manual.id,
-                Bookmark.ordering > bookmark.ordering,
-                Bookmark.level <= bookmark.level,
-            )
-            .order_by(Bookmark.ordering)
-            .first()
-        )
+        # Get all relevant bookmark IDs (hierarchical)
+        target_bookmark_ids = _get_descendant_bookmark_ids(manual_id, bookmark_id, db)
 
-        if next_bookmark:
-            bookmark_end_page = next_bookmark.page_num - 1
-        else:
-            # If it's the last bookmark, go to the end of the PDF
-            bookmark_end_page = manual.page_count
+        # Query ChromaDB
+        # We want chunks where manual_id matches AND bookmark_id is in our list
 
-        bookmark_total_pages = (bookmark_end_page - bookmark_start_page) + 1
-        if bookmark_total_pages <= 0:
-            content_data = {
-                "markdown_content": "",
-                "bookmark_total_pages": 0,
-                "page_offset": 0,
-                "page_limit": 0,
-                "next_page_offset": None,
+        # Chroma where clause:
+        # {"$and": [{"manual_id": manual_id}, {"bookmark_id": {"$in": target_bookmark_ids}}]}
+
+        results = collection.get(
+            where={
+                "$and": [
+                    {"manual_id": manual_id},
+                    {"bookmark_id": {"$in": target_bookmark_ids}},
+                ]
             }
-            return MarkdownContent.model_validate(content_data)
-
-        # 2. Determine the processing chunk based on limits
-        limit = min(
-            page_limit or settings.MAX_PAGES_PER_REQUEST, settings.MAX_PAGES_PER_REQUEST
         )
 
-        if page_offset >= bookmark_total_pages:
-            raise ToolError("page_offset is out of bounds.")
+        # results['documents'] is a list of strings
+        # results['ids'] is a list of IDs.
+        # We should sort them. Assuming IDs are like "manual_id_index" where index is integer.
+        # But ids are strings. "uuid_0", "uuid_1", "uuid_10". String sort is bad for "10" vs "2".
+        # Let's try to extract index from ID.
 
-        # 3. Calculate absolute page numbers for the chunk
-        chunk_start_page = bookmark_start_page + page_offset
-        chunk_end_page = min(chunk_start_page + limit - 1, bookmark_end_page)
+        # Safely zip and sort
+        combined = []
+        if results["ids"] and results["documents"] and results["metadatas"]:
+            for i, doc_id in enumerate(results["ids"]):
+                meta = results["metadatas"][i]
+                # Default to a high number or -1? Or use loop index?
+                # If we rely on chunk_index, it should be there for new builds.
+                # Fallback to current index 'i' if missing might not be correct if results are shuffled?
+                # But 'get' usually returns in insertion order if no sort? No, 'get' order is not guaranteed.
+                # If chunk_index is missing, we might want to try parsing ID as legacy fallback?
+                # Let's assign priority: chunk_index > ID parse > 0
+                
+                idx = 0
+                if "chunk_index" in meta:
+                    idx = meta["chunk_index"]
+                else:
+                    # Legacy fallback
+                    parts = doc_id.rsplit("_", 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        idx = int(parts[1])
+                
+                combined.append((idx, results["documents"][i]))
 
-        # 4. Process pages in the chunk
-        markdown_parts = []
-        processed_page_nums = []
-        for page_num in range(chunk_start_page, chunk_end_page + 1):
-            processed_page_nums.append(page_num)
-            cached_content = find_page_cache(manual, page_num, db)
-            if cached_content is not None:
-                markdown_parts.append(cached_content)
-                continue
+        # Sort by index
+        combined.sort(key=lambda x: x[0])
 
-            # Cache miss: process the single page
-            logger.info(
-                f"Cache miss for page {page_num} of '{manual.file_name}'. Processing."
-            )
-            temp_pdf_path = create_temp_pdf_from_page_range(
-                pdf_path, page_num, page_num
-            )
-            if not temp_pdf_path:
-                error_msg = f"""Page {page_num} could not be processed: 
-                failed to create temporary PDF."""
-                logger.error(error_msg)
-                raise ToolError(error_msg)
+        # Join text
+        sorted_texts = [t for _, t in combined]
+        final_content = "\n\n".join(sorted_texts)
 
-            try:
-                conversion_result = markdown_converter.convert(str(temp_pdf_path))
-                page_content = conversion_result.markdown if conversion_result else ""
-                if not page_content:
-                    logger.warning(
-                        f"""Page {page_num} of '{manual.file_name}' 
-                        converted to empty content."""
-                    )
-
-                markdown_parts.append(page_content)
-                create_page_cache(manual, page_num, page_content, db)
-            finally:
-                if os.path.exists(temp_pdf_path):
-                    os.remove(temp_pdf_path)
-
-        # 5. Batch update access times
-        batch_update_last_accessed(manual.id, processed_page_nums, db)
-
-        # All DB operations for the chunk are complete, commit them.
-        db.commit()
-
-        # 6. Construct the response
-        final_content = "\n\n---\n\n".join(markdown_parts)
-        actual_limit = len(processed_page_nums)
-        next_page_offset = page_offset + actual_limit
-        if next_page_offset >= bookmark_total_pages:
-            next_page_offset = None
-
-        content_data = {
-            "markdown_content": final_content,
-            "bookmark_total_pages": bookmark_total_pages,
-            "page_offset": page_offset,
-            "page_limit": actual_limit,
-            "next_page_offset": next_page_offset,
-        }
-        return MarkdownContent.model_validate(content_data)
+        return MarkdownContent(markdown_content=final_content)
 
     except Exception as e:
-        db.rollback()
         logger.exception(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
         raise ToolError(e)
     finally:
@@ -335,18 +330,14 @@ def get_markdown_content(
 
 @app.tool(
     name="search_manual",
-    description="""Searches for a query string within a specific manual.
-    Returns a list of matches, each with the page number, context, and the
-    hierarchical path of headings (bookmarks) leading to that page.
-    The search is case-insensitive.
+    description="""Searches for a query string within a specific manual using semantic search.
+    Returns the top matching text chunks.
     
     Optionally, a `bookmark_id` can be provided to restrict the search to a specific
-    section of the manual.
+    section of the manual (including subsections).
 
     Workflow Example:
     1. Call `search_manual(manual_id=..., query="...")` to find occurrences.
-    2. Use the `page_offset` from a result item to jump to that location using
-       `get_markdown_content`.
     """,
     tags={"manual", "search"},
     annotations={"readOnlyHint": True},
@@ -362,133 +353,99 @@ def search_manual(
     ],
     bookmark_id: Annotated[
         Optional[str],
-        Field(description="Optional bookmark ID to restrict search to a specific section."),
+        Field(
+            description="Optional bookmark ID to restrict search to a specific section."
+        ),
     ] = None,
 ) -> SearchResult:
     """Searches for text in a manual and returns matches with context and hierarchy."""
+    """Searches for text in a manual and returns matches with context and hierarchy."""
+    if app_state.collection is None:
+        raise ToolError("Vector database is not initialized.")
+
+    if app_state.embedding_fn is None:
+        raise ToolError("Embedding function is not initialized.")
+
+    collection = app_state.collection
+    embedding_fn = app_state.embedding_fn
+
     db: Session = SessionLocal()
     try:
-        manual = db.query(Manual).filter(Manual.id == manual_id).first()
-        if not manual:
-            raise ToolError(f"Manual with id '{manual_id}' not found.")
+        where_clause = {"manual_id": manual_id}
 
-        pdf_path = settings.PDF_ROOT_DIR.resolve() / manual.relative_path
-        
-        start_page = None
-        end_page = None
-        
         if bookmark_id:
-            bookmark = (
-                db.query(Bookmark)
-                .filter(Bookmark.id == bookmark_id)
-                .first()
-            )
-            if not bookmark:
-                raise ToolError(f"Bookmark with id '{bookmark_id}' not found.")
-            
-            if bookmark.manual_id != manual_id:
-                raise ToolError(f"Bookmark '{bookmark_id}' does not belong to manual '{manual_id}'.")
-            
-            start_page = bookmark.page_num
-            
-            # Find the next bookmark to determine the end of this section
-            next_bookmark = (
-                db.query(Bookmark)
-                .filter(
-                    Bookmark.manual_id == manual.id,
-                    Bookmark.ordering > bookmark.ordering,
-                    Bookmark.level <= bookmark.level,
-                )
-                .order_by(Bookmark.ordering)
-                .first()
-            )
-            
-            if next_bookmark:
-                end_page = next_bookmark.page_num - 1
-            else:
-                end_page = manual.page_count
+            # Hierarchical filter
+            target_ids = _get_descendant_bookmark_ids(manual_id, bookmark_id, db)
+            where_clause = {
+                "$and": [{"manual_id": manual_id}, {"bookmark_id": {"$in": target_ids}}]
+            }
 
-        # 1. Perform the text search on the PDF
-        pdf_matches = search_pdf(pdf_path, query, start_page=start_page, end_page=end_page)
-        
-        # 2. Enhance matches with bookmark hierarchy
-        results = []
-        
-        # Pre-fetch all bookmarks for this manual to minimize DB queries
-        # Ordered by page_num then ordering to help with finding the right bookmark
-        all_bookmarks = (
-            db.query(Bookmark)
-            .filter(Bookmark.manual_id == manual.id)
-            .order_by(Bookmark.page_num.asc(), Bookmark.ordering.asc())
-            .all()
+        # Query ChromaDB with manual embedding
+        query_vec = embedding_fn([query])
+        results = collection.query(
+            query_embeddings=query_vec, n_results=5, where=where_clause
         )
-        
-        # Let's just use a map for O(1) lookup since we have all bookmarks.
-        bookmark_map = {bm.id: bm for bm in all_bookmarks}
-        
-        for match in pdf_matches:
-            # Find the deepest bookmark that starts on or before the match page
-            # Use binary search for optimization
-            idx = bisect.bisect_right(all_bookmarks, match.page_num, key=lambda b: b.page_num)
-            if idx > 0:
-                current_bookmark = all_bookmarks[idx - 1]
-            else:
-                current_bookmark = None
-            
-            # Build hierarchy
-            bookmark_node_list = []
-            page_offset = 0
-            
-            if current_bookmark:
-                # Calculate offset from the start of the bookmark
-                page_offset = match.page_num - current_bookmark.page_num
-                
-                # Traverse up to build the full hierarchy
-                # We need to reconstruct the path. Since we have the parent_id, we can do this.
-                # However, our Bookmark model has a parent relationship, so we can use that if loaded.
-                # But we didn't eager load parents in the bulk query.
-                
-                temp_bm = current_bookmark
-                path_nodes = []
-                while temp_bm:
-                    path_nodes.append(temp_bm)
-                    if temp_bm.parent_id:
-                        temp_bm = bookmark_map.get(temp_bm.parent_id)
-                    else:
-                        temp_bm = None
-                
-                # Reverse to get root-to-leaf order
-                path_nodes.reverse()
-                
-                # Convert to BookmarkNode (simplified, no children needed for the path list itself usually, 
-                # but schema asks for BookmarkNode which has children field. 
-                # We will return the nodes as a flat list representing the path, 
-                # so 'children' can be empty for these nodes in this context.)
-                for node in path_nodes:
-                    bookmark_node_list.append(BookmarkNode(
-                        id=node.id,
-                        title=node.title,
-                        page=node.page_num,
-                        children=[] # We don't need the full tree here, just the path
-                    ))
-            else:
-                 # Match is before any bookmark (e.g. title page)
-                 # We can leave bookmarks list empty or create a pseudo-node if needed.
-                 # Schema says bookmarks is List[BookmarkNode]. Empty list is valid.
-                 page_offset = match.page_num - 1 # Offset from start of doc if no bookmark
-            
-            results.append(SearchResultItem(
-                page_num=match.page_num,
-                page_offset=page_offset,
-                bookmarks=bookmark_node_list,
-                context=match.context,
-                match_index=match.match_index
-            ))
-            
+
+        # results is a dict with lists of lists (for documents, metadatas, etc.)
+        # Structure: {'ids': [['id1', ...]], 'metadatas': [[{...}, ...]], 'documents': [['text', ...]]}
+
+        search_result_items = []
+
+        if results["ids"] and results["ids"][0]:
+            ids = results["ids"][0]
+            docs = results["documents"][0]
+            metas = results["metadatas"][0]
+
+            # Pre-fetch bookmarks for hierarchy reconstruction
+            # We can't easily pre-fetch just the parents needed without knowing them.
+            # But we can cache the manual's bookmarks map.
+            all_bookmarks = (
+                db.scalars(select(Bookmark).where(Bookmark.manual_id == manual_id)).all()
+            )
+            bookmark_map = {bm.id: bm for bm in all_bookmarks}
+
+            for i, chunk_id in enumerate(ids):
+                text = docs[i]
+                meta = metas[i]
+
+                # Get Bookmark Info
+                chunk_bm_id = meta.get("bookmark_id")
+
+                # Build hierarchy path
+                bookmark_node_list = []
+
+                if chunk_bm_id and chunk_bm_id in bookmark_map:
+                    temp_bm = bookmark_map[chunk_bm_id]
+                    path_nodes = []
+                    while temp_bm:
+                        path_nodes.append(temp_bm)
+                        if temp_bm.parent_id:
+                            temp_bm = bookmark_map.get(temp_bm.parent_id)
+                        else:
+                            temp_bm = None
+                    path_nodes.reverse()
+
+                    for node in path_nodes:
+                        bookmark_node_list.append(
+                            BookmarkNode(
+                                id=node.id,
+                                title=node.title,
+                                page=node.page_num,
+                                children=[],
+                            )
+                        )
+
+                search_result_items.append(
+                    SearchResultItem(
+                        bookmarks=bookmark_node_list,
+                        context=text,
+                        manual_id=manual_id,
+                        bookmark_id=chunk_bm_id,
+                    )
+                )
+
         return SearchResult(
-            manual_id=manual_id,
-            query=query,
-            results=results
+            manual_id=manual_id, query=query, results=search_result_items
         )
 
     except Exception as e:

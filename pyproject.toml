@@ -14,9 +14,16 @@ dependencies = [
     "SQLAlchemy",
     "pydantic",
     "pydantic-settings",
+    "chromadb",
+    "fastembed>=0.7.4",
 ]
 
 [project.optional-dependencies]
+builder = [
+    "docling",
+    "langchain-text-splitters",
+    "sentence-transformers>=5.2.0",
+]
 dev = [
     "uv",
     "ruff",
@@ -40,9 +47,15 @@ package = true
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::ResourceWarning",
+]
 
 [tool.coverage.run]
 source = ["src/mcp_manual_walker"]
+
+[project.scripts]
+db_manager = "mcp_manual_walker.db_manager:main"
 
 [tool.coverage.report]
 fail_under = 70
