@@ -52,6 +52,11 @@ def test_builder_smoke(tmp_path, mock_settings):
     mock_docling = MagicMock()
     mock_docling_conv = MagicMock()
     mock_docling.document_converter = mock_docling_conv
+    
+    mock_docling_dm = MagicMock()
+    mock_docling.datamodel = mock_docling_dm
+    mock_docling.datamodel.base_models = MagicMock()
+    mock_docling.datamodel.pipeline_options = MagicMock()
 
     mock_lts = MagicMock()
 
@@ -78,6 +83,9 @@ def test_builder_smoke(tmp_path, mock_settings):
         {
             "docling": mock_docling,
             "docling.document_converter": mock_docling_conv,
+            "docling.datamodel": mock_docling_dm,
+            "docling.datamodel.base_models": mock_docling.datamodel.base_models,
+            "docling.datamodel.pipeline_options": mock_docling.datamodel.pipeline_options,
             "langchain_text_splitters": mock_lts,
             "chromadb": mock_chromadb,
             "chromadb.utils": mock_chromadb.utils,
