@@ -23,6 +23,8 @@ builder = [
     "docling",
     "langchain-text-splitters",
     "sentence-transformers>=5.2.0",
+    "torch>=2.0.0; sys_platform == 'linux'",
+    "torchvision>=0.15.0; sys_platform == 'linux'",
 ]
 dev = [
     "uv",
@@ -42,6 +44,15 @@ select = ["E", "F", "I"]
 
 [tool.uv]
 package = true
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch" }]
+torchvision = [{ index = "pytorch" }]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
