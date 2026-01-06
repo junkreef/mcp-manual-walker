@@ -23,9 +23,12 @@ logger = logging.getLogger("builder")
 
 
 try:
-    from docling.document_converter import DocumentConverter
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
     # We might need specific options if we want to speed up or customize
-except ImportError:
+except ImportError as e:
+    logger.error(f"Failed to import docling: {e}", exc_info=True)
     DocumentConverter = None
 
 try:
@@ -212,9 +215,22 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
 
     logger.info(f"Found {len(pdf_files)} PDF files.")
 
-    # Initialize Docling converter
-    logger.info("Initializing Docling converter...")
-    converter = DocumentConverter()
+    # Initialize Docling converter with GPU optimization
+    logger.info("Initializing Docling converter with GPU acceleration...")
+    
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.accelerator_options = AcceleratorOptions(
+        device=AcceleratorDevice.CUDA
+    )
+    # Increase batch sizes to improve GPU utilization
+    pipeline_options.ocr_batch_size = 32
+    pipeline_options.layout_batch_size = 32
+
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+        }
+    )
 
     for pdf_path in pdf_files:
         logger.info(f"Processing {str(pdf_path.relative_to(pdf_dir))}...")
