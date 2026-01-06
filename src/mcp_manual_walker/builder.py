@@ -198,9 +198,10 @@ def docling_worker(pdf_queue: queue.Queue, doc_queue: queue.Queue, pdf_root: Pat
     logger.info(f"[Docling-{worker_id}] Ready.")
 
     while True:
-        try:
-            item = pdf_queue.get_nowait()
-        except queue.Empty:
+        item = pdf_queue.get()
+        if item is None:
+            # Sentinel value to stop the worker
+            pdf_queue.task_done()
             break
 
         pdf_path, manual_id = item
@@ -230,31 +231,34 @@ def embedding_worker(q: queue.Queue, collection, pdf_root: Path, save_markdown: 
     4. Save Markdown (optional)
     """
     logger.info("[Embedding-Worker] Started.")
-    while True:
-        item = q.get()
-        if item is None:
-            # Sentinel value to stop the worker
-            break
+    
+    # Create DB session once per worker for better performance
+    with SessionLocal() as session:
+        while True:
+            item = q.get()
+            if item is None:
+                # Sentinel value to stop the worker
+                q.task_done()
+                break
 
-        manual_id, pdf_path, doc_result = item
-        
-        try:
-            logger.info(f"[Embedding-Worker] Processing {pdf_path.name}...")
+            manual_id, pdf_path, doc_result = item
+            
+            try:
+                logger.info(f"[Embedding-Worker] Processing {pdf_path.name}...")
 
-            # Save Markdown (optional)
-            if save_markdown:
-                try:
-                    md_content = doc_result.document.export_to_markdown()
-                    rel_path = pdf_path.relative_to(pdf_root)
-                    md_path = settings.MARKDOWN_OUTPUT_DIR / rel_path.with_suffix(".md")
-                    md_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(md_path, "w", encoding="utf-8") as f:
-                        f.write(md_content)
-                except Exception as e:
-                    logger.error(f"[Embedding-Worker] Failed to save markdown for {pdf_path}: {e}")
+                # Save Markdown (optional)
+                if save_markdown:
+                    try:
+                        md_content = doc_result.document.export_to_markdown()
+                        rel_path = pdf_path.relative_to(pdf_root)
+                        md_path = settings.MARKDOWN_OUTPUT_DIR / rel_path.with_suffix(".md")
+                        md_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(md_path, "w", encoding="utf-8") as f:
+                            f.write(md_content)
+                    except Exception as e:
+                        logger.error(f"[Embedding-Worker] Failed to save markdown for {pdf_path}: {e}")
 
-            # Re-fetch manual object for chunking
-            with SessionLocal() as session:
+                # Re-fetch manual object for chunking
                 manual = session.get(Manual, manual_id)
                 if not manual:
                     logger.error(f"[Embedding-Worker] Manual {manual_id} not found in DB. Skipping.")
@@ -289,10 +293,10 @@ def embedding_worker(q: queue.Queue, collection, pdf_root: Path, save_markdown: 
                 collection.add(ids=ids, documents=documents, metadatas=metadatas)
                 logger.info(f"[Embedding-Worker] Added {len(chunks)} chunks to ChromaDB for {pdf_path.name}")
 
-        except Exception as e:
-            logger.error(f"[Embedding-Worker] Failed to process {pdf_path}: {e}", exc_info=True)
-        finally:
-            q.task_done()
+            except Exception as e:
+                logger.error(f"[Embedding-Worker] Failed to process {pdf_path}: {e}", exc_info=True)
+            finally:
+                q.task_done()
     
     logger.info("[Embedding-Worker] Finished.")
 
