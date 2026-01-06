@@ -411,6 +411,13 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
     pdf_queue.join()
     logger.info("All PDFs have been processed by Docling workers.")
 
+    # Stop Docling workers
+    for _ in range(1):
+        pdf_queue.put(None)
+    
+    for t in docling_threads:
+        t.join()
+
     # Wait for Docling results to be processed by Embedding worker
     doc_queue.join()
     logger.info("All documents have been embedded.")
