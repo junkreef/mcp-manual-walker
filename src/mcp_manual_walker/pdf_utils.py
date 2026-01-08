@@ -59,13 +59,14 @@ def extract_pdf_metadata(file_path: Path) -> Dict[str, Any]:
                             if page_num is not None:
                                 # Safe extraction of Top
                                 raw_top = getattr(item, "top", None)
-                                if isinstance(raw_top, (NullObject, type(None))):
-                                    top = None
-                                else:
+                                top = None
+                                if not isinstance(raw_top, (NullObject, type(None))):
                                     try:
                                         top = float(raw_top)
                                     except (ValueError, TypeError):
-                                        top = None
+                                        logger.warning(
+                                            f"Could not convert bookmark 'top' coordinate '{raw_top}' to float for bookmark '{item.title}'. Defaulting to None."
+                                        )
 
                                 flat_list.append(
                                     {

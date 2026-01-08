@@ -27,18 +27,29 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
 
     # Pre-process: If some bookmarks lack coordinates, try to find them in the text
     # This is a heuristic fallback.
+    
+    # Optimization: Group texts by page first to avoid O(N*M) complexity
+    texts_by_page: Dict[int, List[Any]] = {}
+    for item in doc.texts:
+        if item.prov:
+            prov = item.prov[0]
+            page_no = prov.page_no
+            if page_no not in texts_by_page:
+                texts_by_page[page_no] = []
+            texts_by_page[page_no].append(item)
+
     for bm in raw_bookmarks:
         if bm.page_top is None:
             # Try to find the first occurrence of the title on the assigned page
-            for item in doc.texts:
-                if not item.prov:
-                    continue
-                prov = item.prov[0]
-                if prov.page_no == (bm.page_num - 1): # docling page_no is 0-indexed, bm.page_num is 1-indexed
-                    if bm.title.lower() in item.text.lower():
-                        bm.page_top = getattr(prov.bbox, "t", 0.0)
-                        logger.info(f"Resolved missing coordinate for bookmark '{bm.title}' on page {bm.page_num} to {bm.page_top}")
-                        break
+            # bm.page_num is 1-indexed, docling page_no is 0-indexed
+            page_texts = texts_by_page.get(bm.page_num - 1, [])
+            for item in page_texts:
+                if bm.title.lower() in item.text.lower():
+                    # We know prov exists from the grouping logic
+                    prov = item.prov[0]
+                    bm.page_top = getattr(prov.bbox, "t", 0.0)
+                    logger.info(f"Resolved missing coordinate for bookmark '{bm.title}' on page {bm.page_num} to {bm.page_top}")
+                    break
 
     bms_by_page: Dict[int, List[Bookmark]] = {}
     for bm in raw_bookmarks:
