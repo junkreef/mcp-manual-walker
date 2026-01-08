@@ -25,6 +25,21 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
     # Filter out bookmarks without page_num (should n't happen if inserted correctly)
     raw_bookmarks = [bm for bm in manual.bookmarks]
 
+    # Pre-process: If some bookmarks lack coordinates, try to find them in the text
+    # This is a heuristic fallback.
+    for bm in raw_bookmarks:
+        if bm.page_top is None:
+            # Try to find the first occurrence of the title on the assigned page
+            for item in doc.texts:
+                if not item.prov:
+                    continue
+                prov = item.prov[0]
+                if prov.page_no == (bm.page_num - 1): # docling page_no is 0-indexed, bm.page_num is 1-indexed
+                    if bm.title.lower() in item.text.lower():
+                        bm.page_top = getattr(prov.bbox, "t", 0.0)
+                        logger.info(f"Resolved missing coordinate for bookmark '{bm.title}' on page {bm.page_num} to {bm.page_top}")
+                        break
+
     bms_by_page: Dict[int, List[Bookmark]] = {}
     for bm in raw_bookmarks:
         if bm.page_num not in bms_by_page:
@@ -34,7 +49,7 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
     # Sort each page's bookmarks by Top DESC for the scanning logic
     for p in bms_by_page:
         bms_by_page[p].sort(
-            key=lambda x: x.page_top if x.page_top is not None else 9999.0, reverse=True
+            key=lambda x: x.page_top if x.page_top is not None else -1.0, reverse=True
         )
 
     current_bookmark: Optional[Bookmark] = None
@@ -71,7 +86,7 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
         candidate = None
         # Iterate bookmarks on this page (Sorted Top DESC)
         for bm in page_bms:
-            bm_top = bm.page_top if bm.page_top is not None else 9999.0
+            bm_top = bm.page_top if bm.page_top is not None else -1.0
 
             # Fuzzy Logic:
             # If bookmark represents a header, the header text itself is at 'bm_top'.

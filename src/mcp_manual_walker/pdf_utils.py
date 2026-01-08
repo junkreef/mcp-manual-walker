@@ -5,6 +5,7 @@ from typing import Any, Dict, Generator
 
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
+from pypdf.generic import NullObject
 
 logger = logging.getLogger(__name__)
 
@@ -56,14 +57,22 @@ def extract_pdf_metadata(file_path: Path) -> Dict[str, Any]:
                             # get_destination_page_number can raise an error if the destination is invalid
                             page_num = reader.get_destination_page_number(item)
                             if page_num is not None:
+                                # Safe extraction of Top
+                                raw_top = getattr(item, "top", None)
+                                if isinstance(raw_top, (NullObject, type(None))):
+                                    top = None
+                                else:
+                                    try:
+                                        top = float(raw_top)
+                                    except (ValueError, TypeError):
+                                        top = None
+
                                 flat_list.append(
                                     {
                                         "title": item.title,
                                         "level": level,
                                         "page_num": page_num + 1,  # pypdf is 0-indexed
-                                        "top": getattr(
-                                            item, "top", None
-                                        ),  # Extract Y-coordinate
+                                        "top": top,  # Extract Y-coordinate safely
                                     }
                                 )
                         except Exception as e:
