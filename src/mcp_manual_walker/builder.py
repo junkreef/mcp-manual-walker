@@ -8,7 +8,6 @@ import queue
 import threading
 from pathlib import Path
 from typing import Optional
-import multiprocessing
 
 # Imports for dependencies
 from sqlalchemy import select
@@ -182,12 +181,12 @@ def docling_worker(pdf_queue: queue.Queue, doc_queue: queue.Queue, pdf_root: Pat
         pipeline_options = ThreadedPdfPipelineOptions()
         pipeline_options.accelerator_options = AcceleratorOptions(
             device=AcceleratorDevice.CUDA,
-            num_threads=multiprocessing.cpu_count()
+            num_threads=settings.DOCLING_NUM_THREADS
         )
         # Increase batch sizes to improve GPU utilization
-        pipeline_options.ocr_batch_size = 16
-        pipeline_options.layout_batch_size = 16
-        pipeline_options.table_batch_size = 16
+        pipeline_options.ocr_batch_size = settings.DOCLING_OCR_BATCH_SIZE
+        pipeline_options.layout_batch_size = settings.DOCLING_LAYOUT_BATCH_SIZE
+        pipeline_options.table_batch_size = settings.DOCLING_TABLE_BATCH_SIZE
         
 
         pipeline_options.ocr_options = RapidOcrOptions(
