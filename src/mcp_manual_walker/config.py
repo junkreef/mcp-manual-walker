@@ -1,4 +1,5 @@
 from pathlib import Path
+import multiprocessing
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +16,12 @@ class Settings(BaseSettings):
 
     HOST: str = "127.0.0.1"
     PORT: int = 8000
+
+    # Docling Configuration
+    DOCLING_NUM_THREADS: int = multiprocessing.cpu_count()
+    DOCLING_OCR_BATCH_SIZE: int = 16
+    DOCLING_LAYOUT_BATCH_SIZE: int = 16
+    DOCLING_TABLE_BATCH_SIZE: int = 16
 
 
 settings = Settings()

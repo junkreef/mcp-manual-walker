@@ -28,7 +28,7 @@ logger = logging.getLogger("builder")
 try:
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
+    from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions, AcceleratorOptions, AcceleratorDevice, RapidOcrOptions
     # We might need specific options if we want to speed up or customize
 except ImportError as e:
     logger.error(f"Failed to import docling: {e}", exc_info=True)
@@ -178,13 +178,20 @@ def docling_worker(pdf_queue: queue.Queue, doc_queue: queue.Queue, pdf_root: Pat
     logger.info(f"[Docling-{worker_id}] Initializing converter...")
     
     try:
-        pipeline_options = PdfPipelineOptions()
+        pipeline_options = ThreadedPdfPipelineOptions()
         pipeline_options.accelerator_options = AcceleratorOptions(
-            device=AcceleratorDevice.CUDA
+            device=AcceleratorDevice.CUDA,
+            num_threads=settings.DOCLING_NUM_THREADS
         )
         # Increase batch sizes to improve GPU utilization
-        pipeline_options.ocr_batch_size = 32
-        pipeline_options.layout_batch_size = 32
+        pipeline_options.ocr_batch_size = settings.DOCLING_OCR_BATCH_SIZE
+        pipeline_options.layout_batch_size = settings.DOCLING_LAYOUT_BATCH_SIZE
+        pipeline_options.table_batch_size = settings.DOCLING_TABLE_BATCH_SIZE
+        
+
+        pipeline_options.ocr_options = RapidOcrOptions(
+            backend="torch",
+        )   
 
         converter = DocumentConverter(
             format_options={
