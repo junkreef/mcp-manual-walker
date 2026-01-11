@@ -143,7 +143,7 @@ def test_chunking_large_content(mock_manual):
     # LangChain should split intelligently. 
     # Likely ["A"*1500, "B"*1000] if separator works well.
     
-    assert len(chunks) >= 2
+    assert len(chunks) == 2
     
     # Concatenation should restore full text (minus potential whitespace variance if splitter strips)
     # But RecursiveCharacterTextSplitter with overlap=0 should preserve content if just split.
@@ -160,7 +160,7 @@ def test_chunking_large_content(mock_manual):
 
 
 def test_chunking_sequence_and_overlap(mock_manual):
-    """Test that chunks are strictly sequential and non-overlapping."""
+    """Test chunking of continuous text to ensure correct overlap creation."""
     doc = MagicMock()
     
     # Create text that will force a split in the middle of a line if no separators found?

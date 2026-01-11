@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     # Chunking
     CHUNK_SIZE: int = 2000
     CHUNK_OVERLAP: int = 200
+    CHUNK_OVERLAP_SEARCH_MARGIN: int = 100
 
     HOST: str = "127.0.0.1"
     PORT: int = 8000

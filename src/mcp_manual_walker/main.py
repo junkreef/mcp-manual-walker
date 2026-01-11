@@ -344,7 +344,7 @@ def _merge_chunks(chunks: List[str]) -> str:
         # We limit search to a reasonable window (e.g., slightly larger than chunk_overlap)
         
         overlap_len = 0
-        max_overlap_search = settings.CHUNK_OVERLAP + 100 # Should cover chunk_overlap + margin
+        max_overlap_search = settings.CHUNK_OVERLAP + settings.CHUNK_OVERLAP_SEARCH_MARGIN # Should cover chunk_overlap + margin
         
         # Search window in merged (last N chars)
         search_start_idx = max(0, len(merged) - max_overlap_search)
