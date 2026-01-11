@@ -317,7 +317,7 @@ def get_markdown_content(
 
         # Join text
         sorted_texts = [t for _, t in combined]
-        final_content = "\n\n".join(sorted_texts)
+        final_content = _merge_chunks(sorted_texts)
 
         return MarkdownContent(markdown_content=final_content)
 
@@ -326,6 +326,48 @@ def get_markdown_content(
         raise ToolError(e)
     finally:
         db.close()
+
+
+def _merge_chunks(chunks: List[str]) -> str:
+    """
+    Merges a list of text chunks, removing overlaps between adjacent chunks.
+    Assumes chunks are sorted by their original sequence.
+    """
+    if not chunks:
+        return ""
+    
+    merged = chunks[0]
+    
+    for next_chunk in chunks[1:]:
+        # Find overlap between end of merged and start of next_chunk
+        # Try to find the longest suffix of 'merged' that matches prefix of 'next_chunk'
+        # We limit search to a reasonable window (e.g., slightly larger than chunk_overlap)
+        
+        overlap_len = 0
+        max_overlap_search = 300 # Should cover chunk_overlap=200 + margin
+        
+        # Search window in merged (last N chars)
+        search_start_idx = max(0, len(merged) - max_overlap_search)
+        suffix_window = merged[search_start_idx:]
+        
+        # Iterate over possible overlap lengths
+        # Optimized: checking logical overlaps
+        # It's cleaner to check if next_chunk starts with a suffix of merged
+        for length in range(min(len(suffix_window), len(next_chunk)), 0, -1):
+            if suffix_window.endswith(next_chunk[:length]):
+                overlap_len = length
+                break
+        
+        if overlap_len > 0:
+            merged += next_chunk[overlap_len:]
+        else:
+            # No overlap detected. Likely a section break or distinct block.
+            # Add separator.
+            merged += "\n\n" + next_chunk
+
+    return merged
+
+
 
 
 @app.tool(

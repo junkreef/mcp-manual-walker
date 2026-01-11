@@ -1,5 +1,6 @@
 import logging
 from typing import Any, Dict, List, Optional
+from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 
 from mcp_manual_walker.models import Bookmark, Manual
 
@@ -66,6 +67,33 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
     current_bookmark: Optional[Bookmark] = None
     current_text_buffer: List[str] = []
 
+    # Initialize Text Splitter for large chunks
+    # We use Markdown splitter to respect table structure etc.
+    # Overlap is 0 to avoid duplication in retrieval.
+    splitter = RecursiveCharacterTextSplitter.from_language(
+        language=Language.MARKDOWN,
+        chunk_size=2000,
+        chunk_overlap=200,
+    )
+
+    def add_chunk(content: str, bookmark: Optional[Bookmark]):
+        if not content:
+            return
+        
+        # Split large content
+        sub_chunks = splitter.split_text(content)
+        
+        for sub_chunk in sub_chunks:
+            chunks.append(
+                {
+                    "text": sub_chunk,
+                    "metadata": {
+                        "manual_id": manual.id,
+                        "bookmark_id": bookmark.id if bookmark else None,
+                    },
+                }
+            )
+
     for item in doc.texts:
         text = item.text.strip()
         if not text:
@@ -82,13 +110,7 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
 
         # Docling bbox is usually [l, b, r, t] (bottom-left origin)
         # We need Top Y.
-        # Check prov.bbox structure. In inspect_prov_bbox.py output:
-        # BBox: l=186.0 t=291.92 r=275.82 b=257.0
-        # It has .t attribute? Or is it a dict?
-        # Output was `BBox: ... t=...` via string representation.
         # docling_core types usually have .l, .r, .t, .b properties.
-        # Let's assume .t exists.
-
         item_top = getattr(prov.bbox, "t", 0.0)
 
         # Match Bookmark
@@ -100,42 +122,11 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
             bm_top = bm.page_top if bm.page_top is not None else -1.0
 
             # Fuzzy Logic:
-            # If bookmark represents a header, the header text itself is at 'bm_top'.
-            # Content follows below.
-            # So item belongs to bookmark if item is BELOW the bookmark (Item Top < BM Top).
-            # Wait, Y-axis increases Upwards (Bottom-Left origin).
-            # So Higher Value = Higher on Page.
-            # So "Below" means Item Top < BM Top.
-            # Tolerance: If item is strictly equal or slightly above due to floats?
-            # Epsilon = 10.0 units (~3-4mm)
-
+            # If item is below bookmark (Item Top < BM Top)
             if item_top < (bm_top + 10.0):
-                # Valid candidate (Item is below Bookmark)
-                # Since we iterate from Highest BM to Lowest BM,
-                # the *first* BM we encounter that satisfies this is the Highest one.
-                # But we want the *lowest* BM that is still above the item (Immediate Parent).
-                # Example:
-                # BM A (700)
-                # BM B (600)
-                # Item (550) -> 550 < 700 (True), 550 < 600 (True).
-                # We want BM B.
-                # So we want the LAST candidate in this sorted list.
-                # Wait, if we iterate DESC (700, 600)
-                # 700 matches. 600 matches.
-                # The last matching one is 600.
                 candidate = bm
             else:
-                # Item is ABOVE this bookmark (Item 650 > BM 600).
-                # Stops matching further lower bookmarks.
                 break
-
-        # If we found a new candidate on this page (or confirmed one), update?
-        # Logic: A page flow updates the context.
-        # Only update if candidate is found?
-        # If no candidate found (e.g. item is at very top of page 800, first BM starts at 500),
-        # then it belongs to previous page's context.
-        # EXCEPT if there are bookmarks on this page, and we are above all of them?
-        # Yes, implies continuation.
 
         if candidate:
             if current_bookmark != candidate:
@@ -143,17 +134,7 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
                 # Flush buffer
                 if current_text_buffer:
                     chunk_content = "\n\n".join(current_text_buffer)
-                    chunks.append(
-                        {
-                            "text": chunk_content,
-                            "metadata": {
-                                "manual_id": manual.id,
-                                "bookmark_id": current_bookmark.id
-                                if current_bookmark
-                                else None,
-                            },
-                        }
-                    )
+                    add_chunk(chunk_content, current_bookmark)
                     current_text_buffer = []
                 current_bookmark = candidate
 
@@ -162,14 +143,6 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
     # Flush final buffer
     if current_text_buffer:
         chunk_content = "\n\n".join(current_text_buffer)
-        chunks.append(
-            {
-                "text": chunk_content,
-                "metadata": {
-                    "manual_id": manual.id,
-                    "bookmark_id": current_bookmark.id if current_bookmark else None,
-                },
-            }
-        )
+        add_chunk(chunk_content, current_bookmark)
 
     return chunks

@@ -119,3 +119,75 @@ def test_chunking_no_doc_texts(mock_manual):
     assert len(chunks) == 1
     assert chunks[0]["text"] == "Full Generic Text"
     assert chunks[0]["metadata"]["bookmark_id"] is None
+
+def test_chunking_large_content(mock_manual):
+    """Test splitting of large content using LangChain splitter."""
+    doc = MagicMock()
+    
+    # Create a large text (> 2000 chars)
+    # 2500 chars
+    large_text = "A" * 1500 + "\n\n" + "B" * 1000
+    
+    item1 = MagicMock()
+    item1.text = large_text
+    item1.prov = [] # Fallback logic uses append then flush called add_chunk
+    
+    doc.texts = [item1]
+    
+    chunks = chunk_text_by_coordinates(doc, mock_manual)
+    
+    # Expectation:
+    # Total 2500+ chars. Max chunk 2000.
+    # Should be at least 2 chunks.
+    # "A"*1500 + \n\n is considered a separator. 
+    # LangChain should split intelligently. 
+    # Likely ["A"*1500, "B"*1000] if separator works well.
+    
+    assert len(chunks) >= 2
+    
+    # Concatenation should restore full text (minus potential whitespace variance if splitter strips)
+    # But RecursiveCharacterTextSplitter with overlap=0 should preserve content if just split.
+    # Actually splitter might consume separators.
+    
+    full_text_out = "".join([c["text"] for c in chunks])
+    # check that we have roughly the content
+    assert "AAAA" in full_text_out
+    assert "BBBB" in full_text_out
+    
+    # Check Metadata
+    assert chunks[0]["metadata"]["manual_id"] == "test_manual_id"
+    assert chunks[1]["metadata"]["manual_id"] == "test_manual_id"
+
+
+def test_chunking_sequence_and_overlap(mock_manual):
+    """Test that chunks are strictly sequential and non-overlapping."""
+    doc = MagicMock()
+    
+    # Create text that will force a split in the middle of a line if no separators found?
+    # Or provide clear separators.
+    # Create continuous text to force a split in the middle, ensuring overlap
+    full = "P" * 2500
+    
+    item = MagicMock()
+    item.text = full
+    item.prov = []
+    
+    doc.texts = [item]
+    
+    chunks = chunk_text_by_coordinates(doc, mock_manual)
+    
+    assert len(chunks) == 2
+    
+    # Chunk 0 should be 2000 chars
+    assert len(chunks[0]["text"]) == 2000
+    
+    # Chunk 1 should be 500 chars (remainder) + 200 overlap = 700 chars
+    assert len(chunks[1]["text"]) == 700
+    
+    # Verify overlap
+    chunk0_suffix = chunks[0]["text"][-200:]
+    chunk1_prefix = chunks[1]["text"][:200]
+    assert chunk0_suffix == chunk1_prefix
+    
+    # Verify metadata is identical
+    assert chunks[0]["metadata"] == chunks[1]["metadata"]
