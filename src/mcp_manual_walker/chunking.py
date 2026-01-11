@@ -1,9 +1,10 @@
 import logging
 from typing import Any, Dict, List, Optional
-from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 
-from mcp_manual_walker.models import Bookmark, Manual
+from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
+
 from mcp_manual_walker.config import settings
+from mcp_manual_walker.models import Bookmark, Manual
 
 logger = logging.getLogger(__name__)
 

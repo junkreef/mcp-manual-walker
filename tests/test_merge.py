@@ -1,5 +1,6 @@
 from mcp_manual_walker.main import _merge_chunks
 
+
 def test_merge_no_overlap():
     chunks = ["Hello World.", "This is a test."]
     merged = _merge_chunks(chunks)

@@ -1,13 +1,12 @@
 import argparse
 import logging
+import queue
 import shutil
 import sys
+import threading
 import uuid
 import warnings
-import queue
-import threading
 from pathlib import Path
-from typing import Optional
 
 # Imports for dependencies
 from sqlalchemy import select
@@ -26,9 +25,13 @@ logger = logging.getLogger("builder")
 
 
 try:
-    from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
+    from docling.datamodel.pipeline_options import (
+        AcceleratorDevice,
+        AcceleratorOptions,
+        PdfPipelineOptions,
+    )
+    from docling.document_converter import DocumentConverter, PdfFormatOption
     # We might need specific options if we want to speed up or customize
 except ImportError as e:
     logger.error(f"Failed to import docling: {e}", exc_info=True)
