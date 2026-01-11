@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 
 from mcp_manual_walker.models import Bookmark, Manual
+from mcp_manual_walker.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -67,13 +68,15 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
     current_bookmark: Optional[Bookmark] = None
     current_text_buffer: List[str] = []
 
+
+
     # Initialize Text Splitter for large chunks
     # We use Markdown splitter to respect table structure etc.
-    # Overlap is 0 to avoid duplication in retrieval.
+    # Overlap is enabled to avoid context loss.
     splitter = RecursiveCharacterTextSplitter.from_language(
         language=Language.MARKDOWN,
-        chunk_size=2000,
-        chunk_overlap=200,
+        chunk_size=settings.CHUNK_SIZE,
+        chunk_overlap=settings.CHUNK_OVERLAP,
     )
 
     def add_chunk(content: str, bookmark: Optional[Bookmark]):
