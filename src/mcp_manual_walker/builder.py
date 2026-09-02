@@ -1,4 +1,5 @@
 import argparse
+import io
 import logging
 import multiprocessing as mp
 import os
@@ -36,6 +37,7 @@ try:
         RapidOcrOptions,
     )
     from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling_core.types.doc import ImageRefMode
     # We might need specific options if we want to speed up or customize
 except ImportError as e:
     logger.error(f"Failed to import docling: {e}", exc_info=True)
@@ -63,7 +65,7 @@ try:
         collection_metadata,
         get_embedder,
     )
-    from mcp_manual_walker.models import Bookmark, Manual
+    from mcp_manual_walker.models import Bookmark, Figure, Manual
     from mcp_manual_walker.pdf_utils import extract_pdf_fingerprint
 except ImportError as e:
     logger.error(f"Failed to import local modules: {e}")
@@ -128,8 +130,9 @@ def sync_manual_to_db(
             return manual, False, existed
         else:
             logger.info("Hash mismatch. Updating...")
-            # Delete old bookmarks
+            # Delete old bookmarks and figures: they describe the old content.
             manual.bookmarks.clear()
+            manual.figures.clear()
     else:
         logger.info(f"Creating new Manual entry for {rel_path_str}")
         manual = Manual(id=str(uuid.uuid4()))
@@ -215,6 +218,11 @@ def _create_converter(num_threads: int):
     # Derive section-header levels from PDF bookmarks / numbering / font style
     pipeline_options.heading_hierarchy_options = HeadingHierarchyOptions(enabled=True)
 
+    # Render the detected pictures: the crops are persisted as PNG blobs in the
+    # SQLite figures table (and written next to the markdown dump on request).
+    pipeline_options.generate_picture_images = True
+    pipeline_options.images_scale = settings.DOCLING_IMAGES_SCALE
+
     pipeline_options.ocr_options = RapidOcrOptions(
         backend=settings.DOCLING_OCR_BACKEND,
         lang=[settings.DOCLING_OCR_LANG],
@@ -243,12 +251,56 @@ def _init_docling_worker(num_threads: int):
     logger.info(f"[Docling-{os.getpid()}] Ready.")
 
 
+def _extract_figures(doc) -> list[dict]:
+    """
+    Pulls the rendered pictures out of a document as PNG bytes.
+
+    The images are removed from the document afterwards: a PIL image travelling
+    inside the pickled DoclingDocument blows the worker-to-parent transfer up
+    (two figures grew a 6 KB pickle to 1.5 MB), while the PNG bytes returned
+    here are handed to the parent as plain dicts.
+    """
+    figures: list[dict] = []
+
+    for index, picture in enumerate(doc.pictures):
+        try:
+            image = picture.get_image(doc)
+        except Exception as e:  # noqa: BLE001 - one bad crop must not fail a PDF
+            logger.warning(f"Could not render picture {index}: {e}")
+            image = None
+
+        prov = picture.prov[0] if getattr(picture, "prov", None) else None
+        if image is None or prov is None:
+            continue
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        bbox = prov.bbox
+        figures.append(
+            {
+                "picture_index": index,
+                "page": prov.page_no,
+                "bbox": (bbox.l, bbox.b, bbox.r, bbox.t),
+                "width": image.width,
+                "height": image.height,
+                "png": buf.getvalue(),
+            }
+        )
+
+    # Drop the images from every picture, including the ones skipped above.
+    for picture in doc.pictures:
+        picture.image = None
+
+    return figures
+
+
 def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
     """
     Converts a single PDF with the worker-local converter.
 
-    Returns the DoclingDocument, which is pickled back to the parent process.
-    That transfer is far cheaper than re-running Docling in the parent.
+    Returns ``(document, figures)``: the DoclingDocument stripped of its picture
+    images, plus those images as plain PNG records. Both are pickled back to the
+    parent process, which is far cheaper than re-running Docling there.
     Conversion errors are left to propagate through the future.
     """
     logger.info(f"[Docling-{os.getpid()}] Converting {pdf_path.name}...")
@@ -257,16 +309,23 @@ def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
 
     if save_markdown:
         # A markdown dump is a convenience artifact; never fail the conversion
-        # because it could not be written.
+        # because it could not be written. It is written before the images are
+        # stripped, so the PNG files next to it can actually be exported.
         try:
             md_path = settings.MARKDOWN_OUTPUT_DIR / Path(rel_path).with_suffix(".md")
             md_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(md_path, "w", encoding="utf-8") as f:
-                f.write(doc.export_to_markdown())
+            # A relative artifacts_dir makes Docling write relative image
+            # links, so the dump stays valid when the tree is moved; the
+            # directory itself is still created next to the markdown file.
+            doc.save_as_markdown(
+                md_path,
+                artifacts_dir=Path(f"{md_path.stem}_artifacts"),
+                image_mode=ImageRefMode.REFERENCED,
+            )
         except Exception as e:
             logger.error(f"Failed to save markdown for {pdf_path}: {e}")
 
-    return doc
+    return doc, _extract_figures(doc)
 
 
 def _ingest_document(
@@ -277,9 +336,14 @@ def _ingest_document(
     pdf_path: Path,
     pdf_root: Path,
     doc,
+    figures: list[dict],
 ) -> int:
     """
     Chunks a converted document, embeds it and stores it in ChromaDB.
+
+    The rendered figures are written to the SQLite ``figures`` table and the
+    chunk that describes each of them only carries the resulting ``figure_id``
+    into Chroma, so the image bytes never leave the relational database.
 
     Runs in the main process while the worker processes keep converting, so the
     GPU serves the Docling pipelines and the embedding model at the same time.
@@ -300,29 +364,69 @@ def _ingest_document(
     if not chunks:
         return 0
 
+    figures_by_index = {f["picture_index"]: f for f in figures}
+
     ids = [f"{manual.id}_{i}" for i in range(len(chunks))]
     documents = [c["text"] for c in chunks]
     metadatas = []
+    stored_figures = 0
 
     for i, c in enumerate(chunks):
+        chunk_meta = c["metadata"]
         meta = {
             "source": str(rel_path),
             "manual_id": str(manual.id),
             "chunk_index": float(i),
         }
 
-        if c["metadata"].get("bookmark_id"):
-            meta["bookmark_id"] = str(c["metadata"]["bookmark_id"])
+        if chunk_meta.get("bookmark_id"):
+            meta["bookmark_id"] = str(chunk_meta["bookmark_id"])
 
         # Chroma metadata values must be str/int/float/bool
-        if c["metadata"].get("type"):
-            meta["type"] = str(c["metadata"]["type"])
-        if c["metadata"].get("page") is not None:
-            meta["page"] = int(c["metadata"]["page"])
-        if c["metadata"].get("picture_index") is not None:
-            meta["picture_index"] = int(c["metadata"]["picture_index"])
+        if chunk_meta.get("type"):
+            meta["type"] = str(chunk_meta["type"])
+        if chunk_meta.get("page") is not None:
+            meta["page"] = int(chunk_meta["page"])
+
+        if chunk_meta.get("type") == "figure":
+            index = chunk_meta.get("picture_index")
+            record = figures_by_index.get(index)
+            if record is None:
+                logger.warning(
+                    f"No rendered image for picture {index} of {rel_path}: "
+                    "the chunk is stored without a figure reference."
+                )
+            else:
+                bbox = record["bbox"]
+                figure = Figure(
+                    id=str(uuid.uuid4()),
+                    manual_id=str(manual.id),
+                    bookmark_id=chunk_meta.get("bookmark_id"),
+                    picture_index=int(record["picture_index"]),
+                    page=int(record["page"]),
+                    bbox_l=float(bbox[0]),
+                    bbox_b=float(bbox[1]),
+                    bbox_r=float(bbox[2]),
+                    bbox_t=float(bbox[3]),
+                    caption=chunk_meta.get("figure_caption"),
+                    labels=chunk_meta.get("figure_labels"),
+                    description=chunk_meta.get("figure_description"),
+                    mime_type="image/png",
+                    width=record["width"],
+                    height=record["height"],
+                    image=record["png"],
+                )
+                session.add(figure)
+                stored_figures += 1
+                meta["figure_id"] = figure.id
 
         metadatas.append(meta)
+
+    # Commit the figures before touching Chroma: a figure row without its chunk
+    # is harmless, a chunk pointing at a missing figure id is not.
+    if stored_figures:
+        session.commit()
+        logger.info(f"Stored {stored_figures} figure(s) in SQLite for {rel_path}")
 
     embeddings = embedder.embed_documents(documents)
 
@@ -503,7 +607,7 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
             for future in as_completed(futures):
                 pdf_path, manual_id = futures[future]
                 try:
-                    doc = future.result()
+                    doc, figures = future.result()
                 except BrokenProcessPool as e:
                     logger.error(
                         "A Docling worker process died (out of memory / CUDA "
@@ -526,6 +630,7 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
                         pdf_path,
                         pdf_dir,
                         doc,
+                        figures,
                     )
                     converted += 1
                 except Exception as e:

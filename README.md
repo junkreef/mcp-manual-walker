@@ -102,11 +102,40 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `DOCLING_DEVICE` | `auto` | Accelerator for Docling's layout/table/OCR models (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`). |
 | `DOCLING_OCR_BACKEND` | `onnxruntime` | RapidOCR inference backend: `onnxruntime` (default; models for `japan`/`chinese`/`en` ship with the rapidocr wheel, works offline, GPU via `onnxruntime-gpu`) or `torch` (downloads checkpoints from modelscope.cn on first use). |
 | `DOCLING_OCR_LANG` | `japan` | RapidOCR language token for the recognition model. `japan`/`chinese`/`en` need no download; other languages (e.g. `korean`) are fetched on first use. |
+| `DOCLING_IMAGES_SCALE` | `2.0` | Render scale for the figure crops stored in SQLite (`1.0` = 72 dpi, `2.0` = 144 dpi). Higher means sharper PNGs and a bigger database file. |
 | `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
 
 OCR only runs on layout regions without a PDF text layer (scanned pages, text
 inside images) — text-based PDFs are read from their text layer, so the OCR
 backend/language choice doesn't affect them.
+
+### 🖼️ Figures
+
+Every picture Docling detects is rendered (at `DOCLING_IMAGES_SCALE`) and stored
+as a PNG blob in the SQLite `figures` table, together with its page, bounding
+box, caption, the labels drawn inside it and the manual and bookmark it belongs
+to. The chunk that describes the figure carries only the `figure_id` in its
+ChromaDB metadata, so the SQLite file and the Chroma directory are the only two
+artifacts that have to travel between machines — the image bytes are never
+duplicated into the vector store.
+
+Consequences worth knowing:
+
+*   `db_manager export` writes each figure as a separate `figures/<id>.png`
+    member of the archive (`format_version: 2` in `manifest.json`) and
+    `db_manager import` restores the rows with their bytes; older archives
+    without figures still import unchanged. Deleting a manual deletes its
+    figures with it.
+*   `--save-markdown` additionally writes the PNGs next to the markdown dump,
+    in a `<name>_artifacts/` directory referenced by the markdown image links.
+    That copy is a viewing convenience; the database stays the source of truth.
+*   The `figures` table is created by `init_db()`, which only ever adds missing
+    tables. **A database built before figures existed has no images in it and
+    must be rebuilt:**
+
+    ```sh
+    uv run db_manager build --pdf_dir ./data/pdfs --reset
+    ```
 
 ### 🧠 Embedding Model
 

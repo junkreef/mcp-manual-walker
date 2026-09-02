@@ -1,15 +1,56 @@
 import concurrent.futures
 import importlib
+import io
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from PIL import Image
 
 from mcp_manual_walker import database
 from mcp_manual_walker.config import settings
-from mcp_manual_walker.models import Manual
+from mcp_manual_walker.models import Figure, Manual
+
+# Size of the image the fake Docling picture renders.
+FAKE_FIGURE_SIZE = (8, 6)
+
+
+class FakeBBox:
+    """Stand-in for a docling bbox (PDF points, bottom-left origin)."""
+
+    def __init__(self, left, bottom, right, top):
+        self.l = left  # noqa: E741 - mirrors the docling attribute name
+        self.b = bottom
+        self.r = right
+        self.t = top
+
+
+class FakePicture:
+    """Minimal stand-in for docling's PictureItem."""
+
+    def __init__(self, index=0, page=2):
+        self.self_ref = f"#/pictures/{index}"
+        self.prov = [
+            SimpleNamespace(page_no=page, bbox=FakeBBox(10.0, 20.0, 110.0, 120.0))
+        ]
+        # An ImageRef on the real item; only its removal matters here.
+        self.image = object()
+
+    def get_image(self, doc):
+        return Image.new("RGB", FAKE_FIGURE_SIZE, (200, 30, 30))
+
+
+def _fake_save_as_markdown(path, artifacts_dir=None, image_mode=None):
+    """Writes a markdown dump the way DoclingDocument.save_as_markdown does."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("MD Content", encoding="utf-8")
+    if artifacts_dir is not None:
+        # Docling resolves a relative artifacts_dir against the markdown file.
+        (path.parent / artifacts_dir).mkdir(parents=True, exist_ok=True)
 
 
 @pytest.fixture
@@ -84,6 +125,9 @@ def builder_env(mock_settings):
     mock_inst = MagicMock()
     mock_res = MagicMock()
     mock_res.document.export_to_markdown.return_value = "MD Content"
+    # One rendered picture, so every conversion returns a figure record.
+    mock_res.document.pictures = [FakePicture(index=0, page=2)]
+    mock_res.document.save_as_markdown.side_effect = _fake_save_as_markdown
     mock_inst.convert.return_value = mock_res
     mock_docling_conv.DocumentConverter.return_value = mock_inst
 
@@ -169,6 +213,9 @@ def builder_env(mock_settings):
                         "type": "figure",
                         "page": 2,
                         "picture_index": 0,
+                        "figure_caption": "Figure 1: Panel",
+                        "figure_labels": "Power, Reset",
+                        "figure_description": "",
                     },
                 },
             ]
@@ -226,7 +273,14 @@ def test_builder_smoke(pdf_dir, mock_settings, builder_env):
     assert "page" not in metas[0]
     assert metas[1]["type"] == "figure"
     assert metas[1]["page"] == 2
-    assert metas[1]["picture_index"] == 0
+
+    # The image itself stays in SQLite: Chroma only learns the figure id, not
+    # the picture index or the caption/labels/description copies.
+    assert "figure_id" in metas[1]
+    for key in ("picture_index", "figure_caption", "figure_labels",
+                "figure_description"):
+        assert key not in metas[1]
+    assert "figure_id" not in metas[0]
 
     # Embeddings are computed in the main process and passed explicitly
     assert len(kwargs["embeddings"]) == len(kwargs["ids"])
@@ -236,12 +290,78 @@ def test_builder_smoke(pdf_dir, mock_settings, builder_env):
     assert (md_root / "sample.md").exists()
     assert (md_root / "subdir" / "nested.md").exists()
 
-    # Relational DB holds both manuals with their bookmarks
+    # Relational DB holds both manuals with their bookmarks and figures
     with database.SessionLocal() as session:
         manuals = session.query(Manual).all()
         assert len(manuals) == 2
         for manual in manuals:
             assert len(manual.bookmarks) == 1
+            assert len(manual.figures) == 1
+
+        # The figure id in the Chroma metadata resolves to a stored PNG.
+        figure = session.get(Figure, metas[1]["figure_id"])
+        assert figure is not None
+        assert figure.page == 2
+        assert figure.picture_index == 0
+        assert figure.bookmark_id == "bm2"
+        assert (figure.bbox_l, figure.bbox_b, figure.bbox_r, figure.bbox_t) == (
+            10.0,
+            20.0,
+            110.0,
+            120.0,
+        )
+        assert figure.caption == "Figure 1: Panel"
+        assert figure.labels == "Power, Reset"
+        assert figure.description == ""
+        assert figure.mime_type == "image/png"
+        assert (figure.width, figure.height) == FAKE_FIGURE_SIZE
+        stored = Image.open(io.BytesIO(figure.image))
+        assert stored.format == "PNG"
+        assert stored.size == FAKE_FIGURE_SIZE
+
+
+def test_extract_figures_returns_png_and_strips_images(builder_env):
+    """The worker helper returns PNG bytes and empties the picture images."""
+    first = FakePicture(index=0, page=3)
+    second = FakePicture(index=1, page=7)
+    doc = SimpleNamespace(pictures=[first, second])
+
+    figures = builder_env.builder._extract_figures(doc)
+
+    assert len(figures) == 2
+    # The index is the position in doc.pictures, so the parent can match a
+    # chunk's picture_index against these records.
+    assert [f["picture_index"] for f in figures] == [0, 1]
+    assert [f["page"] for f in figures] == [3, 7]
+
+    record = figures[1]
+    assert record["bbox"] == (10.0, 20.0, 110.0, 120.0)
+    assert (record["width"], record["height"]) == FAKE_FIGURE_SIZE
+
+    decoded = Image.open(io.BytesIO(record["png"]))
+    assert decoded.format == "PNG"
+    assert decoded.size == FAKE_FIGURE_SIZE
+
+    # The images must not travel back to the parent inside the pickled document.
+    assert first.image is None
+    assert second.image is None
+
+
+def test_extract_figures_skips_pictures_without_image_or_prov(builder_env):
+    """Unrenderable pictures are dropped, but still lose their image ref."""
+    no_image = FakePicture(index=0)
+    no_image.get_image = lambda doc: None
+    no_prov = FakePicture(index=1)
+    no_prov.prov = []
+    good = FakePicture(index=2, page=4)
+    doc = SimpleNamespace(pictures=[no_image, no_prov, good])
+
+    figures = builder_env.builder._extract_figures(doc)
+
+    # Skipped pictures do not shift the index of the ones that follow.
+    assert [f["picture_index"] for f in figures] == [2]
+    assert no_image.image is None
+    assert no_prov.image is None
 
 
 def test_builder_skips_unchanged(pdf_dir, mock_settings, builder_env):

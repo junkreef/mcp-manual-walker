@@ -2,8 +2,11 @@
 
 The document is walked in reading order via ``doc.iterate_items()``. Text items
 are buffered per manual bookmark, while tables and pictures become dedicated
-chunks. Docling types are never imported here: item kinds are detected through
-their ``label`` value and duck-typed methods, so tests can use light fakes.
+chunks. A figure chunk also carries the caption, the labels drawn inside the
+picture and the Docling description in its metadata, so the builder can persist
+them next to the image. Docling types are never imported here: item kinds are
+detected through their ``label`` value and duck-typed methods, so tests can use
+light fakes.
 """
 
 import logging
@@ -82,6 +85,11 @@ def _normalize_title(s: str) -> str:
     normalized = _NUMBERING_PREFIX_RE.sub("", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized.strip(_TITLE_PUNCTUATION)
+
+
+def _page_top_key(bm: Bookmark) -> float:
+    """Sort key placing the bookmarks of a page top-down (missing tops last)."""
+    return bm.page_top if bm.page_top is not None else -1.0
 
 
 def _ordering_key(bm: Bookmark) -> int:
@@ -191,7 +199,9 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
 
     Returns a list of ``{"text": str, "metadata": {...}}`` dicts whose metadata
     always carries ``manual_id``, ``bookmark_id`` and ``type``, plus ``page``
-    for table/figure chunks and ``picture_index`` for figure chunks.
+    for table/figure chunks. Figure chunks additionally carry
+    ``picture_index``, ``figure_caption``, ``figure_labels`` (comma-joined,
+    ``""`` when the picture has none) and ``figure_description``.
     """
     chunks: List[Dict[str, Any]] = []
 
@@ -275,9 +285,7 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
 
     # Sort each page's bookmarks by Top DESC for the scanning logic
     for page_bms in bms_by_page.values():
-        page_bms.sort(
-            key=lambda x: x.page_top if x.page_top is not None else -1.0, reverse=True
-        )
+        page_bms.sort(key=_page_top_key, reverse=True)
 
     current_bookmark: Optional[Bookmark] = None
     buffer: List[str] = []
@@ -312,6 +320,10 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
             candidate = _match_bookmark_by_title(page_bms, text)
             if candidate is not None and candidate.page_top is None:
                 candidate.page_top = item_top
+                # The page list must stay sorted top-down, otherwise the early
+                # break of the coordinate rule below cuts the scan short for
+                # the items that follow on this page.
+                page_bms.sort(key=_page_top_key, reverse=True)
 
         if candidate is None:
             # Coordinate rule: the last bookmark that starts above this item.
@@ -358,6 +370,9 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
                         "figure",
                         page=page_no,
                         picture_index=index,
+                        figure_caption=caption,
+                        figure_labels=", ".join(labels),
+                        figure_description=description,
                     ),
                 }
             )

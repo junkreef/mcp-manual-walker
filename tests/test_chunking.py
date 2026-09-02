@@ -377,6 +377,14 @@ def test_picture_becomes_figure_chunk(manual):
     assert figure["metadata"]["picture_index"] == 3
     assert figure["metadata"]["bookmark_id"] == "bm_panel"
 
+    # The parts are also kept separately, so the builder can store them
+    # alongside the image without re-parsing the chunk text.
+    assert figure["metadata"]["figure_caption"] == "Figure 3-1: Controller wiring"
+    assert figure["metadata"]["figure_labels"] == "Controller, Sensor"
+    assert figure["metadata"]["figure_description"] == (
+        "A wiring diagram of the controller."
+    )
+
     # The caption item must not be repeated in a text chunk.
     text_chunks = [c for c in chunks if c["metadata"]["type"] == "text"]
     assert all("Figure 3-1" not in c["text"] for c in text_chunks)
@@ -396,3 +404,6 @@ def test_picture_without_caption_labels_or_description(manual):
     assert chunks[0]["metadata"]["page"] == 4
     assert chunks[0]["metadata"]["picture_index"] == 0
     assert chunks[0]["metadata"]["bookmark_id"] is None
+    assert chunks[0]["metadata"]["figure_caption"] == ""
+    assert chunks[0]["metadata"]["figure_labels"] == ""
+    assert chunks[0]["metadata"]["figure_description"] == ""

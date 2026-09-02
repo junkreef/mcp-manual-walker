@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     DOCLING_OCR_BATCH_SIZE: int = 16
     DOCLING_LAYOUT_BATCH_SIZE: int = 16
     DOCLING_TABLE_BATCH_SIZE: int = 16
+    # Render scale for the figure crops persisted to SQLite (1.0 = 72 dpi,
+    # 2.0 = 144 dpi). Higher values give sharper PNGs and a bigger database.
+    DOCLING_IMAGES_SCALE: float = 2.0
 
     # Worker pipeline configuration
     # pypdf hash/outline extraction processes; <=1 means run inline
