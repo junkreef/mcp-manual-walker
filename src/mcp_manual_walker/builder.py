@@ -31,6 +31,7 @@ try:
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
         AcceleratorOptions,
+        HeadingHierarchyOptions,
         PdfPipelineOptions,
         RapidOcrOptions,
     )
@@ -53,7 +54,7 @@ except ImportError:
 # Imports for DB Sync
 # Local imports
 try:
-    from mcp_manual_walker.chunking import chunk_text_by_coordinates
+    from mcp_manual_walker.chunking import chunk_document
     from mcp_manual_walker.config import settings
     from mcp_manual_walker.database import SessionLocal, init_db
     from mcp_manual_walker.embeddings import (
@@ -211,6 +212,9 @@ def _create_converter(num_threads: int):
     pipeline_options.layout_batch_size = settings.DOCLING_LAYOUT_BATCH_SIZE
     pipeline_options.table_batch_size = settings.DOCLING_TABLE_BATCH_SIZE
 
+    # Derive section-header levels from PDF bookmarks / numbering / font style
+    pipeline_options.heading_hierarchy_options = HeadingHierarchyOptions(enabled=True)
+
     pipeline_options.ocr_options = RapidOcrOptions(
         backend=settings.DOCLING_OCR_BACKEND,
         lang=[settings.DOCLING_OCR_LANG],
@@ -286,7 +290,7 @@ def _ingest_document(
         logger.error(f"Manual {manual_id} not found in DB. Skipping.")
         return 0
 
-    chunks = chunk_text_by_coordinates(doc, manual)
+    chunks = chunk_document(doc, manual)
     try:
         rel_path = pdf_path.relative_to(pdf_root)
     except ValueError:
@@ -309,6 +313,14 @@ def _ingest_document(
 
         if c["metadata"].get("bookmark_id"):
             meta["bookmark_id"] = str(c["metadata"]["bookmark_id"])
+
+        # Chroma metadata values must be str/int/float/bool
+        if c["metadata"].get("type"):
+            meta["type"] = str(c["metadata"]["type"])
+        if c["metadata"].get("page") is not None:
+            meta["page"] = int(c["metadata"]["page"])
+        if c["metadata"].get("picture_index") is not None:
+            meta["picture_index"] = int(c["metadata"]["picture_index"])
 
         metadatas.append(meta)
 

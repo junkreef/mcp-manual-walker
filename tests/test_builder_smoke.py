@@ -134,7 +134,7 @@ def builder_env(mock_settings):
         with (
             patch("mcp_manual_walker.pdf_utils.extract_pdf_metadata") as mock_meta,
             patch("mcp_manual_walker.pdf_utils.calculate_file_hash") as mock_hash,
-            patch("mcp_manual_walker.builder.chunk_text_by_coordinates") as mock_chunk,
+            patch("mcp_manual_walker.builder.chunk_document") as mock_chunk,
             patch(
                 "mcp_manual_walker.builder._make_process_executor",
                 side_effect=_thread_executor,
@@ -155,11 +155,21 @@ def builder_env(mock_settings):
             mock_chunk.return_value = [
                 {
                     "text": "Chunk 1",
-                    "metadata": {"manual_id": "id", "bookmark_id": "bm1"},
+                    "metadata": {
+                        "manual_id": "id",
+                        "bookmark_id": "bm1",
+                        "type": "text",
+                    },
                 },
                 {
                     "text": "Chunk 2",
-                    "metadata": {"manual_id": "id", "bookmark_id": "bm2"},
+                    "metadata": {
+                        "manual_id": "id",
+                        "bookmark_id": "bm2",
+                        "type": "figure",
+                        "page": 2,
+                        "picture_index": 0,
+                    },
                 },
             ]
 
@@ -210,6 +220,13 @@ def test_builder_smoke(pdf_dir, mock_settings, builder_env):
     assert metas[0]["bookmark_id"] == "bm1"
     assert metas[1]["bookmark_id"] == "bm2"
     assert "manual_id" in metas[0]
+
+    # Chunk kind and figure location travel into the Chroma metadata
+    assert metas[0]["type"] == "text"
+    assert "page" not in metas[0]
+    assert metas[1]["type"] == "figure"
+    assert metas[1]["page"] == 2
+    assert metas[1]["picture_index"] == 0
 
     # Embeddings are computed in the main process and passed explicitly
     assert len(kwargs["embeddings"]) == len(kwargs["ids"])
