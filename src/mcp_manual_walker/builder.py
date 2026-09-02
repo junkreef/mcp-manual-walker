@@ -211,7 +211,8 @@ def _create_converter(num_threads: int):
     pipeline_options.table_batch_size = settings.DOCLING_TABLE_BATCH_SIZE
 
     pipeline_options.ocr_options = RapidOcrOptions(
-        backend="torch",
+        backend=settings.DOCLING_OCR_BACKEND,
+        lang=[settings.DOCLING_OCR_LANG],
     )
 
     return DocumentConverter(

@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     DOCLING_WORKERS: int = 1
     # "auto" | "cpu" | "cuda" | "cuda:N" | "mps", passed to AcceleratorOptions
     DOCLING_DEVICE: str = "auto"
+    # RapidOCR inference backend passed to RapidOcrOptions(backend=...):
+    # "torch" (GPU-capable, checkpoints fetched on first use) or
+    # "onnxruntime" (CPU, uses the PP-OCRv6 models bundled with the rapidocr
+    # wheel, so it works offline).
+    DOCLING_OCR_BACKEND: str = "torch"
+    # RapidOCR language token for the recognition model (rapidocr default is
+    # "chinese"; e.g. "japan", "en", "korean").
+    DOCLING_OCR_LANG: str = "chinese"
     # Embedding model (shared by the builder and the search server; must match the DB)
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-0.6B"
     # "auto" | "cpu" | "cuda" ... for SentenceTransformers

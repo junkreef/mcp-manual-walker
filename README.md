@@ -100,6 +100,8 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `DOCLING_WORKERS` | `1` | Number of Docling converter processes, each with its own copy of the models in VRAM. The main knob for GPU utilization. |
 | `DOCLING_NUM_THREADS` | CPU count | Total CPU-thread budget for Docling, split evenly across `DOCLING_WORKERS`. |
 | `DOCLING_DEVICE` | `auto` | Accelerator for Docling's layout/table/OCR models (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`). |
+| `DOCLING_OCR_BACKEND` | `torch` | RapidOCR inference backend: `torch` (GPU-capable, checkpoints fetched on first use) or `onnxruntime` (CPU, uses the PP-OCRv6 models bundled with the rapidocr wheel, so it works offline). |
+| `DOCLING_OCR_LANG` | `chinese` | RapidOCR language token for the recognition model (e.g. `japan`, `en`, `korean`). |
 | `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
 
 ### 🧠 Embedding Model
