@@ -395,6 +395,81 @@ def test_builder_rebuilds_changed_manual(pdf_dir, mock_settings, builder_env):
     assert set(manual_ids) == deleted_ids
 
 
+def test_picture_description_options_disabled_by_default(builder_env):
+    """No PICTURE_DESCRIPTION_URL means the feature stays off."""
+    with patch.object(settings, "PICTURE_DESCRIPTION_URL", ""):
+        assert builder_env.builder._picture_description_options() is None
+
+        api_options_cls = builder_env.builder.PictureDescriptionApiOptions
+        api_options_cls.reset_mock()
+        builder_env.builder._create_converter(1)
+        api_options_cls.assert_not_called()
+
+
+def test_picture_description_options_built_from_settings(builder_env):
+    """URL/model/api key settings become the Docling API options + params."""
+    with (
+        patch.object(
+            settings, "PICTURE_DESCRIPTION_URL", "http://localhost:8080/v1/chat"
+        ),
+        patch.object(settings, "PICTURE_DESCRIPTION_MODEL", "m"),
+        patch.object(settings, "PICTURE_DESCRIPTION_API_KEY", "k"),
+    ):
+        options = builder_env.builder._picture_description_options()
+        assert options is not None
+
+        pipeline_cls = builder_env.builder.PictureDescriptionApiOptions
+        call_kwargs = pipeline_cls.call_args.kwargs
+        assert call_kwargs["url"] == "http://localhost:8080/v1/chat"
+        assert call_kwargs["params"] == {"max_tokens": 300, "model": "m"}
+        assert call_kwargs["headers"] == {"Authorization": "Bearer k"}
+        assert call_kwargs["prompt"] == settings.PICTURE_DESCRIPTION_PROMPT
+        assert call_kwargs["timeout"] == settings.PICTURE_DESCRIPTION_TIMEOUT
+        assert call_kwargs["concurrency"] == settings.PICTURE_DESCRIPTION_CONCURRENCY
+        assert call_kwargs["scale"] == settings.DOCLING_IMAGES_SCALE
+        assert (
+            call_kwargs["picture_area_threshold"]
+            == settings.PICTURE_DESCRIPTION_AREA_THRESHOLD
+        )
+
+        # PdfPipelineOptions() is a mock class, so every call returns the
+        # same instance (its default .return_value) - the one _create_converter
+        # actually configures.
+        pipeline_options = builder_env.builder.PdfPipelineOptions.return_value
+        builder_env.builder._create_converter(1)
+        assert pipeline_options.enable_remote_services is True
+        assert pipeline_options.do_picture_description is True
+        assert pipeline_options.picture_description_options is options
+
+
+def test_count_missing_descriptions_warns_when_empty(builder_env, caplog):
+    """A picture with no description text is reported as missing."""
+    described = FakePicture(index=0, page=1)
+    described.meta = SimpleNamespace(
+        description=SimpleNamespace(text="already described")
+    )
+    undescribed = FakePicture(index=1, page=1)
+    undescribed.meta = SimpleNamespace(description=None)
+    doc = SimpleNamespace(pictures=[described, undescribed])
+
+    missing, total = builder_env.builder._count_missing_descriptions(doc)
+    assert (missing, total) == (1, 2)
+
+    with patch.object(
+        settings, "PICTURE_DESCRIPTION_URL", "http://localhost:8080/v1/chat"
+    ):
+        doc.save_as_markdown = lambda *a, **k: None
+        with caplog.at_level("WARNING", logger="builder"):
+            builder_env.builder._converter = SimpleNamespace(
+                convert=lambda path: SimpleNamespace(document=doc)
+            )
+            builder_env.builder._convert_pdf_task(
+                Path("dummy.pdf"), "dummy.pdf", save_markdown=False
+            )
+    assert "1 of 2 figure(s)" in caplog.text
+    assert "got no description" in caplog.text
+
+
 def test_builder_continues_after_conversion_failure(
     pdf_dir, mock_settings, builder_env
 ):

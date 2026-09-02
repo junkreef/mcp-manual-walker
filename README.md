@@ -137,6 +137,44 @@ Consequences worth knowing:
     uv run db_manager build --pdf_dir ./data/pdfs --reset
     ```
 
+### 🗣️ Figure descriptions (optional)
+
+Each figure crop can additionally be sent to a local vision model over an
+OpenAI-compatible `chat/completions` API (Docling's built-in
+`PictureDescriptionApiOptions`). The returned text is stored in
+`figures.description` and folded into the figure chunk's text, so figures
+become searchable by what they actually show instead of just their caption
+and on-page labels.
+
+The feature is off by default (`PICTURE_DESCRIPTION_URL` empty). To enable
+it, run any vision-capable model (e.g. Gemma 3 4B) behind an
+OpenAI-compatible server — [Ollama](https://ollama.com) or
+[llama.cpp's server](https://github.com/ggml-org/llama.cpp) both work — and
+set `PICTURE_DESCRIPTION_URL` (and `PICTURE_DESCRIPTION_MODEL` for Ollama,
+which requires the model name in the request body; llama.cpp ignores it
+since the model is fixed at server startup):
+
+```sh
+PICTURE_DESCRIPTION_URL=http://localhost:11434/v1/chat/completions
+PICTURE_DESCRIPTION_MODEL=gemma3:4b
+```
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `PICTURE_DESCRIPTION_URL` | `""` | OpenAI-compatible `chat/completions` endpoint. Empty disables the feature. |
+| `PICTURE_DESCRIPTION_MODEL` | `""` | Sent as `"model"` in the request payload. Required by Ollama, ignored by llama.cpp's server. |
+| `PICTURE_DESCRIPTION_API_KEY` | `""` | Sent as `Authorization: Bearer ...` when set. |
+| `PICTURE_DESCRIPTION_PROMPT` | (Japanese prompt, see `config.py`) | Prompt sent alongside each figure crop. |
+| `PICTURE_DESCRIPTION_MAX_TOKENS` | `300` | Upper bound on the generated description length. |
+| `PICTURE_DESCRIPTION_TIMEOUT` | `120.0` | HTTP timeout per request to the vision API, in seconds. |
+| `PICTURE_DESCRIPTION_CONCURRENCY` | `1` | Parallel requests in flight per Docling worker. With `DOCLING_WORKERS > 1`, every worker sends its own requests, so the effective load on the vision server is `PICTURE_DESCRIPTION_CONCURRENCY * DOCLING_WORKERS`. |
+| `PICTURE_DESCRIPTION_AREA_THRESHOLD` | `0.02` | Pictures smaller than this fraction of the page area are skipped (not sent to the vision API). |
+
+A failing or unreachable endpoint does not fail the build: Docling logs an
+error per request and leaves that figure's description empty, and the
+builder additionally logs a warning naming the manual and how many figures
+got no description, as a hint to check whether the vision server is up.
+
 ### 🧠 Embedding Model
 
 Both the builder and the server embed text with [Sentence Transformers](https://www.sbert.net/) using [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (Apache-2.0). It was chosen for:

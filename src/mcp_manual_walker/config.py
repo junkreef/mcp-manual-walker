@@ -65,5 +65,31 @@ class Settings(BaseSettings):
     EMBEDDING_MAX_SEQ_LENGTH: int = 4096
     EMBEDDING_BATCH_SIZE: int = 32
 
+    # Figure descriptions (optional)
+    # Ask a local OpenAI-compatible vision model to describe every detected
+    # figure. Empty (the default) disables the feature entirely.
+    # Ollama: http://localhost:11434/v1/chat/completions
+    # llama.cpp server: http://localhost:8080/v1/chat/completions
+    PICTURE_DESCRIPTION_URL: str = ""
+    # Sent as "model" in the request payload when set. Ollama requires it;
+    # llama.cpp's server ignores it (the model is fixed at server startup).
+    PICTURE_DESCRIPTION_MODEL: str = ""
+    # Sent as the "Authorization: Bearer ..." header when set.
+    PICTURE_DESCRIPTION_API_KEY: str = ""
+    # Prompt sent alongside each figure crop.
+    PICTURE_DESCRIPTION_PROMPT: str = (
+        "これは技術マニュアルに掲載された図です。図が示している機器・部品・接続・"
+        "操作手順を、検索用の要約として日本語で簡潔に説明してください。"
+        "図中に書かれている文字はそのまま含めてください。"
+    )
+    # Upper bound on the generated description length.
+    PICTURE_DESCRIPTION_MAX_TOKENS: int = 300
+    # HTTP timeout per request to the vision API, in seconds.
+    PICTURE_DESCRIPTION_TIMEOUT: float = 120.0
+    # Parallel requests in flight per Docling worker.
+    PICTURE_DESCRIPTION_CONCURRENCY: int = 1
+    # Pictures smaller than this fraction of the page area are skipped.
+    PICTURE_DESCRIPTION_AREA_THRESHOLD: float = 0.02
+
 
 settings = Settings()

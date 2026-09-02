@@ -34,6 +34,7 @@ try:
         AcceleratorOptions,
         HeadingHierarchyOptions,
         PdfPipelineOptions,
+        PictureDescriptionApiOptions,
         RapidOcrOptions,
     )
     from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -56,7 +57,7 @@ except ImportError:
 # Imports for DB Sync
 # Local imports
 try:
-    from mcp_manual_walker.chunking import chunk_document
+    from mcp_manual_walker.chunking import _picture_description, chunk_document
     from mcp_manual_walker.config import settings
     from mcp_manual_walker.database import SessionLocal, init_db
     from mcp_manual_walker.embeddings import (
@@ -202,6 +203,36 @@ def _make_process_executor(
     )
 
 
+def _picture_description_options():
+    """
+    Builds the Docling options for describing figures via a vision model.
+
+    Returns None when PICTURE_DESCRIPTION_URL is unset, which is how the
+    feature stays off by default.
+    """
+    if not settings.PICTURE_DESCRIPTION_URL:
+        return None
+
+    params: dict = {"max_tokens": settings.PICTURE_DESCRIPTION_MAX_TOKENS}
+    if settings.PICTURE_DESCRIPTION_MODEL:
+        params["model"] = settings.PICTURE_DESCRIPTION_MODEL
+
+    headers: dict = {}
+    if settings.PICTURE_DESCRIPTION_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.PICTURE_DESCRIPTION_API_KEY}"
+
+    return PictureDescriptionApiOptions(
+        url=settings.PICTURE_DESCRIPTION_URL,
+        params=params,
+        headers=headers,
+        prompt=settings.PICTURE_DESCRIPTION_PROMPT,
+        timeout=settings.PICTURE_DESCRIPTION_TIMEOUT,
+        concurrency=settings.PICTURE_DESCRIPTION_CONCURRENCY,
+        scale=settings.DOCLING_IMAGES_SCALE,
+        picture_area_threshold=settings.PICTURE_DESCRIPTION_AREA_THRESHOLD,
+    )
+
+
 def _create_converter(num_threads: int):
     """Builds a DocumentConverter configured for the accelerator settings."""
     pipeline_options = PdfPipelineOptions()
@@ -228,6 +259,15 @@ def _create_converter(num_threads: int):
         lang=[settings.DOCLING_OCR_LANG],
     )
 
+    picture_description_options = _picture_description_options()
+    if picture_description_options is not None:
+        # enable_remote_services unlocks Docling pipelines that call an
+        # external HTTP endpoint; here that endpoint is the user's own local
+        # vision model server, not a third-party cloud service.
+        pipeline_options.enable_remote_services = True
+        pipeline_options.do_picture_description = True
+        pipeline_options.picture_description_options = picture_description_options
+
     # The default ThreadedDoclingParseDocumentBackend (docling-parse's native
     # threaded parser) was observed dropping pages ("Page N failed to parse",
     # PARTIAL_SUCCESS) and segfaulting the worker; cross-document parallelism
@@ -248,6 +288,14 @@ def _init_docling_worker(num_threads: int):
     global _converter
     logger.info(f"[Docling-{os.getpid()}] Initializing converter...")
     _converter = _create_converter(num_threads)
+    if settings.PICTURE_DESCRIPTION_URL:
+        logger.info(
+            f"[Docling-{os.getpid()}] Figure descriptions enabled via "
+            f"{settings.PICTURE_DESCRIPTION_URL} "
+            f"(model={settings.PICTURE_DESCRIPTION_MODEL or '(unset)'})."
+        )
+    else:
+        logger.info(f"[Docling-{os.getpid()}] Figure descriptions disabled.")
     logger.info(f"[Docling-{os.getpid()}] Ready.")
 
 
@@ -294,6 +342,16 @@ def _extract_figures(doc) -> list[dict]:
     return figures
 
 
+def _count_missing_descriptions(doc) -> tuple[int, int]:
+    """Counts pictures whose Docling-generated description is empty.
+
+    Returns ``(missing, total)``.
+    """
+    total = len(doc.pictures)
+    missing = sum(1 for p in doc.pictures if not _picture_description(p))
+    return missing, total
+
+
 def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
     """
     Converts a single PDF with the worker-local converter.
@@ -324,6 +382,17 @@ def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
             )
         except Exception as e:
             logger.error(f"Failed to save markdown for {pdf_path}: {e}")
+
+    if settings.PICTURE_DESCRIPTION_URL:
+        missing, total = _count_missing_descriptions(doc)
+        if missing:
+            logger.warning(
+                f"{missing} of {total} figure(s) in {rel_path} got no "
+                "description (is the vision API at "
+                f"{settings.PICTURE_DESCRIPTION_URL} running?)"
+            )
+        else:
+            logger.info(f"{total} figure(s) in {rel_path} got a description.")
 
     return doc, _extract_figures(doc)
 
