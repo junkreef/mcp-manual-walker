@@ -100,9 +100,13 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `DOCLING_WORKERS` | `1` | Number of Docling converter processes, each with its own copy of the models in VRAM. The main knob for GPU utilization. |
 | `DOCLING_NUM_THREADS` | CPU count | Total CPU-thread budget for Docling, split evenly across `DOCLING_WORKERS`. |
 | `DOCLING_DEVICE` | `auto` | Accelerator for Docling's layout/table/OCR models (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`). |
-| `DOCLING_OCR_BACKEND` | `torch` | RapidOCR inference backend: `torch` (GPU-capable, checkpoints fetched on first use) or `onnxruntime` (CPU, uses the PP-OCRv6 models bundled with the rapidocr wheel, so it works offline). |
-| `DOCLING_OCR_LANG` | `chinese` | RapidOCR language token for the recognition model (e.g. `japan`, `en`, `korean`). |
+| `DOCLING_OCR_BACKEND` | `onnxruntime` | RapidOCR inference backend: `onnxruntime` (default; models for `japan`/`chinese`/`en` ship with the rapidocr wheel, works offline, GPU via `onnxruntime-gpu`) or `torch` (downloads checkpoints from modelscope.cn on first use). |
+| `DOCLING_OCR_LANG` | `japan` | RapidOCR language token for the recognition model. `japan`/`chinese`/`en` need no download; other languages (e.g. `korean`) are fetched on first use. |
 | `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
+
+OCR only runs on layout regions without a PDF text layer (scanned pages, text
+inside images) — text-based PDFs are read from their text layer, so the OCR
+backend/language choice doesn't affect them.
 
 ### 🧠 Embedding Model
 
