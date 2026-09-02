@@ -97,3 +97,39 @@ def extract_pdf_metadata(file_path: Path) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"An unexpected error occurred while processing {file_path}: {e}")
         return None
+
+
+def extract_pdf_fingerprint(pdf_path: Path) -> Dict[str, Any]:
+    """
+    Computes the file hash and extracts the pypdf metadata for a single PDF.
+
+    This lives in pdf_utils rather than in the builder on purpose: it is
+    submitted to a "spawn" process pool, and every worker imports the module
+    that defines the task. Keeping it here means the workers only pull in pypdf
+    instead of the heavy Docling/torch stack that builder.py imports.
+
+    It never raises: any failure is reported back through the "error" key.
+    """
+    try:
+        file_hash = calculate_file_hash(pdf_path)
+        metadata = extract_pdf_metadata(pdf_path)
+        if not metadata:
+            return {
+                "pdf_path": pdf_path,
+                "file_hash": None,
+                "metadata": None,
+                "error": f"Failed to extract metadata from {pdf_path}",
+            }
+        return {
+            "pdf_path": pdf_path,
+            "file_hash": file_hash,
+            "metadata": metadata,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "pdf_path": pdf_path,
+            "file_hash": None,
+            "metadata": None,
+            "error": f"{type(e).__name__}: {e}",
+        }

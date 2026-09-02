@@ -1,11 +1,14 @@
+import concurrent.futures
 import importlib
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from mcp_manual_walker import database
 from mcp_manual_walker.config import settings
+from mcp_manual_walker.models import Manual
 
 
 @pytest.fixture
@@ -26,6 +29,9 @@ def mock_settings(tmp_path):
         patch.object(settings, "PDF_ROOT_DIR", new_pdf_dir),
         patch.object(settings, "CHROMADB_PATH", new_chroma_path),
         patch.object(settings, "MARKDOWN_OUTPUT_DIR", new_markdown_path),
+        # Keep the pipeline single-worker and in-process for deterministic tests
+        patch.object(settings, "METADATA_WORKERS", 1),
+        patch.object(settings, "DOCLING_WORKERS", 1),
     ):
         yield settings
 
@@ -34,25 +40,30 @@ def mock_settings(tmp_path):
         database.engine.dispose()
 
 
-def test_builder_smoke(tmp_path, mock_settings):
-    """Smoke test for builder.py using MOCKED dependencies."""
+def _thread_executor(max_workers, initializer=None, initargs=()):
+    """
+    Stand-in for builder._make_process_executor.
 
-    # 1. Prepare Paths
-    # 1. Prepare Paths
-    pdf_dir = tmp_path / "pdfs"
-    pdf_dir.mkdir(exist_ok=True)
-    sub_dir = pdf_dir / "subdir"
-    sub_dir.mkdir(exist_ok=True)
+    Spawned processes cannot see the mocks installed in this process, so the
+    tests run the whole pipeline on threads instead.
+    """
+    return concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers,
+        initializer=initializer,
+        initargs=initargs,
+    )
 
-    # Create dummy PDFs
-    (pdf_dir / "sample.pdf").write_text("dummy")
-    (sub_dir / "nested.pdf").write_text("dummy")
 
-    # 2. Prepare Mocks
+@pytest.fixture
+def builder_env(mock_settings):
+    """
+    Reloads builder.py with docling/langchain/chromadb replaced by mocks and
+    yields a namespace with the handles the tests need to assert on.
+    """
     mock_docling = MagicMock()
     mock_docling_conv = MagicMock()
     mock_docling.document_converter = mock_docling_conv
-    
+
     mock_docling_dm = MagicMock()
     mock_docling.datamodel = mock_docling_dm
     mock_docling.datamodel.base_models = MagicMock()
@@ -77,7 +88,8 @@ def test_builder_smoke(tmp_path, mock_settings):
     mock_client_inst.get_or_create_collection.return_value = mock_coll
     mock_chromadb.PersistentClient.return_value = mock_client_inst
 
-    # 3. Patch sys.modules and Run
+    pipeline_options = mock_docling.datamodel.pipeline_options
+
     with patch.dict(
         sys.modules,
         {
@@ -85,23 +97,36 @@ def test_builder_smoke(tmp_path, mock_settings):
             "docling.document_converter": mock_docling_conv,
             "docling.datamodel": mock_docling_dm,
             "docling.datamodel.base_models": mock_docling.datamodel.base_models,
-            "docling.datamodel.pipeline_options": mock_docling.datamodel.pipeline_options,
+            "docling.datamodel.pipeline_options": pipeline_options,
             "langchain_text_splitters": mock_lts,
             "chromadb": mock_chromadb,
             "chromadb.utils": mock_chromadb.utils,
-            "chromadb.utils.embedding_functions": mock_chromadb.utils.embedding_functions,
+            "chromadb.utils.embedding_functions": (
+                mock_chromadb.utils.embedding_functions
+            ),
         },
     ):
-        # Import/Reload builder inside patched environment
+        # Import/Reload builder inside patched environment so that the guarded
+        # module level imports pick up the mocks.
         from mcp_manual_walker import builder
 
         importlib.reload(builder)
 
-        # Patch local imports inside builder (which are now 'real' imports in the module object)
+        def fake_embedding_fn(docs):
+            return [[0.1, 0.2, 0.3] for _ in docs]
+
         with (
-            patch("mcp_manual_walker.builder.extract_pdf_metadata") as mock_meta,
-            patch("mcp_manual_walker.builder.calculate_file_hash") as mock_hash,
+            patch("mcp_manual_walker.pdf_utils.extract_pdf_metadata") as mock_meta,
+            patch("mcp_manual_walker.pdf_utils.calculate_file_hash") as mock_hash,
             patch("mcp_manual_walker.builder.chunk_text_by_coordinates") as mock_chunk,
+            patch(
+                "mcp_manual_walker.builder._make_process_executor",
+                side_effect=_thread_executor,
+            ),
+            patch(
+                "mcp_manual_walker.builder.get_ef",
+                return_value=fake_embedding_fn,
+            ),
         ):
             mock_hash.return_value = "dummy_hash"
             mock_meta.return_value = {
@@ -122,32 +147,107 @@ def test_builder_smoke(tmp_path, mock_settings):
                 },
             ]
 
-            # Use the mocked dependencies via builder attribute if they were imported directly
-            # builder.DocumentConverter is from docling.document_converter
-            # Since we patched sys.modules BEFORE reload, builder should have picked up the mocks.
-            # builder.py:
-            # try: from docling.document_converter import DocumentConverter ...
+            yield types.SimpleNamespace(
+                builder=builder,
+                mock_inst=mock_inst,
+                mock_res=mock_res,
+                mock_coll=mock_coll,
+                mock_hash=mock_hash,
+                mock_meta=mock_meta,
+                mock_chunk=mock_chunk,
+            )
 
-            # Since mock_docling_conv is in sys.modules, import should succeed and grab the mock.
 
-            # Run build twice to check coverage? Or just once with True
-            builder.build(pdf_dir, reset=True, save_markdown=True)
+@pytest.fixture
+def pdf_dir(tmp_path):
+    """Creates two dummy PDFs, one of them in a nested directory."""
+    pdf_dir = tmp_path / "pdfs"
+    pdf_dir.mkdir(exist_ok=True)
+    sub_dir = pdf_dir / "subdir"
+    sub_dir.mkdir(exist_ok=True)
 
-            # Verify
-            assert mock_inst.convert.call_count == 2
-            assert mock_coll.add.call_count == 2
+    (pdf_dir / "sample.pdf").write_text("dummy")
+    (sub_dir / "nested.pdf").write_text("dummy")
+    return pdf_dir
 
-            # Check args of last call
-            call_args = mock_coll.add.call_args
-            kwargs = call_args[1]
 
-            assert len(kwargs["ids"]) == 2
-            metas = kwargs["metadatas"]
-            # Check metadata keys
-            assert "bookmark_id" in metas[0]
-            assert metas[0]["bookmark_id"] == "bm1"
-            assert metas[1]["bookmark_id"] == "bm2"
+def test_builder_smoke(pdf_dir, mock_settings, builder_env):
+    """Smoke test for builder.py using MOCKED dependencies."""
+    builder_env.builder.build(pdf_dir, reset=True, save_markdown=True)
 
-            # Check manual_id
-            assert "manual_id" in metas[0]
+    assert builder_env.mock_inst.convert.call_count == 2
+    assert builder_env.mock_coll.add.call_count == 2
 
+    # Check args of last call
+    kwargs = builder_env.mock_coll.add.call_args[1]
+
+    assert len(kwargs["ids"]) == 2
+    assert len(kwargs["documents"]) == 2
+    metas = kwargs["metadatas"]
+    assert metas[0]["bookmark_id"] == "bm1"
+    assert metas[1]["bookmark_id"] == "bm2"
+    assert "manual_id" in metas[0]
+
+    # Embeddings are computed in the main process and passed explicitly
+    assert len(kwargs["embeddings"]) == len(kwargs["ids"])
+
+    # Markdown files keep the nested layout of the source tree
+    md_root = mock_settings.MARKDOWN_OUTPUT_DIR
+    assert (md_root / "sample.md").exists()
+    assert (md_root / "subdir" / "nested.md").exists()
+
+    # Relational DB holds both manuals with their bookmarks
+    with database.SessionLocal() as session:
+        manuals = session.query(Manual).all()
+        assert len(manuals) == 2
+        for manual in manuals:
+            assert len(manual.bookmarks) == 1
+
+
+def test_builder_skips_unchanged(pdf_dir, mock_settings, builder_env):
+    """A second build with identical hashes must not re-convert anything."""
+    builder_env.builder.build(pdf_dir, reset=True, save_markdown=False)
+    first_count = builder_env.mock_inst.convert.call_count
+    assert first_count == 2
+
+    builder_env.builder.build(pdf_dir, reset=False, save_markdown=False)
+
+    assert builder_env.mock_inst.convert.call_count == first_count
+    builder_env.mock_coll.delete.assert_not_called()
+
+
+def test_builder_rebuilds_changed_manual(pdf_dir, mock_settings, builder_env):
+    """A changed hash must drop the stale chunks and re-convert the file."""
+    builder_env.builder.build(pdf_dir, reset=True, save_markdown=False)
+
+    with database.SessionLocal() as session:
+        manual_ids = [m.id for m in session.query(Manual).all()]
+    assert manual_ids
+
+    builder_env.mock_hash.return_value = "changed_hash"
+    builder_env.builder.build(pdf_dir, reset=False, save_markdown=False)
+
+    assert builder_env.mock_inst.convert.call_count == 4
+
+    delete_calls = builder_env.mock_coll.delete.call_args_list
+    assert len(delete_calls) == 2
+    deleted_ids = {call.kwargs["where"]["manual_id"] for call in delete_calls}
+    assert set(manual_ids) == deleted_ids
+
+
+def test_builder_continues_after_conversion_failure(
+    pdf_dir, mock_settings, builder_env
+):
+    """One failing conversion must not abort the whole build."""
+
+    def convert_side_effect(path_str):
+        if "nested" in path_str:
+            raise RuntimeError("Simulated docling failure")
+        return builder_env.mock_res
+
+    builder_env.mock_inst.convert.side_effect = convert_side_effect
+
+    builder_env.builder.build(pdf_dir, reset=True, save_markdown=False)
+
+    assert builder_env.mock_inst.convert.call_count == 2
+    assert builder_env.mock_coll.add.call_count == 1

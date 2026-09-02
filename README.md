@@ -66,6 +66,34 @@ The server provides a set of tools for AI agents. The typical workflow is as fol
 
 This process allows an agent to intelligently navigate large documents and only pull the necessary information into its context.
 
+## 🏗️ Building the Database
+
+Building the searchable database (Docling PDF conversion, chunking, embeddings, and ChromaDB indexing) is a separate step from running the server, and it has its own dependencies. Install them first:
+
+```sh
+uv sync --extra builder
+```
+
+This pulls in Docling, `sentence-transformers`, and the CUDA build of PyTorch (from the `pytorch` index configured in `pyproject.toml`) so embeddings and Docling's models can run on the GPU.
+
+Then run the builder:
+
+```sh
+uv run db_manager build --pdf_dir ./data/pdfs [--reset] [--save-markdown]
+```
+
+The build pipeline is designed to keep the GPU busy instead of processing one PDF at a time. The main process scans the PDF directory (largest files first), runs a fast metadata pass (hashing + bookmark extraction), and syncs the results to SQLite. It then submits each new or changed PDF to a pool of Docling worker processes for conversion; as each conversion finishes, the main process chunks the text, computes embeddings on the GPU, and writes the result into ChromaDB, so embedding of one file overlaps with Docling converting the next ones. Files whose SHA256 hash hasn't changed are skipped entirely, and rebuilding a manual first removes its old chunks from ChromaDB before adding the new ones.
+
+The pipeline's concurrency and device placement are tuned through environment variables (see `.env.example`):
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `METADATA_WORKERS` | `max(1, cpu_count // 2)` | Processes used for the fast hashing/bookmark pass. 1 or less runs it inline. |
+| `DOCLING_WORKERS` | `1` | Number of Docling converter processes, each with its own copy of the models in VRAM. The main knob for GPU utilization. |
+| `DOCLING_NUM_THREADS` | CPU count | Total CPU-thread budget for Docling, split evenly across `DOCLING_WORKERS`. |
+| `DOCLING_DEVICE` | `auto` | Accelerator for Docling's layout/table/OCR models (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`). |
+| `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
+
 ## 🗺️ Roadmap
 
 *   [ ] Implement a more sophisticated search functionality.

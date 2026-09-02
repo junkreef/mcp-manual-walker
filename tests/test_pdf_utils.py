@@ -5,6 +5,7 @@ import pytest
 
 from mcp_manual_walker.pdf_utils import (
     calculate_file_hash,
+    extract_pdf_fingerprint,
     extract_pdf_metadata,
 )
 
@@ -98,3 +99,28 @@ def test_extract_metadata_file_not_found():
     assert result is None
 
     assert result is None
+
+
+def test_extract_pdf_fingerprint_success(pdf_for_utils_test: Path):
+    """
+    Tests that the worker task reports the hash and metadata of a valid PDF.
+    """
+    result = extract_pdf_fingerprint(pdf_for_utils_test)
+
+    assert result["error"] is None
+    assert result["pdf_path"] == pdf_for_utils_test
+    assert len(result["file_hash"]) == 64
+    assert all(c in "0123456789abcdef" for c in result["file_hash"])
+    assert result["metadata"]["document_title"] == "Dummy Test Manual"
+
+
+def test_extract_pdf_fingerprint_reports_error_for_missing_file(tmp_path: Path):
+    """
+    Tests that the worker task reports failures instead of raising.
+    """
+    result = extract_pdf_fingerprint(tmp_path / "does_not_exist.pdf")
+
+    assert isinstance(result["error"], str)
+    assert result["error"]
+    assert result["metadata"] is None
+    assert result["file_hash"] is None

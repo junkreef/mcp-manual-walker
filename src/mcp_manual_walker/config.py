@@ -1,5 +1,5 @@
-from pathlib import Path
 import multiprocessing
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -25,10 +25,22 @@ class Settings(BaseSettings):
     PORT: int = 8000
 
     # Docling Configuration
+    # DOCLING_NUM_THREADS is the TOTAL CPU thread budget shared by all Docling
+    # worker processes; each worker gets DOCLING_NUM_THREADS // DOCLING_WORKERS.
     DOCLING_NUM_THREADS: int = multiprocessing.cpu_count()
     DOCLING_OCR_BATCH_SIZE: int = 16
     DOCLING_LAYOUT_BATCH_SIZE: int = 16
     DOCLING_TABLE_BATCH_SIZE: int = 16
+
+    # Worker pipeline configuration
+    # pypdf hash/outline extraction processes; <=1 means run inline
+    METADATA_WORKERS: int = max(1, multiprocessing.cpu_count() // 2)
+    # Number of Docling converter processes (each loads its own models into VRAM)
+    DOCLING_WORKERS: int = 1
+    # "auto" | "cpu" | "cuda" | "cuda:N" | "mps", passed to AcceleratorOptions
+    DOCLING_DEVICE: str = "auto"
+    # "auto" | "cpu" | "cuda" ... for SentenceTransformers
+    EMBEDDING_DEVICE: str = "auto"
 
 
 settings = Settings()

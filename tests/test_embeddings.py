@@ -3,8 +3,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mcp_manual_walker.config import settings
 from mcp_manual_walker.embeddings import (
     FastEmbedEmbeddingFunction,
+    _resolve_device,
     get_embedding_function,
 )
 
@@ -50,16 +52,30 @@ def test_get_embedding_function_sentence_transformers_installed():
         "chromadb.utils.embedding_functions.SentenceTransformerEmbeddingFunction"
     ) as mock_st_ef_cls:
         # Simulate sentence_transformers installed
-        with patch.dict(sys.modules, {"sentence_transformers": mock_st}):
-            # We also need to make sure the import inside get_embedding_function succeeds.
-            # importing sentence_transformers will succeed due to sys.modules patch.
+        with (
+            patch.dict(sys.modules, {"sentence_transformers": mock_st}),
+            patch.object(settings, "EMBEDDING_DEVICE", "cpu"),
+        ):
+            # The import inside get_embedding_function must succeed:
+            # sentence_transformers is resolved from the sys.modules patch.
 
             ef = get_embedding_function()
 
             mock_st_ef_cls.assert_called_with(
-                model_name="intfloat/multilingual-e5-small"
+                model_name="intfloat/multilingual-e5-small", device="cpu"
             )
             assert ef == mock_st_ef_cls.return_value
+
+
+def test_resolve_device_explicit():
+    """An explicit device string must be passed through untouched."""
+    assert _resolve_device("cuda:1") == "cuda:1"
+
+
+def test_resolve_device_auto_without_torch():
+    """Without torch available, "auto" must fall back to CPU."""
+    with patch.dict(sys.modules, {"torch": None}):
+        assert _resolve_device("auto") == "cpu"
 
 
 def test_fastembed_embedding_function_call(mock_fastembed_module):

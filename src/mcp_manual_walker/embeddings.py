@@ -1,6 +1,8 @@
 import logging
 from typing import Optional
 
+from mcp_manual_walker.config import settings
+
 try:
     import chromadb
     from chromadb import Documents, EmbeddingFunction, Embeddings
@@ -65,6 +67,27 @@ class FastEmbedEmbeddingFunction(EmbeddingFunction):
         return list(self.model.embed(input))
 
 
+def _resolve_device(preferred: str) -> str:
+    """
+    Resolves the compute device for SentenceTransformers.
+
+    Any explicit value ("cpu", "cuda", "cuda:1", "mps", ...) is passed through
+    untouched. "auto" asks torch whether a CUDA device is usable and falls back
+    to CPU when torch is unavailable.
+    """
+    if preferred.lower() != "auto":
+        return preferred
+
+    # Imported lazily and separately from sentence_transformers: the test suite
+    # injects a fake sentence_transformers module without providing torch.
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
 def get_embedding_function() -> Optional[EmbeddingFunction]:
     """
     Returns an appropriate embedding function based on available libraries.
@@ -81,9 +104,12 @@ def get_embedding_function() -> Optional[EmbeddingFunction]:
         import sentence_transformers  # noqa: F401
         from chromadb.utils import embedding_functions
 
-        logger.info(f"Using SentenceTransformers with model: {MODEL_NAME}")
+        device = _resolve_device(settings.EMBEDDING_DEVICE)
+        logger.info(
+            f"Using SentenceTransformers with model: {MODEL_NAME} on device: {device}"
+        )
         return embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=MODEL_NAME
+            model_name=MODEL_NAME, device=device
         )
     except ImportError:
         pass
