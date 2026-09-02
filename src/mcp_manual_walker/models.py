@@ -8,7 +8,9 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
+    Text,
 )
 from sqlalchemy.orm import Mapped, declarative_base, relationship
 
@@ -37,6 +39,9 @@ class Manual(Base):
     bookmarks: Mapped[List["Bookmark"]] = relationship(
         "Bookmark", back_populates="manual", cascade="all, delete-orphan"
     )
+    figures: Mapped[List["Figure"]] = relationship(
+        "Figure", back_populates="manual", cascade="all, delete-orphan"
+    )
 
 
 class Bookmark(Base):
@@ -60,3 +65,44 @@ class Bookmark(Base):
     children: Mapped[List["Bookmark"]] = relationship(
         "Bookmark", back_populates="parent", cascade="all, delete-orphan"
     )
+
+
+class Figure(Base):
+    """A picture detected by Docling, stored as a PNG blob.
+
+    The image bytes live in SQLite so that the database file and the Chroma
+    directory are the only artifacts that have to travel between machines;
+    chunk metadata in Chroma only carries the figure id.
+    """
+
+    __tablename__ = "figures"
+
+    id: Mapped[str] = Column(String(36), primary_key=True, default=generate_uuid)
+    manual_id: Mapped[str] = Column(
+        String(36), ForeignKey("manuals.id"), nullable=False
+    )
+    # Plain column, deliberately without a foreign key: bookmarks are re-created
+    # on every manual update, and Chroma stores the same plain id.
+    bookmark_id: Mapped[Optional[str]] = Column(String(36), nullable=True)
+    picture_index: Mapped[int] = Column(Integer, nullable=False)
+    page: Mapped[int] = Column(Integer, nullable=False)
+    # Bounding box in PDF points, bottom-left origin (Docling prov bbox).
+    bbox_l: Mapped[float] = Column(Float, nullable=False)
+    bbox_b: Mapped[float] = Column(Float, nullable=False)
+    bbox_r: Mapped[float] = Column(Float, nullable=False)
+    bbox_t: Mapped[float] = Column(Float, nullable=False)
+    caption: Mapped[Optional[str]] = Column(Text, nullable=True)
+    # Comma-joined text labels drawn inside the picture.
+    labels: Mapped[Optional[str]] = Column(Text, nullable=True)
+    # Filled by a later phase (vision model description).
+    description: Mapped[Optional[str]] = Column(Text, nullable=True)
+    mime_type: Mapped[str] = Column(String, default="image/png")
+    width: Mapped[Optional[int]] = Column(Integer)
+    height: Mapped[Optional[int]] = Column(Integer)
+    image: Mapped[bytes] = Column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+    )
+
+    manual: Mapped["Manual"] = relationship("Manual", back_populates="figures")

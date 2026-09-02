@@ -9,22 +9,29 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp",
-    "markitdown[pdf]",
     "pypdf",
     "SQLAlchemy",
     "pydantic",
     "pydantic-settings",
     "chromadb",
-    "fastembed>=0.7.4",
+    "sentence-transformers>=5.2.0",
 ]
 
 [project.optional-dependencies]
+# The torch build is chosen by extra: CPU wheels for the search server,
+# CUDA 13.0 wheels for the builder. They are mutually exclusive.
+cpu = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+]
+cu130 = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+]
 builder = [
+    "mcp-manual-walker[cu130]",
     "docling",
     "langchain-text-splitters",
-    "sentence-transformers>=5.2.0",
-    "torch>=2.0.0; sys_platform == 'linux'",
-    "torchvision>=0.15.0; sys_platform == 'linux'",
 ]
 dev = [
     "uv",
@@ -44,15 +51,27 @@ select = ["E", "F", "I"]
 
 [tool.uv]
 package = true
+conflicts = [[{ extra = "cpu" }, { extra = "cu130" }]]
 
 [[tool.uv.index]]
-name = "pytorch"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch" }]
-torchvision = [{ index = "pytorch" }]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

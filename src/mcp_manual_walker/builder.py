@@ -1,11 +1,14 @@
 import argparse
+import io
 import logging
-import queue
+import multiprocessing as mp
+import os
 import shutil
 import sys
-import threading
 import uuid
 import warnings
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 # Imports for dependencies
@@ -25,14 +28,17 @@ logger = logging.getLogger("builder")
 
 
 try:
+    from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
     from docling.datamodel.base_models import InputFormat
-    from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.pipeline_options import (
-        ThreadedPdfPipelineOptions,
         AcceleratorOptions,
-        AcceleratorDevice,
-        RapidOcrOptions
+        HeadingHierarchyOptions,
+        PdfPipelineOptions,
+        PictureDescriptionApiOptions,
+        RapidOcrOptions,
     )
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling_core.types.doc import ImageRefMode
     # We might need specific options if we want to speed up or customize
 except ImportError as e:
     logger.error(f"Failed to import docling: {e}", exc_info=True)
@@ -51,15 +57,27 @@ except ImportError:
 # Imports for DB Sync
 # Local imports
 try:
-    from mcp_manual_walker.chunking import chunk_text_by_coordinates
+    from mcp_manual_walker.chunking import _picture_description, chunk_document
     from mcp_manual_walker.config import settings
     from mcp_manual_walker.database import SessionLocal, init_db
-    from mcp_manual_walker.embeddings import get_embedding_function as get_ef
-    from mcp_manual_walker.models import Bookmark, Manual
-    from mcp_manual_walker.pdf_utils import calculate_file_hash, extract_pdf_metadata
+    from mcp_manual_walker.embeddings import (
+        COLLECTION_NAME,
+        check_collection_model,
+        collection_metadata,
+        get_embedder,
+    )
+    from mcp_manual_walker.models import Bookmark, Figure, Manual
+    from mcp_manual_walker.pdf_utils import extract_pdf_fingerprint
 except ImportError as e:
     logger.error(f"Failed to import local modules: {e}")
     sys.exit(1)
+
+
+# Chroma rejects very large single batches, so inserts are sliced.
+CHROMA_ADD_BATCH_SIZE = 1000
+
+# Per-process Docling converter, initialized once in each worker process.
+_converter = None
 
 
 def check_dependencies():
@@ -77,24 +95,23 @@ def check_dependencies():
         sys.exit(1)
 
 
-def get_embedding_function():
-    # Helper to get the embedding function via factory
-    ef = get_ef()
-    if ef is None:
-        logger.error(
-            "Could not load any embedding function. Please install 'fastembed' or 'sentence-transformers'."
-        )
-        sys.exit(1)
-    return ef
-
-
 def sync_manual_to_db(
-    session: Session, pdf_path: Path, pdf_root: Path
-) -> tuple[Manual, bool]:
+    session: Session,
+    pdf_path: Path,
+    pdf_root: Path,
+    file_hash: str,
+    metadata: dict,
+) -> tuple[Manual, bool, bool]:
     """
     Syncs the Manual and Bookmarks to the SQLite DB.
+
+    The file hash and the pypdf metadata are computed beforehand (possibly in a
+    worker process) and passed in, so this function only touches the DB.
+
     Returns:
-        (Manual, bool): The manual object and a boolean indicating if it was updated/new (True) or unchanged (False).
+        (Manual, updated, existed): the manual object, whether it was created or
+        refreshed (True) or left unchanged (False), and whether a row for this
+        relative path already existed before the call.
     """
     # Use consistent relative path from the root PDF directory
     try:
@@ -103,27 +120,22 @@ def sync_manual_to_db(
         # Fallback if path is not relative to root (should be rare in current usage)
         rel_path_str = pdf_path.name
 
-    file_hash = calculate_file_hash(pdf_path)
-
-    # Extract metadata including bookmarks with TOP coordinates
-    metadata = extract_pdf_metadata(pdf_path)
-    if not metadata:
-        raise ValueError(f"Failed to extract metadata from {pdf_path}")
-
-    stmt = select(Manual).where(Manual.relative_path == str(pdf_path.relative_to(pdf_root)))
+    stmt = select(Manual).where(Manual.relative_path == rel_path_str)
     manual = session.execute(stmt).scalars().first()
+    existed = manual is not None
 
     if manual:
-        logger.info(f"Manual {str(pdf_path.relative_to(pdf_root))} found in DB. Checking hash...")
+        logger.info(f"Manual {rel_path_str} found in DB. Checking hash...")
         if manual.file_hash == file_hash:
             logger.info("Hash match. Skipping DB sync (bookmarks).")
-            return manual, False
+            return manual, False, existed
         else:
             logger.info("Hash mismatch. Updating...")
-            # Delete old bookmarks
+            # Delete old bookmarks and figures: they describe the old content.
             manual.bookmarks.clear()
+            manual.figures.clear()
     else:
-        logger.info(f"Creating new Manual entry for {str(pdf_path.relative_to(pdf_root))}")
+        logger.info(f"Creating new Manual entry for {rel_path_str}")
         manual = Manual(id=str(uuid.uuid4()))
         session.add(manual)
 
@@ -171,145 +183,333 @@ def sync_manual_to_db(
 
     session.commit()
     logger.info(f"Synced {len(bookmarks_data)} bookmarks to DB.")
-    return manual, True
+    return manual, True, existed
 
 
-def docling_worker(pdf_queue: queue.Queue, doc_queue: queue.Queue, pdf_root: Path, worker_id: int):
+def _make_process_executor(
+    max_workers: int, initializer=None, initargs=()
+) -> ProcessPoolExecutor:
     """
-    Worker function for Docling conversion.
-    Each worker initializes its own DocumentConverter to parallelize GPU usage.
+    Creates a process pool using the "spawn" start method.
+
+    This is the single place where a ProcessPoolExecutor is built, so tests can
+    swap it for a thread pool and keep everything inside one process.
     """
-    logger.info(f"[Docling-{worker_id}] Initializing converter...")
-    
-    try:
-        pipeline_options = ThreadedPdfPipelineOptions()
-        pipeline_options.accelerator_options = AcceleratorOptions(
-            device=AcceleratorDevice.CUDA,
-            num_threads=settings.DOCLING_NUM_THREADS
+    return ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=mp.get_context("spawn"),
+        initializer=initializer,
+        initargs=initargs,
+    )
+
+
+def _picture_description_options():
+    """
+    Builds the Docling options for describing figures via a vision model.
+
+    Returns None when PICTURE_DESCRIPTION_URL is unset, which is how the
+    feature stays off by default.
+    """
+    if not settings.PICTURE_DESCRIPTION_URL:
+        return None
+
+    params: dict = {"max_tokens": settings.PICTURE_DESCRIPTION_MAX_TOKENS}
+    if settings.PICTURE_DESCRIPTION_MODEL:
+        params["model"] = settings.PICTURE_DESCRIPTION_MODEL
+
+    headers: dict = {}
+    if settings.PICTURE_DESCRIPTION_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.PICTURE_DESCRIPTION_API_KEY}"
+
+    return PictureDescriptionApiOptions(
+        url=settings.PICTURE_DESCRIPTION_URL,
+        params=params,
+        headers=headers,
+        prompt=settings.PICTURE_DESCRIPTION_PROMPT,
+        timeout=settings.PICTURE_DESCRIPTION_TIMEOUT,
+        concurrency=settings.PICTURE_DESCRIPTION_CONCURRENCY,
+        scale=settings.DOCLING_IMAGES_SCALE,
+        picture_area_threshold=settings.PICTURE_DESCRIPTION_AREA_THRESHOLD,
+    )
+
+
+def _create_converter(num_threads: int):
+    """Builds a DocumentConverter configured for the accelerator settings."""
+    pipeline_options = PdfPipelineOptions()
+    # AcceleratorOptions accepts the device as a plain string ("auto", "cuda:0", ...)
+    pipeline_options.accelerator_options = AcceleratorOptions(
+        device=settings.DOCLING_DEVICE,
+        num_threads=num_threads,
+    )
+    # Increase batch sizes to improve GPU utilization
+    pipeline_options.ocr_batch_size = settings.DOCLING_OCR_BATCH_SIZE
+    pipeline_options.layout_batch_size = settings.DOCLING_LAYOUT_BATCH_SIZE
+    pipeline_options.table_batch_size = settings.DOCLING_TABLE_BATCH_SIZE
+
+    # Derive section-header levels from PDF bookmarks / numbering / font style
+    pipeline_options.heading_hierarchy_options = HeadingHierarchyOptions(enabled=True)
+
+    # Render the detected pictures: the crops are persisted as PNG blobs in the
+    # SQLite figures table (and written next to the markdown dump on request).
+    pipeline_options.generate_picture_images = True
+    pipeline_options.images_scale = settings.DOCLING_IMAGES_SCALE
+
+    pipeline_options.ocr_options = RapidOcrOptions(
+        backend=settings.DOCLING_OCR_BACKEND,
+        lang=[settings.DOCLING_OCR_LANG],
+    )
+
+    picture_description_options = _picture_description_options()
+    if picture_description_options is not None:
+        # enable_remote_services unlocks Docling pipelines that call an
+        # external HTTP endpoint; here that endpoint is the user's own local
+        # vision model server, not a third-party cloud service.
+        pipeline_options.enable_remote_services = True
+        pipeline_options.do_picture_description = True
+        pipeline_options.picture_description_options = picture_description_options
+
+    # The default ThreadedDoclingParseDocumentBackend (docling-parse's native
+    # threaded parser) was observed dropping pages ("Page N failed to parse",
+    # PARTIAL_SUCCESS) and segfaulting the worker; cross-document parallelism
+    # already comes from DOCLING_WORKERS, so the single-threaded parser is
+    # used here for deterministic output.
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=pipeline_options,
+                backend=DoclingParseDocumentBackend,
+            )
+        }
+    )
+
+
+def _init_docling_worker(num_threads: int):
+    """Process pool initializer: loads the Docling models once per worker."""
+    global _converter
+    logger.info(f"[Docling-{os.getpid()}] Initializing converter...")
+    _converter = _create_converter(num_threads)
+    if settings.PICTURE_DESCRIPTION_URL:
+        logger.info(
+            f"[Docling-{os.getpid()}] Figure descriptions enabled via "
+            f"{settings.PICTURE_DESCRIPTION_URL} "
+            f"(model={settings.PICTURE_DESCRIPTION_MODEL or '(unset)'})."
         )
-        # Increase batch sizes to improve GPU utilization
-        pipeline_options.ocr_batch_size = settings.DOCLING_OCR_BATCH_SIZE
-        pipeline_options.layout_batch_size = settings.DOCLING_LAYOUT_BATCH_SIZE
-        pipeline_options.table_batch_size = settings.DOCLING_TABLE_BATCH_SIZE
-        
+    else:
+        logger.info(f"[Docling-{os.getpid()}] Figure descriptions disabled.")
+    logger.info(f"[Docling-{os.getpid()}] Ready.")
 
-        pipeline_options.ocr_options = RapidOcrOptions(
-            backend="torch",
-        )   
 
-        converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+def _extract_figures(doc) -> list[dict]:
+    """
+    Pulls the rendered pictures out of a document as PNG bytes.
+
+    The images are removed from the document afterwards: a PIL image travelling
+    inside the pickled DoclingDocument blows the worker-to-parent transfer up
+    (two figures grew a 6 KB pickle to 1.5 MB), while the PNG bytes returned
+    here are handed to the parent as plain dicts.
+    """
+    figures: list[dict] = []
+
+    for index, picture in enumerate(doc.pictures):
+        try:
+            image = picture.get_image(doc)
+        except Exception as e:  # noqa: BLE001 - one bad crop must not fail a PDF
+            logger.warning(f"Could not render picture {index}: {e}")
+            image = None
+
+        prov = picture.prov[0] if getattr(picture, "prov", None) else None
+        if image is None or prov is None:
+            continue
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        bbox = prov.bbox
+        figures.append(
+            {
+                "picture_index": index,
+                "page": prov.page_no,
+                "bbox": (bbox.l, bbox.b, bbox.r, bbox.t),
+                "width": image.width,
+                "height": image.height,
+                "png": buf.getvalue(),
             }
         )
-    except Exception as e:
-        logger.error(f"[Docling-{worker_id}] Failed to initialize converter: {e}", exc_info=True)
-        return
 
-    logger.info(f"[Docling-{worker_id}] Ready.")
+    # Drop the images from every picture, including the ones skipped above.
+    for picture in doc.pictures:
+        picture.image = None
 
-    while True:
-        item = pdf_queue.get()
-        if item is None:
-            # Sentinel value to stop the worker
-            pdf_queue.task_done()
-            break
+    return figures
 
-        pdf_path, manual_id = item
-        
+
+def _count_missing_descriptions(doc) -> tuple[int, int]:
+    """Counts pictures whose Docling-generated description is empty.
+
+    Returns ``(missing, total)``.
+    """
+    total = len(doc.pictures)
+    missing = sum(1 for p in doc.pictures if not _picture_description(p))
+    return missing, total
+
+
+def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
+    """
+    Converts a single PDF with the worker-local converter.
+
+    Returns ``(document, figures)``: the DoclingDocument stripped of its picture
+    images, plus those images as plain PNG records. Both are pickled back to the
+    parent process, which is far cheaper than re-running Docling there.
+    Conversion errors are left to propagate through the future.
+    """
+    logger.info(f"[Docling-{os.getpid()}] Converting {pdf_path.name}...")
+    result = _converter.convert(str(pdf_path))
+    doc = result.document
+
+    if save_markdown:
+        # A markdown dump is a convenience artifact; never fail the conversion
+        # because it could not be written. It is written before the images are
+        # stripped, so the PNG files next to it can actually be exported.
         try:
-            logger.info(f"[Docling-{worker_id}] Converting {pdf_path.name}...")
-            result = converter.convert(str(pdf_path))
-            
-            # Pass to Embedding Worker
-            doc_queue.put((manual_id, pdf_path, result))
-            logger.info(f"[Docling-{worker_id}] Queued {pdf_path.name} for embedding.")
-
+            md_path = settings.MARKDOWN_OUTPUT_DIR / Path(rel_path).with_suffix(".md")
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            # A relative artifacts_dir makes Docling write relative image
+            # links, so the dump stays valid when the tree is moved; the
+            # directory itself is still created next to the markdown file.
+            doc.save_as_markdown(
+                md_path,
+                artifacts_dir=Path(f"{md_path.stem}_artifacts"),
+                image_mode=ImageRefMode.REFERENCED,
+            )
         except Exception as e:
-            logger.error(f"[Docling-{worker_id}] Failed to convert {pdf_path}: {e}", exc_info=True)
-        finally:
-            pdf_queue.task_done()
-    
-    logger.info(f"[Docling-{worker_id}] Finished.")
+            logger.error(f"Failed to save markdown for {pdf_path}: {e}")
+
+    if settings.PICTURE_DESCRIPTION_URL:
+        missing, total = _count_missing_descriptions(doc)
+        if missing:
+            logger.warning(
+                f"{missing} of {total} figure(s) in {rel_path} got no "
+                "description (is the vision API at "
+                f"{settings.PICTURE_DESCRIPTION_URL} running?)"
+            )
+        else:
+            logger.info(f"{total} figure(s) in {rel_path} got a description.")
+
+    return doc, _extract_figures(doc)
 
 
-def embedding_worker(q: queue.Queue, collection, pdf_root: Path, save_markdown: bool):
+def _ingest_document(
+    session: Session,
+    collection,
+    embedder,
+    manual_id: str,
+    pdf_path: Path,
+    pdf_root: Path,
+    doc,
+    figures: list[dict],
+) -> int:
     """
-    Worker function to process documents from the queue:
-    1. Chunking (CPU)
-    2. Embedding (GPU/CPU)
-    3. Insert into ChromaDB
-    4. Save Markdown (optional)
+    Chunks a converted document, embeds it and stores it in ChromaDB.
+
+    The rendered figures are written to the SQLite ``figures`` table and the
+    chunk that describes each of them only carries the resulting ``figure_id``
+    into Chroma, so the image bytes never leave the relational database.
+
+    Runs in the main process while the worker processes keep converting, so the
+    GPU serves the Docling pipelines and the embedding model at the same time.
+    Returns the number of chunks written.
     """
-    logger.info("[Embedding-Worker] Started.")
-    
-    # Create DB session once per worker for better performance
-    with SessionLocal() as session:
-        while True:
-            item = q.get()
-            if item is None:
-                # Sentinel value to stop the worker
-                q.task_done()
-                break
+    manual = session.get(Manual, manual_id)
+    if not manual:
+        logger.error(f"Manual {manual_id} not found in DB. Skipping.")
+        return 0
 
-            manual_id, pdf_path, doc_result = item
-            
-            try:
-                logger.info(f"[Embedding-Worker] Processing {pdf_path.name}...")
+    chunks = chunk_document(doc, manual)
+    try:
+        rel_path = pdf_path.relative_to(pdf_root)
+    except ValueError:
+        rel_path = Path(pdf_path.name)
 
-                # Save Markdown (optional)
-                if save_markdown:
-                    try:
-                        md_content = doc_result.document.export_to_markdown()
-                        rel_path = pdf_path.relative_to(pdf_root)
-                        md_path = settings.MARKDOWN_OUTPUT_DIR / rel_path.with_suffix(".md")
-                        md_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(md_path, "w", encoding="utf-8") as f:
-                            f.write(md_content)
-                    except Exception as e:
-                        logger.error(f"[Embedding-Worker] Failed to save markdown for {pdf_path}: {e}")
+    logger.info(f"Generated {len(chunks)} chunks for {rel_path}")
+    if not chunks:
+        return 0
 
-                # Re-fetch manual object for chunking
-                manual = session.get(Manual, manual_id)
-                if not manual:
-                    logger.error(f"[Embedding-Worker] Manual {manual_id} not found in DB. Skipping.")
-                    continue
+    figures_by_index = {f["picture_index"]: f for f in figures}
 
-                # 3. Coordinate-Based Chunking
-                chunks = chunk_text_by_coordinates(doc_result.document, manual)
-                logger.info(f"[Embedding-Worker] Generated {len(chunks)} chunks for {pdf_path.relative_to(pdf_root)}")
+    ids = [f"{manual.id}_{i}" for i in range(len(chunks))]
+    documents = [c["text"] for c in chunks]
+    metadatas = []
+    stored_figures = 0
 
-                if not chunks:
-                    continue
+    for i, c in enumerate(chunks):
+        chunk_meta = c["metadata"]
+        meta = {
+            "source": str(rel_path),
+            "manual_id": str(manual.id),
+            "chunk_index": float(i),
+        }
 
-                # 4. Add to ChromaDB
-                ids = [f"{manual.id}_{i}" for i in range(len(chunks))]
-                documents = [c["text"] for c in chunks]
-                metadatas = []
+        if chunk_meta.get("bookmark_id"):
+            meta["bookmark_id"] = str(chunk_meta["bookmark_id"])
 
-                rel_path = pdf_path.relative_to(pdf_root)
+        # Chroma metadata values must be str/int/float/bool
+        if chunk_meta.get("type"):
+            meta["type"] = str(chunk_meta["type"])
+        if chunk_meta.get("page") is not None:
+            meta["page"] = int(chunk_meta["page"])
 
-                for i, c in enumerate(chunks):
-                    meta = {
-                        "source": str(rel_path),
-                        "manual_id": str(manual.id),
-                        "chunk_index": float(i),
-                    }
+        if chunk_meta.get("type") == "figure":
+            index = chunk_meta.get("picture_index")
+            record = figures_by_index.get(index)
+            if record is None:
+                logger.warning(
+                    f"No rendered image for picture {index} of {rel_path}: "
+                    "the chunk is stored without a figure reference."
+                )
+            else:
+                bbox = record["bbox"]
+                figure = Figure(
+                    id=str(uuid.uuid4()),
+                    manual_id=str(manual.id),
+                    bookmark_id=chunk_meta.get("bookmark_id"),
+                    picture_index=int(record["picture_index"]),
+                    page=int(record["page"]),
+                    bbox_l=float(bbox[0]),
+                    bbox_b=float(bbox[1]),
+                    bbox_r=float(bbox[2]),
+                    bbox_t=float(bbox[3]),
+                    caption=chunk_meta.get("figure_caption"),
+                    labels=chunk_meta.get("figure_labels"),
+                    description=chunk_meta.get("figure_description"),
+                    mime_type="image/png",
+                    width=record["width"],
+                    height=record["height"],
+                    image=record["png"],
+                )
+                session.add(figure)
+                stored_figures += 1
+                meta["figure_id"] = figure.id
 
-                    if c["metadata"].get("bookmark_id"):
-                        meta["bookmark_id"] = str(c["metadata"]["bookmark_id"])
+        metadatas.append(meta)
 
-                    metadatas.append(meta)
+    # Commit the figures before touching Chroma: a figure row without its chunk
+    # is harmless, a chunk pointing at a missing figure id is not.
+    if stored_figures:
+        session.commit()
+        logger.info(f"Stored {stored_figures} figure(s) in SQLite for {rel_path}")
 
-                collection.add(ids=ids, documents=documents, metadatas=metadatas)
-                logger.info(f"[Embedding-Worker] Added {len(chunks)} chunks to ChromaDB for {pdf_path.name}")
+    embeddings = embedder.embed_documents(documents)
 
-            except Exception as e:
-                logger.error(f"[Embedding-Worker] Failed to process {pdf_path}: {e}", exc_info=True)
-            finally:
-                q.task_done()
-    
-    logger.info("[Embedding-Worker] Finished.")
+    for start in range(0, len(ids), CHROMA_ADD_BATCH_SIZE):
+        end = start + CHROMA_ADD_BATCH_SIZE
+        collection.add(
+            ids=ids[start:end],
+            documents=documents[start:end],
+            metadatas=metadatas[start:end],
+            embeddings=embeddings[start:end],
+        )
+
+    logger.info(f"Added {len(chunks)} chunks to ChromaDB for {pdf_path.name}")
+    return len(chunks)
 
 
 def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
@@ -339,17 +539,6 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
     if not settings.DB_FILE_PATH.parent.exists():
         settings.DB_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     init_db()
-    
-    # Initialize Chroma components (Main thread)
-    logger.info(f"Initializing ChromaDB at {settings.CHROMADB_PATH}...")
-    client = chromadb.PersistentClient(path=str(settings.CHROMADB_PATH))
-    embedding_fn = get_embedding_function()
-
-    collection = client.get_or_create_collection(
-        name="manual_chunks",
-        embedding_function=embedding_fn,
-        metadata={"description": "Chunks from PDF manuals"},
-    )
 
     # Process PDFs - Recursive scan
     pdf_files = list(pdf_dir.rglob("*.pdf"))
@@ -363,80 +552,168 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
     # This helps balanced load distribution among workers and reduces total make-span
     pdf_files.sort(key=lambda p: p.stat().st_size, reverse=True)
 
-    # Queues
-    pdf_queue = queue.Queue()
-    doc_queue = queue.Queue(maxsize=10) # Limit intermediate queue
+    # Phase 1: hash + pypdf metadata extraction (CPU bound, no GPU involved)
+    # The task itself lives in pdf_utils: spawned workers import the module that
+    # defines it, so keeping it out of builder.py means they load only pypdf
+    # instead of the whole Docling/torch stack.
+    metadata_workers = max(1, settings.METADATA_WORKERS)
+    if metadata_workers <= 1:
+        logger.info("Extracting PDF metadata inline (METADATA_WORKERS <= 1).")
+        results = list(map(extract_pdf_fingerprint, pdf_files))
+    else:
+        logger.info(f"Extracting PDF metadata with {metadata_workers} processes.")
+        with _make_process_executor(metadata_workers) as executor:
+            # executor.map preserves the input order
+            results = list(executor.map(extract_pdf_fingerprint, pdf_files))
 
-    # Pre-process DB Sync and fill Queue
+    # Phase 2: relational DB sync (main process only, SQLite has one writer)
+    tasks: list[tuple[Path, str, str]] = []
+    stale_manual_ids: list[str] = []
+    skipped = 0
+    failed = 0
+
     session = SessionLocal()
     try:
-        count = 0
-        for pdf_path in pdf_files:
-            try:
-                # 1. Sync to Relational DB (Main thread - fast)
-                manual, updated = sync_manual_to_db(session, pdf_path, pdf_dir)
+        for result in results:
+            pdf_path = result["pdf_path"]
+            if result["error"] or result["metadata"] is None:
+                logger.error(f"Failed to read {pdf_path}: {result['error']}")
+                failed += 1
+                continue
 
-                if not updated and not reset:
-                    logger.info(
-                        f"File {str(pdf_path.relative_to(pdf_dir))} unchanged. Skipping."
-                    )
-                    continue
-                
-                pdf_queue.put((pdf_path, str(manual.id)))
-                count += 1
+            try:
+                manual, updated, existed = sync_manual_to_db(
+                    session,
+                    pdf_path,
+                    pdf_dir,
+                    result["file_hash"],
+                    result["metadata"],
+                )
             except Exception as e:
-                logger.error(f"Failed to sync DB for {pdf_path}: {e}")
-        
-        logger.info(f"Queued {count} files for processing.")
-        
+                logger.error(f"Failed to sync DB for {pdf_path}: {e}", exc_info=True)
+                failed += 1
+                continue
+
+            try:
+                rel_path_str = str(pdf_path.relative_to(pdf_dir))
+            except ValueError:
+                rel_path_str = pdf_path.name
+
+            if not updated and not reset:
+                logger.info(f"File {rel_path_str} unchanged. Skipping.")
+                skipped += 1
+                continue
+
+            tasks.append((pdf_path, str(manual.id), rel_path_str))
+
+            # A manual that already existed and changed still holds its old
+            # chunks in Chroma; they must be dropped before re-inserting.
+            if existed and updated:
+                stale_manual_ids.append(str(manual.id))
+
+        logger.info(f"Queued {len(tasks)} files for processing.")
+
+        if not tasks:
+            logger.info("No files to process.")
+            return
+
+        # Initialize Chroma components only when there is work to do, so the
+        # embedding model is not loaded for a no-op build.
+        logger.info(f"Initializing ChromaDB at {settings.CHROMADB_PATH}...")
+        client = chromadb.PersistentClient(path=str(settings.CHROMADB_PATH))
+        embedder = get_embedder()
+        if embedder is None:
+            sys.exit(1)
+
+        # embedding_function=None: every vector is computed here and passed
+        # explicitly, so Chroma must never embed anything on its own.
+        collection = client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=None,
+            metadata=collection_metadata(embedder),
+        )
+
+        # get_or_create_collection ignores the metadata of an existing
+        # collection, so an older collection keeps its own model name: refuse to
+        # mix vectors from two models. After a reset the collection is fresh.
+        if not reset:
+            try:
+                check_collection_model(collection, embedder.model_name)
+            except RuntimeError as e:
+                logger.error(str(e))
+                sys.exit(1)
+
+        for mid in stale_manual_ids:
+            try:
+                logger.info(f"Deleting stale chunks for manual {mid}.")
+                collection.delete(where={"manual_id": mid})
+            except Exception as e:
+                logger.error(f"Failed to delete stale chunks for manual {mid}: {e}")
+
+        # Phase 3: Docling conversion in worker processes, ingestion in the parent
+        num_workers = max(1, settings.DOCLING_WORKERS)
+        threads_per_worker = max(1, settings.DOCLING_NUM_THREADS // num_workers)
+        logger.info(
+            f"Starting {num_workers} Docling worker process(es) with "
+            f"{threads_per_worker} thread(s) each."
+        )
+
+        converted = 0
+        total_chunks = 0
+
+        with _make_process_executor(
+            num_workers,
+            initializer=_init_docling_worker,
+            initargs=(threads_per_worker,),
+        ) as executor:
+            futures: dict[Future, tuple[Path, str]] = {}
+            for pdf_path, manual_id, rel_path_str in tasks:
+                future = executor.submit(
+                    _convert_pdf_task, pdf_path, rel_path_str, save_markdown
+                )
+                futures[future] = (pdf_path, manual_id)
+
+            for future in as_completed(futures):
+                pdf_path, manual_id = futures[future]
+                try:
+                    doc, figures = future.result()
+                except BrokenProcessPool as e:
+                    logger.error(
+                        "A Docling worker process died (out of memory / CUDA "
+                        "error?) - lower DOCLING_WORKERS and retry."
+                    )
+                    raise RuntimeError("Docling worker process pool broke") from e
+                except Exception as e:
+                    logger.error(
+                        f"Failed to convert {pdf_path}: {e}", exc_info=True
+                    )
+                    failed += 1
+                    continue
+
+                try:
+                    total_chunks += _ingest_document(
+                        session,
+                        collection,
+                        embedder,
+                        manual_id,
+                        pdf_path,
+                        pdf_dir,
+                        doc,
+                        figures,
+                    )
+                    converted += 1
+                except Exception as e:
+                    logger.error(
+                        f"Failed to ingest {pdf_path}: {e}", exc_info=True
+                    )
+                    failed += 1
     finally:
         session.close()
 
-    if count == 0:
-        logger.info("No files to process.")
-        return
-
-    # Start Workers
-    
-    # 1 Docling Worker (GPU) - Single thread to avoid GPU contention and context switching overhead
-    # Previous tests showed that 3 workers caused 4x slowdown per file due to resource contention.
-    docling_threads = []
-    for i in range(1):
-        t = threading.Thread(
-            target=docling_worker,
-            args=(pdf_queue, doc_queue, pdf_dir, i+1),
-            daemon=True
-        )
-        t.start()
-        docling_threads.append(t)
-
-    # 1 Embedding Worker
-    embedding_thread = threading.Thread(
-        target=embedding_worker, 
-        args=(doc_queue, collection, pdf_dir, save_markdown),
-        daemon=True
+    logger.info(
+        f"Summary: {len(pdf_files)} file(s) found, {skipped} unchanged, "
+        f"{converted} converted, {failed} failed, {total_chunks} chunk(s) stored."
     )
-    embedding_thread.start()
-
-    # Wait for PDF queue to be empty (Docling workers finished processing all items)
-    pdf_queue.join()
-    logger.info("All PDFs have been processed by Docling workers.")
-
-    # Stop Docling workers
-    for _ in range(1):
-        pdf_queue.put(None)
-    
-    for t in docling_threads:
-        t.join()
-
-    # Wait for Docling results to be processed by Embedding worker
-    doc_queue.join()
-    logger.info("All documents have been embedded.")
-
-    # Stop Embedding worker
-    doc_queue.put(None)
-    embedding_thread.join()
-
     logger.info("Build complete.")
     logger.info(f"Database saved to {settings.CHROMADB_PATH}")
 

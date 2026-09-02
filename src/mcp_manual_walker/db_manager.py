@@ -12,8 +12,14 @@ from sqlalchemy import select
 from mcp_manual_walker.builder import build
 from mcp_manual_walker.config import settings
 from mcp_manual_walker.database import SessionLocal, init_db
-from mcp_manual_walker.embeddings import get_embedding_function
-from mcp_manual_walker.models import Bookmark, Manual
+from mcp_manual_walker.embeddings import (
+    COLLECTION_NAME,
+    EMBEDDING_MODEL_METADATA_KEY,
+    check_collection_model,
+    collection_metadata,
+    get_embedder,
+)
+from mcp_manual_walker.models import Bookmark, Figure, Manual
 
 try:
     import chromadb
@@ -26,6 +32,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("db_manager")
+
+# Archive layout version: 1 had no figures, 2 adds the "figures" records in
+# sqlite.json plus one PNG per figure under figures/ in the zip.
+EXPORT_FORMAT_VERSION = 2
+FIGURES_DIR_NAME = "figures"
 
 
 def get_chroma_client():
@@ -62,23 +73,24 @@ def command_list(args):
             return
 
         if args.json:
-            print(
-                json.dumps([manual_to_dict(m) for m in manuals], indent=2, default=str)
-            )
+            payload = [manual_to_dict(m, include_figures=False) for m in manuals]
+            print(json.dumps(payload, indent=2, default=str))
         else:
-            print(f"{'ID':<38} | {'Pages':<6} | {'Path'}")
+            print(f"{'ID':<38} | {'Pages':<6} | {'Figs':<5} | {'Path'}")
             print("-" * 80)
             for manual in manuals:
                 print(
-                    f"{manual.id:<38} | {manual.page_count:<6} | {manual.relative_path}"
+                    f"{manual.id:<38} | {manual.page_count:<6} | "
+                    f"{len(manual.figures):<5} | {manual.relative_path}"
                 )
 
     finally:
         session.close()
 
 
-def manual_to_dict(manual):
-    return {
+def manual_to_dict(manual, include_figures: bool = True):
+    """Serializes a manual; ``include_figures`` adds the figure records."""
+    data = {
         "id": manual.id,
         "file_name": manual.file_name,
         "document_title": manual.document_title,
@@ -86,7 +98,34 @@ def manual_to_dict(manual):
         "file_hash": manual.file_hash,
         "page_count": manual.page_count,
         "updated_at": manual.updated_at.isoformat() if manual.updated_at else None,
+        "figure_count": len(manual.figures),
         "bookmarks": [bookmark_to_dict(bm) for bm in manual.bookmarks],
+    }
+    if include_figures:
+        data["figures"] = [figure_to_dict(f) for f in manual.figures]
+    return data
+
+
+def figure_to_dict(figure):
+    """Serializes a figure; the PNG bytes travel as a separate zip member."""
+    return {
+        "id": figure.id,
+        "manual_id": figure.manual_id,
+        "bookmark_id": figure.bookmark_id,
+        "picture_index": figure.picture_index,
+        "page": figure.page,
+        "bbox_l": figure.bbox_l,
+        "bbox_b": figure.bbox_b,
+        "bbox_r": figure.bbox_r,
+        "bbox_t": figure.bbox_t,
+        "caption": figure.caption,
+        "labels": figure.labels,
+        "description": figure.description,
+        "mime_type": figure.mime_type,
+        "width": figure.width,
+        "height": figure.height,
+        "created_at": figure.created_at.isoformat() if figure.created_at else None,
+        "image_file": f"figures/{figure.id}.png",
     }
 
 
@@ -111,7 +150,7 @@ def command_export(args):
 
     session = SessionLocal()
     client = get_chroma_client()
-    collection = client.get_collection(name="manual_chunks")
+    collection = client.get_collection(name=COLLECTION_NAME)
 
     try:
         stmt = select(Manual).where(Manual.relative_path.startswith(target))
@@ -157,12 +196,20 @@ def command_export(args):
             "documents": chroma_results["documents"],
         }
 
+        # Figure images are exported as separate zip members, one PNG per row.
+        figure_blobs = [(f.id, f.image) for m in manuals for f in m.figures]
+
         manifest = {
             "version": "1.0",
+            # 2 adds the "figures" records and the figures/ zip members.
+            "format_version": EXPORT_FORMAT_VERSION,
             "created_at": datetime.now().isoformat(),
             "target": target,
             "manual_count": len(manuals),
             "chunk_count": len(chroma_results["ids"]),
+            "figure_count": len(figure_blobs),
+            # Vectors are only reusable by the model that produced them.
+            EMBEDDING_MODEL_METADATA_KEY: settings.EMBEDDING_MODEL,
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -177,15 +224,50 @@ def command_export(args):
             with open(temp_path / "chroma.json", "w", encoding="utf-8") as f:
                 json.dump(chroma_data, f)
 
+            figures_dir = temp_path / FIGURES_DIR_NAME
+            if figure_blobs:
+                figures_dir.mkdir(parents=True, exist_ok=True)
+                for figure_id, image in figure_blobs:
+                    with open(figures_dir / f"{figure_id}.png", "wb") as f:
+                        f.write(image)
+
             # Create Zip
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for file_name in ["manifest.json", "sqlite.json", "chroma.json"]:
                     zf.write(temp_path / file_name, arcname=file_name)
 
-        logger.info(f"Export completed: {output_path}")
+                if figure_blobs:
+                    for png_path in sorted(figures_dir.iterdir()):
+                        zf.write(
+                            png_path,
+                            arcname=f"{FIGURES_DIR_NAME}/{png_path.name}",
+                        )
+
+        logger.info(
+            f"Export completed: {output_path} "
+            f"({len(figure_blobs)} figure image(s) included)"
+        )
 
     finally:
         session.close()
+
+
+def _read_figure_images(temp_path: Path, sqlite_data) -> dict:
+    """Reads the exported figure PNGs out of the extracted archive by id."""
+    images = {}
+    for manual_dict in sqlite_data:
+        for fig_dict in manual_dict.get("figures", []):
+            member = fig_dict.get("image_file")
+            image_path = temp_path / member if member else None
+            if image_path is None or not image_path.exists():
+                logger.warning(
+                    f"Figure {fig_dict.get('id')} has no image member "
+                    f"'{member}' in the archive. Skipping it."
+                )
+                continue
+            with open(image_path, "rb") as f:
+                images[fig_dict["id"]] = f.read()
+    return images
 
 
 def command_import(args):
@@ -199,23 +281,6 @@ def command_import(args):
     session = SessionLocal()
     client = get_chroma_client()
 
-    # Try to load embedding function.
-    logger.info("Loading embedding function...")
-    ef = get_embedding_function()
-
-    if ef:
-        collection = client.get_or_create_collection(
-            name="manual_chunks",
-            embedding_function=ef,
-            metadata={"description": "Chunks from PDF manuals"},
-        )
-    else:
-        # If we can't load EF, we assume collection exists or create without specific EF (dangerous if mixed).
-        collection = client.get_or_create_collection(
-            name="manual_chunks",
-            metadata={"description": "Chunks from PDF manuals"},
-        )
-
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -225,9 +290,12 @@ def command_import(args):
             with open(temp_path / "manifest.json", "r", encoding="utf-8") as f:
                 manifest = json.load(f)
 
+            # Archives written before figures existed carry no format_version.
+            format_version = manifest.get("format_version", 1)
             logger.info(
                 f"Importing export from {manifest['created_at']}, target: {manifest['target']}"
             )
+            logger.info(f"Archive format version: {format_version}")
 
             with open(temp_path / "sqlite.json", "r", encoding="utf-8") as f:
                 sqlite_data = json.load(f)
@@ -235,9 +303,51 @@ def command_import(args):
             with open(temp_path / "chroma.json", "r", encoding="utf-8") as f:
                 chroma_data = json.load(f)
 
+            # The images are read here, while the extracted archive still exists.
+            figure_images = _read_figure_images(temp_path, sqlite_data)
+
+        # Imported vectors are only usable with the model that produced them.
+        exported_model = manifest.get(EMBEDDING_MODEL_METADATA_KEY)
+        if exported_model is None:
+            logger.warning(
+                "The export does not record an embedding model. Its vectors may "
+                f"have been built with a model other than {settings.EMBEDDING_MODEL}."
+            )
+        elif exported_model != settings.EMBEDDING_MODEL:
+            logger.error(
+                f"The export was built with '{exported_model}', but "
+                f"settings.EMBEDDING_MODEL is '{settings.EMBEDDING_MODEL}'. "
+                "Import aborted: re-export the data with the current model."
+            )
+            return
+
+        # Load the embedding model only to stamp the collection metadata; every
+        # vector comes from the archive, so Chroma never embeds anything here.
+        logger.info("Loading embedding model...")
+        embedder = get_embedder()
+
+        if embedder:
+            collection = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=None,
+                metadata=collection_metadata(embedder),
+            )
+        else:
+            # Without the model we cannot stamp the model name on a freshly
+            # created collection; an existing one keeps its own metadata.
+            logger.warning(
+                "Embedding model unavailable: a newly created collection will "
+                "not record which model built its vectors."
+            )
+            collection = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=None,
+            )
+
         # Import SQLite Data
         imported_count = 0
         skipped_count = 0
+        imported_figures = 0
         accepted_manual_ids = set()
 
         for manual_dict in sqlite_data:
@@ -264,6 +374,36 @@ def command_import(args):
             session.add(manual)
             accepted_manual_ids.add(manual.id)
 
+            for fig_dict in manual_dict.get("figures", []):
+                image = figure_images.get(fig_dict["id"])
+                if image is None:
+                    # Already reported by _read_figure_images.
+                    continue
+                session.add(
+                    Figure(
+                        id=fig_dict["id"],
+                        manual_id=fig_dict["manual_id"],
+                        bookmark_id=fig_dict.get("bookmark_id"),
+                        picture_index=fig_dict["picture_index"],
+                        page=fig_dict["page"],
+                        bbox_l=fig_dict["bbox_l"],
+                        bbox_b=fig_dict["bbox_b"],
+                        bbox_r=fig_dict["bbox_r"],
+                        bbox_t=fig_dict["bbox_t"],
+                        caption=fig_dict.get("caption"),
+                        labels=fig_dict.get("labels"),
+                        description=fig_dict.get("description"),
+                        mime_type=fig_dict.get("mime_type", "image/png"),
+                        width=fig_dict.get("width"),
+                        height=fig_dict.get("height"),
+                        created_at=datetime.fromisoformat(fig_dict["created_at"])
+                        if fig_dict.get("created_at")
+                        else None,
+                        image=image,
+                    )
+                )
+                imported_figures += 1
+
             for bm_dict in manual_dict["bookmarks"]:
                 bm = Bookmark(
                     id=bm_dict["id"],
@@ -281,7 +421,8 @@ def command_import(args):
 
         session.commit()
         logger.info(
-            f"SQLite Import: {imported_count} imported, {skipped_count} skipped."
+            f"SQLite Import: {imported_count} imported, {skipped_count} skipped, "
+            f"{imported_figures} figure(s) restored."
         )
 
         # Import Chroma Data
@@ -333,7 +474,7 @@ def command_delete(args):
 
     session = SessionLocal()
     client = get_chroma_client()
-    collection = client.get_collection(name="manual_chunks")
+    collection = client.get_collection(name=COLLECTION_NAME)
 
     try:
         # Find manuals starting with the target string (directory or specific file)
@@ -355,9 +496,9 @@ def command_delete(args):
             except Exception as e:
                 logger.error(f"  - Failed to delete from ChromaDB: {e}")
 
-            # Delete from SQLite (cascades to bookmarks)
+            # Delete from SQLite (cascades to bookmarks and figures)
             session.delete(manual)
-            logger.info("  - Deleted from SQLite")
+            logger.info("  - Deleted from SQLite (bookmarks and figures included)")
 
         session.commit()
         logger.info("Deletion complete.")
@@ -380,16 +521,23 @@ def command_search(args):
 
     client = get_chroma_client()
 
-    logger.info("Loading embedding function...")
-    ef = get_embedding_function()
-    if not ef:
-        logger.error("Could not load embedding function.")
+    logger.info("Loading embedding model...")
+    embedder = get_embedder()
+    if not embedder:
+        logger.error("Could not load the embedding model.")
         return
 
-    collection = client.get_collection(name="manual_chunks")
+    collection = client.get_collection(name=COLLECTION_NAME)
 
-    # Manually embed the query to avoid EF validation conflict with persisted "sentence_transformer"
-    query_embeddings = ef([query])
+    try:
+        check_collection_model(collection, settings.EMBEDDING_MODEL)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return
+
+    # The query is embedded here and passed explicitly: the collection has no
+    # embedding function of its own.
+    query_embeddings = [embedder.embed_query(query)]
 
     results = collection.query(
         query_embeddings=query_embeddings,

@@ -1,3 +1,4 @@
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, List, Optional
@@ -5,16 +6,19 @@ from typing import Annotated, List, Optional
 import chromadb
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.utilities.types import Image
 from pydantic import Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import SessionLocal, init_db
-from .embeddings import get_embedding_function
-from .models import Bookmark, Manual
+from .embeddings import COLLECTION_NAME, check_collection_model, get_embedder
+from .models import Bookmark, Figure, Manual
 from .schemas import (
     BookmarkNode,
+    FigureInfo,
+    FigureRef,
     ManualInfo,
     ManualMetadata,
     MarkdownContent,
@@ -32,9 +36,60 @@ class AppState:
     def __init__(self):
         self.chroma_client = None
         self.collection = None
-        self.embedding_fn = None
+        self.embedder = None
+        # Reason why the vector store could not be used, surfaced by the tools.
+        self.init_error = None
+
 
 app_state = AppState()
+
+
+def init_vector_store() -> None:
+    """
+    Connects app_state to the persisted vector collection.
+
+    Kept out of the lifespan so it can be re-run (the test suite reuses a single
+    server object). A failure is recorded instead of raised, so the server still
+    starts and every tool can explain why the vector store is unusable.
+    """
+    logger.info("Initializing ChromaDB...")
+    app_state.chroma_client = None
+    app_state.collection = None
+    app_state.embedder = None
+    app_state.init_error = None
+
+    try:
+        chroma_client = chromadb.PersistentClient(
+            path=str(settings.CHROMADB_PATH.resolve())
+        )
+
+        # Load the embedding model (the same one the builder used)
+        embedder = get_embedder()
+
+        # Get the collection without an embedding function: queries are embedded
+        # here and passed to Chroma explicitly.
+        collection = chroma_client.get_collection(name=COLLECTION_NAME)
+
+        # Vectors built with another model are not comparable to ours.
+        check_collection_model(collection, settings.EMBEDDING_MODEL)
+
+        app_state.chroma_client = chroma_client
+        app_state.embedder = embedder
+        app_state.collection = collection
+
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB: {e}")
+        app_state.init_error = str(e)
+
+
+def _require_collection():
+    """Returns the collection, or raises a ToolError explaining why it is missing."""
+    if app_state.collection is None:
+        message = "Vector database is not initialized."
+        if app_state.init_error:
+            message = f"{message} {app_state.init_error}"
+        raise ToolError(message)
+    return app_state.collection
 
 
 @asynccontextmanager
@@ -49,27 +104,7 @@ async def lifespan(app: FastMCP):
     logger.info("Initializing database...")
     init_db()
 
-    logger.info("Initializing ChromaDB...")
-    try:
-        chroma_client = chromadb.PersistentClient(
-            path=str(settings.CHROMADB_PATH.resolve())
-        )
-
-        # Load embedding function using factory
-        embedding_fn = get_embedding_function()
-
-        # Get collection without enforcing EF to avoid strict validation mismatch
-        # We will handle embedding manually in search_manual
-        collection = chroma_client.get_collection(name="manual_chunks")
-        
-        # Store in explicit app_state
-        app_state.chroma_client = chroma_client
-        app_state.embedding_fn = embedding_fn
-        app_state.collection = collection
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize ChromaDB: {e}")
-        # We don't raise here to allow server to start, but tools will fail if not fixed.
+    init_vector_store()
 
     yield
 
@@ -184,6 +219,25 @@ def get_manual_metadata(
         db.close()
 
 
+def _figure_ref(figure: Figure) -> FigureRef:
+    """Builds the lightweight figure reference embedded in tool responses."""
+    return FigureRef(
+        id=figure.id,
+        page=figure.page,
+        caption=figure.caption,
+        description=figure.description,
+        bookmark_id=figure.bookmark_id,
+    )
+
+
+def _load_figures(db: Session, figure_ids: list[str]) -> dict[str, Figure]:
+    """Loads the given figures in a single query, keyed by figure id."""
+    if not figure_ids:
+        return {}
+    figures = db.scalars(select(Figure).where(Figure.id.in_(figure_ids))).all()
+    return {figure.id: figure for figure in figures}
+
+
 def _get_descendant_bookmark_ids(
     manual_id: str, bookmark_id: str, db: Session
 ) -> List[str]:
@@ -234,11 +288,17 @@ def _get_descendant_bookmark_ids(
     description="""Fetches the Markdown content for a specific bookmark (section) within
       a manual using the Vector DB. This returns the pre-processed text chunks associated
       with the bookmark and its sub-sections.
-      
+
+    Figures (diagrams, drawings, screenshots) appear in the Markdown as a
+    `[Figure: <figure_id> (page N)]` marker followed by the figure's caption,
+    labels and description, and are also listed in the `figures` field in
+    document order. Pass a figure id to `get_figure` to obtain the image itself.
+
     Workflow Example:
     1. Get a `bookmark_id` from the `table_of_contents` provided by
       `get_manual_metadata()`.
-    2. Call `get_markdown_content(bookmark_id=...)` to get the content.""",
+    2. Call `get_markdown_content(bookmark_id=...)` to get the content.
+    3. Call `get_figure(figure_id=...)` for any figure you need to look at.""",
     tags={"manual", "content", "markdown"},
     annotations={"readOnlyHint": True},
 )
@@ -252,9 +312,7 @@ def get_markdown_content(
     ],
 ) -> MarkdownContent:
     """Returns the Markdown content for a specific bookmark from the Vector DB."""
-    if app_state.collection is None:
-        raise ToolError("Vector database is not initialized.")
-    collection = app_state.collection
+    collection = _require_collection()
 
     db: Session = SessionLocal()
     try:
@@ -280,27 +338,20 @@ def get_markdown_content(
                     {"manual_id": manual_id},
                     {"bookmark_id": {"$in": target_bookmark_ids}},
                 ]
-            }
+            },
+            include=["documents", "metadatas"],
         )
 
         # results['documents'] is a list of strings
         # results['ids'] is a list of IDs.
-        # We should sort them. Assuming IDs are like "manual_id_index" where index is integer.
-        # But ids are strings. "uuid_0", "uuid_1", "uuid_10". String sort is bad for "10" vs "2".
-        # Let's try to extract index from ID.
-
-        # Safely zip and sort
+        # 'get' does not guarantee an order, so chunks are sorted by their
+        # chunk_index metadata, falling back to the trailing index of the
+        # legacy "<manual_id>_<index>" chunk ids.
         combined = []
         if results["ids"] and results["documents"] and results["metadatas"]:
             for i, doc_id in enumerate(results["ids"]):
                 meta = results["metadatas"][i]
-                # Default to a high number or -1? Or use loop index?
-                # If we rely on chunk_index, it should be there for new builds.
-                # Fallback to current index 'i' if missing might not be correct if results are shuffled?
-                # But 'get' usually returns in insertion order if no sort? No, 'get' order is not guaranteed.
-                # If chunk_index is missing, we might want to try parsing ID as legacy fallback?
-                # Let's assign priority: chunk_index > ID parse > 0
-                
+
                 idx = 0
                 if "chunk_index" in meta:
                     idx = meta["chunk_index"]
@@ -309,17 +360,60 @@ def get_markdown_content(
                     parts = doc_id.rsplit("_", 1)
                     if len(parts) == 2 and parts[1].isdigit():
                         idx = int(parts[1])
-                
-                combined.append((idx, results["documents"][i]))
+
+                combined.append((idx, results["documents"][i], meta))
 
         # Sort by index
         combined.sort(key=lambda x: x[0])
 
-        # Join text
-        sorted_texts = [t for _, t in combined]
-        final_content = _merge_chunks(sorted_texts)
+        figure_ids = [
+            str(meta["figure_id"])
+            for _, _, meta in combined
+            if meta.get("type") == "figure" and meta.get("figure_id")
+        ]
+        figures_by_id = _load_figures(db, figure_ids)
 
-        return MarkdownContent(markdown_content=final_content)
+        # Text and table chunks overlap each other and are merged; a figure
+        # chunk is self-contained and is kept as its own block, so the overlap
+        # logic never glues it to a neighbour.
+        blocks: List[str] = []
+        pending_texts: List[str] = []
+        figure_refs: List[FigureRef] = []
+
+        for _, text, meta in combined:
+            if meta.get("type") != "figure":
+                pending_texts.append(text)
+                continue
+
+            if pending_texts:
+                blocks.append(_merge_chunks(pending_texts))
+                pending_texts = []
+
+            figure_id = meta.get("figure_id")
+            page = meta.get("page")
+            page_label = str(int(page)) if isinstance(page, (int, float)) else str(page)
+            if figure_id:
+                header = f"[Figure: {figure_id} (page {page_label})]"
+            else:
+                header = f"[Figure (page {page_label})]"
+            blocks.append(f"{header}\n\n{text}")
+
+            if figure_id:
+                figure = figures_by_id.get(str(figure_id))
+                if figure is not None:
+                    figure_refs.append(_figure_ref(figure))
+                else:
+                    logger.warning(
+                        f"Figure '{figure_id}' is referenced by a chunk of "
+                        f"bookmark '{bookmark_id}' but missing from the database."
+                    )
+
+        if pending_texts:
+            blocks.append(_merge_chunks(pending_texts))
+
+        final_content = "\n\n".join(blocks)
+
+        return MarkdownContent(markdown_content=final_content, figures=figure_refs)
 
     except Exception as e:
         logger.exception(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
@@ -373,13 +467,19 @@ def _merge_chunks(chunks: List[str]) -> str:
 @app.tool(
     name="search_manual",
     description="""Searches for a query string within a specific manual using semantic search.
-    Returns the top matching text chunks.
-    
+    Returns the top matching chunks.
+
     Optionally, a `bookmark_id` can be provided to restrict the search to a specific
     section of the manual (including subsections).
 
+    Every result reports its `chunk_type` ("text", "table" or "figure"). A hit
+    with `chunk_type` "figure" also carries a `figure` object whose `id` can be
+    passed to `get_figure` to retrieve the image itself; its `context` is the
+    figure's caption, labels and description.
+
     Workflow Example:
     1. Call `search_manual(manual_id=..., query="...")` to find occurrences.
+    2. Call `get_figure(figure_id=...)` for a hit whose `chunk_type` is "figure".
     """,
     tags={"manual", "search"},
     annotations={"readOnlyHint": True},
@@ -401,15 +501,12 @@ def search_manual(
     ] = None,
 ) -> SearchResult:
     """Searches for text in a manual and returns matches with context and hierarchy."""
-    """Searches for text in a manual and returns matches with context and hierarchy."""
-    if app_state.collection is None:
-        raise ToolError("Vector database is not initialized.")
+    collection = _require_collection()
 
-    if app_state.embedding_fn is None:
-        raise ToolError("Embedding function is not initialized.")
+    if app_state.embedder is None:
+        raise ToolError("Embedding model is not initialized.")
 
-    collection = app_state.collection
-    embedding_fn = app_state.embedding_fn
+    embedder = app_state.embedder
 
     db: Session = SessionLocal()
     try:
@@ -423,7 +520,7 @@ def search_manual(
             }
 
         # Query ChromaDB with manual embedding
-        query_vec = embedding_fn([query])
+        query_vec = [embedder.embed_query(query)]
         results = collection.query(
             query_embeddings=query_vec, n_results=5, where=where_clause
         )
@@ -445,6 +542,11 @@ def search_manual(
                 db.scalars(select(Bookmark).where(Bookmark.manual_id == manual_id)).all()
             )
             bookmark_map = {bm.id: bm for bm in all_bookmarks}
+
+            # Figures referenced by the hits, resolved in a single query.
+            figures_by_id = _load_figures(
+                db, [str(m["figure_id"]) for m in metas if m.get("figure_id")]
+            )
 
             for i, chunk_id in enumerate(ids):
                 text = docs[i]
@@ -477,12 +579,26 @@ def search_manual(
                             )
                         )
 
+                figure_ref = None
+                figure_id = meta.get("figure_id")
+                if figure_id:
+                    figure = figures_by_id.get(str(figure_id))
+                    if figure is not None:
+                        figure_ref = _figure_ref(figure)
+                    else:
+                        logger.warning(
+                            f"Chunk '{chunk_id}' references figure "
+                            f"'{figure_id}', which is missing from the database."
+                        )
+
                 search_result_items.append(
                     SearchResultItem(
                         bookmarks=bookmark_node_list,
                         context=text,
                         manual_id=manual_id,
                         bookmark_id=chunk_bm_id,
+                        chunk_type=str(meta.get("type", "text")),
+                        figure=figure_ref,
                     )
                 )
 
@@ -492,6 +608,53 @@ def search_manual(
 
     except Exception as e:
         logger.error(f"Error searching manual '{manual_id}': {e}")
+        raise ToolError(e)
+    finally:
+        db.close()
+
+
+@app.tool(
+    name="get_figure",
+    description="""Returns the image of a figure (diagram, drawing, screenshot)
+    stored from a manual, together with its metadata.
+    Figure ids come from `search_manual` results whose `chunk_type` is "figure"
+    (field `figure.id`) and from the `figures` list of `get_markdown_content`.
+    The response contains the PNG image and a JSON text block with the figure's
+    manual_id, bookmark_id, page, caption, labels, description and size.""",
+    tags={"manual", "figure"},
+    annotations={"readOnlyHint": True},
+    # Required: fastmcp would otherwise try to serialize the Image object as
+    # structured content, which fails.
+    output_schema=None,
+)
+def get_figure(
+    figure_id: Annotated[str, Field(description="The unique ID of the figure.")],
+):
+    """Returns the PNG image of a figure plus its metadata as JSON."""
+    db: Session = SessionLocal()
+    try:
+        figure = db.get(Figure, figure_id)
+        if not figure:
+            raise ToolError(f"Figure with id '{figure_id}' not found.")
+
+        info = FigureInfo(
+            id=figure.id,
+            page=figure.page,
+            caption=figure.caption,
+            description=figure.description,
+            bookmark_id=figure.bookmark_id,
+            manual_id=figure.manual_id,
+            labels=figure.labels,
+            width=figure.width,
+            height=figure.height,
+            mime_type=figure.mime_type or "image/png",
+        )
+        return [
+            Image(data=figure.image, format="png"),
+            json.dumps(info.model_dump()),
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching figure '{figure_id}': {e}")
         raise ToolError(e)
     finally:
         db.close()
