@@ -30,7 +30,7 @@ cu130 = [
 ]
 builder = [
     "mcp-manual-walker[cu130]",
-    "docling",
+    "docling>=2.120",
     "langchain-text-splitters",
 ]
 dev = [
