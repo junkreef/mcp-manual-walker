@@ -191,3 +191,44 @@ def test_chunking_sequence_and_overlap(mock_manual):
     
     # Verify metadata is identical
     assert chunks[0]["metadata"] == chunks[1]["metadata"]
+
+
+def test_chunking_fallback_resolves_missing_bookmark_coordinate(mock_manual):
+    """Test that a bookmark without page_top is resolved via title search on its
+    own (1-indexed) page, not the previous page."""
+    bm = MagicMock(spec=Bookmark)
+    bm.id = "bm_troubleshooting"
+    bm.page_num = 3
+    bm.page_top = None
+    bm.title = "Troubleshooting"
+
+    mock_manual.bookmarks = [bm]
+
+    doc = MagicMock()
+
+    # Page 2 item: same top as the page-3 title, but doesn't contain it.
+    # Presence of this item on the wrong page guards against the old
+    # off-by-one bug (page_num - 1) accidentally matching.
+    item_page2 = MagicMock()
+    item_page2.text = "Unrelated heading"
+    item_page2.prov = [MagicMock(page_no=2, bbox=MagicMock(t=750.0))]
+
+    # Page 3 item A: the bookmark title itself, used to resolve page_top.
+    item_page3_title = MagicMock()
+    item_page3_title.text = "3 Troubleshooting"
+    item_page3_title.prov = [MagicMock(page_no=3, bbox=MagicMock(t=750.0))]
+
+    # Page 3 item B: the body text that should be attached to the bookmark.
+    item_page3_body = MagicMock()
+    item_page3_body.text = "If the paper jams, open the rear cover."
+    item_page3_body.prov = [MagicMock(page_no=3, bbox=MagicMock(t=700.0))]
+
+    doc.texts = [item_page2, item_page3_title, item_page3_body]
+
+    chunks = chunk_text_by_coordinates(doc, mock_manual)
+
+    assert bm.page_top == 750.0
+
+    matching = [c for c in chunks if "If the paper jams" in c["text"]]
+    assert len(matching) == 1
+    assert matching[0]["metadata"]["bookmark_id"] == "bm_troubleshooting"

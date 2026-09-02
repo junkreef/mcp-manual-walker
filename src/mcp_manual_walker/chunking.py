@@ -44,8 +44,8 @@ def chunk_text_by_coordinates(doc, manual: Manual) -> List[Dict[str, Any]]:
     for bm in raw_bookmarks:
         if bm.page_top is None:
             # Try to find the first occurrence of the title on the assigned page
-            # bm.page_num is 1-indexed, docling page_no is 0-indexed
-            page_texts = texts_by_page.get(bm.page_num - 1, [])
+            # Both bm.page_num and docling page_no are 1-indexed
+            page_texts = texts_by_page.get(bm.page_num, [])
             for item in page_texts:
                 if bm.title.lower() in item.text.lower():
                     # We know prov exists from the grouping logic
