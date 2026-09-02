@@ -27,6 +27,7 @@ logger = logging.getLogger("builder")
 
 
 try:
+    from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
         AcceleratorOptions,
@@ -215,9 +216,17 @@ def _create_converter(num_threads: int):
         lang=[settings.DOCLING_OCR_LANG],
     )
 
+    # The default ThreadedDoclingParseDocumentBackend (docling-parse's native
+    # threaded parser) was observed dropping pages ("Page N failed to parse",
+    # PARTIAL_SUCCESS) and segfaulting the worker; cross-document parallelism
+    # already comes from DOCLING_WORKERS, so the single-threaded parser is
+    # used here for deterministic output.
     return DocumentConverter(
         format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=pipeline_options,
+                backend=DoclingParseDocumentBackend,
+            )
         }
     )
 

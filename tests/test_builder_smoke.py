@@ -70,6 +70,10 @@ def builder_env(mock_settings):
     mock_docling.datamodel.base_models = MagicMock()
     mock_docling.datamodel.pipeline_options = MagicMock()
 
+    mock_docling_backend = MagicMock()
+    mock_docling.backend = mock_docling_backend
+    mock_docling_backend.docling_parse_backend = MagicMock()
+
     mock_lts = MagicMock()
 
     mock_chromadb = MagicMock()
@@ -99,6 +103,10 @@ def builder_env(mock_settings):
             "docling.datamodel": mock_docling_dm,
             "docling.datamodel.base_models": mock_docling.datamodel.base_models,
             "docling.datamodel.pipeline_options": pipeline_options,
+            "docling.backend": mock_docling_backend,
+            "docling.backend.docling_parse_backend": (
+                mock_docling_backend.docling_parse_backend
+            ),
             "langchain_text_splitters": mock_lts,
             "chromadb": mock_chromadb,
             "chromadb.utils": mock_chromadb.utils,
