@@ -30,8 +30,8 @@ try:
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
         AcceleratorOptions,
+        PdfPipelineOptions,
         RapidOcrOptions,
-        ThreadedPdfPipelineOptions,
     )
     from docling.document_converter import DocumentConverter, PdfFormatOption
     # We might need specific options if we want to speed up or customize
@@ -55,7 +55,12 @@ try:
     from mcp_manual_walker.chunking import chunk_text_by_coordinates
     from mcp_manual_walker.config import settings
     from mcp_manual_walker.database import SessionLocal, init_db
-    from mcp_manual_walker.embeddings import get_embedding_function as get_ef
+    from mcp_manual_walker.embeddings import (
+        COLLECTION_NAME,
+        check_collection_model,
+        collection_metadata,
+        get_embedder,
+    )
     from mcp_manual_walker.models import Bookmark, Manual
     from mcp_manual_walker.pdf_utils import extract_pdf_fingerprint
 except ImportError as e:
@@ -83,17 +88,6 @@ def check_dependencies():
         logger.error(f"Missing required dependencies: {', '.join(missing)}")
         logger.error("Please install them with: uv sync --extra builder")
         sys.exit(1)
-
-
-def get_embedding_function():
-    # Helper to get the embedding function via factory
-    ef = get_ef()
-    if ef is None:
-        logger.error(
-            "Could not load any embedding function. Please install 'fastembed' or 'sentence-transformers'."
-        )
-        sys.exit(1)
-    return ef
 
 
 def sync_manual_to_db(
@@ -205,7 +199,7 @@ def _make_process_executor(
 
 def _create_converter(num_threads: int):
     """Builds a DocumentConverter configured for the accelerator settings."""
-    pipeline_options = ThreadedPdfPipelineOptions()
+    pipeline_options = PdfPipelineOptions()
     # AcceleratorOptions accepts the device as a plain string ("auto", "cuda:0", ...)
     pipeline_options.accelerator_options = AcceleratorOptions(
         device=settings.DOCLING_DEVICE,
@@ -264,7 +258,7 @@ def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
 def _ingest_document(
     session: Session,
     collection,
-    embedding_fn,
+    embedder,
     manual_id: str,
     pdf_path: Path,
     pdf_root: Path,
@@ -308,7 +302,7 @@ def _ingest_document(
 
         metadatas.append(meta)
 
-    embeddings = embedding_fn(documents)
+    embeddings = embedder.embed_documents(documents)
 
     for start in range(0, len(ids), CHROMA_ADD_BATCH_SIZE):
         end = start + CHROMA_ADD_BATCH_SIZE
@@ -432,13 +426,27 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
         # embedding model is not loaded for a no-op build.
         logger.info(f"Initializing ChromaDB at {settings.CHROMADB_PATH}...")
         client = chromadb.PersistentClient(path=str(settings.CHROMADB_PATH))
-        embedding_fn = get_embedding_function()
+        embedder = get_embedder()
+        if embedder is None:
+            sys.exit(1)
 
+        # embedding_function=None: every vector is computed here and passed
+        # explicitly, so Chroma must never embed anything on its own.
         collection = client.get_or_create_collection(
-            name="manual_chunks",
-            embedding_function=embedding_fn,
-            metadata={"description": "Chunks from PDF manuals"},
+            name=COLLECTION_NAME,
+            embedding_function=None,
+            metadata=collection_metadata(embedder),
         )
+
+        # get_or_create_collection ignores the metadata of an existing
+        # collection, so an older collection keeps its own model name: refuse to
+        # mix vectors from two models. After a reset the collection is fresh.
+        if not reset:
+            try:
+                check_collection_model(collection, embedder.model_name)
+            except RuntimeError as e:
+                logger.error(str(e))
+                sys.exit(1)
 
         for mid in stale_manual_ids:
             try:
@@ -491,7 +499,7 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
                     total_chunks += _ingest_document(
                         session,
                         collection,
-                        embedding_fn,
+                        embedder,
                         manual_id,
                         pdf_path,
                         pdf_dir,

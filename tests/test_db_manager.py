@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+from mcp_manual_walker.config import settings
 from mcp_manual_walker.db_manager import (
     command_delete,
     command_export,
@@ -165,7 +166,12 @@ def test_command_import(mock_session, mock_chroma):
     client, collection = mock_chroma
 
     # Mock data
-    manifest_data = {"version": "1.0", "created_at": "2024-01-01", "target": "t"}
+    manifest_data = {
+        "version": "1.0",
+        "created_at": "2024-01-01",
+        "target": "t",
+        "embedding_model": settings.EMBEDDING_MODEL,
+    }
     sqlite_data = [
         {
             "id": "uuid-imp",
@@ -193,7 +199,7 @@ def test_command_import(mock_session, mock_chroma):
         patch("builtins.open", mock_open()),
         patch("json.load") as mock_json_load,
         patch("mcp_manual_walker.db_manager.Path") as MockPath,
-        patch("mcp_manual_walker.db_manager.get_embedding_function"),
+        patch("mcp_manual_walker.db_manager.get_embedder"),
     ):
         # Setup mocks
         mock_path_inst = MockPath.return_value
@@ -213,3 +219,56 @@ def test_command_import(mock_session, mock_chroma):
         collection.add.assert_called()
         call_args = collection.add.call_args
         assert call_args.kwargs["ids"] == ["c1"]
+
+
+def test_command_import_rejects_other_embedding_model(mock_session, mock_chroma):
+    """An export built with another model must not be merged into the collection."""
+    client, collection = mock_chroma
+
+    manifest_data = {
+        "version": "1.0",
+        "created_at": "2024-01-01",
+        "target": "t",
+        "embedding_model": "intfloat/multilingual-e5-small",
+    }
+    sqlite_data = [
+        {
+            "id": "uuid-imp",
+            "file_name": "imp.pdf",
+            "document_title": "Title",
+            "relative_path": "imp.pdf",
+            "file_hash": "hash",
+            "page_count": 10,
+            "updated_at": "2024-01-01T00:00:00",
+            "bookmarks": [],
+        }
+    ]
+    chroma_data = {
+        "ids": ["c1"],
+        "embeddings": [[0.1]],
+        "metadatas": [{"manual_id": "uuid-imp"}],
+        "documents": ["chunk"],
+    }
+
+    args = Namespace(input="in.zip")
+
+    with (
+        patch("zipfile.ZipFile"),
+        patch("tempfile.TemporaryDirectory"),
+        patch("builtins.open", mock_open()),
+        patch("json.load") as mock_json_load,
+        patch("mcp_manual_walker.db_manager.Path") as MockPath,
+        patch("mcp_manual_walker.db_manager.get_embedder") as mock_get_embedder,
+    ):
+        mock_path_inst = MockPath.return_value
+        mock_path_inst.exists.return_value = True
+
+        mock_json_load.side_effect = [manifest_data, sqlite_data, chroma_data]
+        mock_session.scalars.return_value.first.return_value = None
+
+        command_import(args)
+
+        # Nothing is written: neither the relational rows nor the vectors.
+        collection.add.assert_not_called()
+        mock_session.add.assert_not_called()
+        mock_get_embedder.assert_not_called()

@@ -21,7 +21,9 @@ The server will:
 *   [Python 3.11+](https://www.python.org/)
 *   [FastMCP](https://github.com/jlowin/fastmcp)
 *   [pypdf](https://pypi.org/project/pypdf/)
-*   [markitdown](https://pypi.org/project/markitdown/)
+*   [Docling](https://github.com/DS4SD/docling)
+*   [ChromaDB](https://www.trychroma.com/)
+*   [Sentence Transformers](https://www.sbert.net/) (Qwen3-Embedding)
 *   [SQLAlchemy](https://www.sqlalchemy.org/)
 *   [Pydantic](https://pydantic-docs.helpmanual.io/)
 *   [Pydantic-Settings](https://docs.pydantic.dev/latest/concepts/settings/)
@@ -46,14 +48,20 @@ You need to have Python 3.11+ and `uv` installed.
     ```sh
     git clone https://github.com/junkreef/mcp-manual-walker.git
     ```
-2.  Install Python packages using `uv`. This command syncs your environment with the `uv.lock` file.
-    ```sh
-    uv sync
-    ```
+2.  Install Python packages using `uv`. Choose the extra that matches this machine's role — plain `uv sync` with no extra leaves PyTorch unresolved, so always pass one:
+    *   Running the search server (CPU-only):
+        ```sh
+        uv sync --extra cpu
+        ```
+    *   Building the database (GPU machine, see "Building the Database" below):
+        ```sh
+        uv sync --extra builder
+        ```
+    *   Add `--extra dev` to either for development and tests, e.g. `uv sync --extra cpu --extra dev`.
 3.  Place your PDF manuals in the `data/pdfs` directory.
 4.  Run the server
     ```sh
-    python src/mcp_manual_walker/main.py
+    uv run python -m mcp_manual_walker.main
     ```
 
 ## 🛠️ Usage
@@ -74,7 +82,7 @@ Building the searchable database (Docling PDF conversion, chunking, embeddings, 
 uv sync --extra builder
 ```
 
-This pulls in Docling, `sentence-transformers`, and the CUDA build of PyTorch (from the `pytorch` index configured in `pyproject.toml`) so embeddings and Docling's models can run on the GPU.
+The `builder` extra pulls in Docling, `sentence-transformers`, and PyTorch's CUDA 13.0 build (via the nested `cu130` extra, resolved from the `pytorch` index configured in `pyproject.toml`), so embeddings and Docling's models can run on the GPU. `builder` and the server's `cpu` extra are mutually exclusive — install whichever matches the machine (see Installation above), and add `--extra dev` on top for development and tests.
 
 Then run the builder:
 
@@ -93,6 +101,30 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `DOCLING_NUM_THREADS` | CPU count | Total CPU-thread budget for Docling, split evenly across `DOCLING_WORKERS`. |
 | `DOCLING_DEVICE` | `auto` | Accelerator for Docling's layout/table/OCR models (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`). |
 | `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
+
+### 🧠 Embedding Model
+
+Both the builder and the server embed text with [Sentence Transformers](https://www.sbert.net/) using [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (Apache-2.0). It was chosen for:
+
+*   **Long context (up to 32k tokens)** — comfortably covers the 2000-character chunks this project produces, so nothing gets silently truncated.
+*   **Strong multilingual quality**, including Japanese, which matters for non-English manuals.
+*   **A permissive, self-hostable license** (Apache-2.0).
+*   **A size (0.6B params, 1024-dim output) small enough to run on CPU** for query embedding at search time — the server only embeds one short query per call, so it never needs a GPU, even though the builder does for embedding whole manuals at scale.
+
+The chosen model is recorded in the ChromaDB collection's metadata when the database is built. The server checks this against its own configured `EMBEDDING_MODEL` at startup and refuses to serve searches if they don't match, with an error telling you to rebuild. **Any existing database (e.g. one built with the earlier `intfloat/multilingual-e5-small` model) must be rebuilt after an embedding model change:**
+
+```sh
+uv run db_manager build --pdf_dir ./data/pdfs --reset
+```
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Sentence Transformers model id. Must be identical for the builder and the server. |
+| `EMBEDDING_DEVICE` | `auto` | Device for the embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
+| `EMBEDDING_QUERY_PREFIX` | `Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ` | Text prepended to search queries before embedding. Qwen3 expects an instruction on the query side only; keep the default unless you switch models (e5-style models use `query: ` / `passage: ` instead). |
+| `EMBEDDING_DOCUMENT_PREFIX` | *(empty)* | Text prepended to every chunk at build time. |
+| `EMBEDDING_MAX_SEQ_LENGTH` | `4096` | Token cap per text passed to the model. Raise for very long chunks, at the cost of VRAM/RAM. |
+| `EMBEDDING_BATCH_SIZE` | `32` | Encode batch size used by the builder. |
 
 ## 🗺️ Roadmap
 

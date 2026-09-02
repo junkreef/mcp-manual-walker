@@ -39,8 +39,19 @@ class Settings(BaseSettings):
     DOCLING_WORKERS: int = 1
     # "auto" | "cpu" | "cuda" | "cuda:N" | "mps", passed to AcceleratorOptions
     DOCLING_DEVICE: str = "auto"
+    # Embedding model (shared by the builder and the search server; must match the DB)
+    EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-0.6B"
     # "auto" | "cpu" | "cuda" ... for SentenceTransformers
     EMBEDDING_DEVICE: str = "auto"
+    # Qwen3-Embedding expects an instruction prefix on queries and none on documents
+    EMBEDDING_QUERY_PREFIX: str = (
+        "Instruct: Given a web search query, retrieve relevant passages that "
+        "answer the query\nQuery: "
+    )
+    EMBEDDING_DOCUMENT_PREFIX: str = ""
+    # Tokens per input; Qwen3 supports 32k but VRAM/RAM grows with the window
+    EMBEDDING_MAX_SEQ_LENGTH: int = 4096
+    EMBEDDING_BATCH_SIZE: int = 32
 
 
 settings = Settings()

@@ -1,70 +1,20 @@
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from mcp_manual_walker.config import settings
 
-try:
-    import chromadb
-    from chromadb import Documents, EmbeddingFunction, Embeddings
-except ImportError:
-    chromadb = None
-    EmbeddingFunction = object  # type: ignore
-
 logger = logging.getLogger(__name__)
 
-# Common Model Name to ensure compatibility between builder and search.
-# FastEmbed supports "intfloat/multilingual-e5-small".
-MODEL_NAME = "intfloat/multilingual-e5-small"
+# Name of the single Chroma collection that holds every manual chunk.
+COLLECTION_NAME = "manual_chunks"
 
+# Collection metadata key recording which model produced the stored vectors.
+EMBEDDING_MODEL_METADATA_KEY = "embedding_model"
 
-class FastEmbedEmbeddingFunction(EmbeddingFunction):
-    """
-    Wrapper for FastEmbed to be compatible with ChromaDB EmbeddingFunction.
-    """
-
-    def __init__(self, model_name: str = MODEL_NAME):
-        try:
-            from fastembed import TextEmbedding
-        except ImportError:
-            raise ImportError("fastembed is not installed. Please install it.")
-
-        # Manually register the model if it's the target one and not supported by default
-        if model_name == "intfloat/multilingual-e5-small":
-            try:
-                # check if already supported (to avoid error on re-registration)
-                supported = any(
-                    m["model"] == model_name
-                    for m in TextEmbedding.list_supported_models()
-                )
-                if not supported:
-                    logger.info(
-                        f"Registering custom model {model_name} using Xenova artifacts"
-                    )
-                    # Need ModelSource object
-                    from fastembed.common.model_description import (
-                        ModelSource,
-                        PoolingType,
-                    )
-
-                    TextEmbedding.add_custom_model(
-                        model=model_name,
-                        pooling=PoolingType.MEAN,
-                        normalization=True,
-                        sources=ModelSource(hf="Xenova/multilingual-e5-small"),
-                        dim=384,
-                        model_file="onnx/model_quantized.onnx",
-                    )
-            except ValueError as e:
-                # Handle race condition or if it was registered between checks
-                logger.debug(f"Model already registered or error: {e}")
-            except Exception as e:
-                logger.warning(f"Failed to register custom model: {e}")
-
-        logger.info(f"Initializing FastEmbed with model: {model_name}")
-        self.model = TextEmbedding(model_name=model_name)
-
-    def __call__(self, input: Documents) -> Embeddings:
-        return list(self.model.embed(input))
+# Hint printed whenever the embedding backend cannot be imported.
+_INSTALL_HINT = (
+    "install with `uv sync --extra cpu` (server) or `--extra builder` (GPU build)"
+)
 
 
 def _resolve_device(preferred: str) -> str:
@@ -88,38 +38,131 @@ def _resolve_device(preferred: str) -> str:
         return "cpu"
 
 
-def get_embedding_function() -> Optional[EmbeddingFunction]:
+class SentenceTransformerEmbedder:
     """
-    Returns an appropriate embedding function based on available libraries.
-    Prioritizes SentenceTransformers (Builder/Heavy) if available,
-    otherwise falls back to FastEmbed (Search/Light).
+    The single embedding path used by both the builder and the search server.
+
+    Qwen3-Embedding is a decoder model: last-token pooling and L2 normalisation
+    are part of its Sentence Transformers pipeline, so this class only has to
+    feed it left-padded inputs and the right prompt. Queries carry an
+    instruction prefix, documents carry none.
     """
-    if not chromadb:
-        logger.error("chromadb is not installed.")
-        return None
 
-    # Try SentenceTransformers first (Builder preference)
-    try:
-        # Start a check to see if sentence_transformers is actually importable
-        import sentence_transformers  # noqa: F401
-        from chromadb.utils import embedding_functions
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        query_prefix: str,
+        document_prefix: str,
+        max_seq_length: int,
+        batch_size: int,
+    ):
+        # Imported here so this module stays importable without torch installed.
+        from sentence_transformers import SentenceTransformer
 
-        device = _resolve_device(settings.EMBEDDING_DEVICE)
-        logger.info(
-            f"Using SentenceTransformers with model: {MODEL_NAME} on device: {device}"
+        self._model_name = model_name
+        self._query_prefix = query_prefix
+        self._document_prefix = document_prefix
+        self._batch_size = batch_size
+
+        # Left padding is required for last-token pooling: with right padding the
+        # final position of a short input would be a pad token.
+        self.model = SentenceTransformer(
+            model_name,
+            device=device,
+            tokenizer_kwargs={"padding_side": "left"},
         )
-        return embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=MODEL_NAME, device=device
+        self.model.max_seq_length = max_seq_length
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def dimension(self) -> int:
+        return self.model.get_sentence_embedding_dimension()
+
+    def _encode(self, texts: list[str], prompt: str) -> list[list[float]]:
+        # An empty prefix is passed as None: Sentence Transformers would otherwise
+        # tokenize "" to derive a prompt length, which is pointless at best.
+        vectors = self.model.encode(
+            texts,
+            prompt=prompt or None,
+            batch_size=self._batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        return vectors.tolist()
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embeds passages for storage (no instruction prefix)."""
+        return self._encode(list(texts), self._document_prefix)
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embeds a single search query (instruction prefix applied)."""
+        return self._encode([text], self._query_prefix)[0]
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        """Alias for embed_documents, for callers expecting a Chroma-style callable."""
+        return self.embed_documents(input)
+
+
+def get_embedder() -> Optional[SentenceTransformerEmbedder]:
+    """
+    Builds the embedder from the application settings.
+
+    Returns None (after logging an actionable error) when sentence-transformers
+    or its torch backend are not installed.
+    """
+    device = _resolve_device(settings.EMBEDDING_DEVICE)
+    logger.info(
+        f"Loading embedding model {settings.EMBEDDING_MODEL} on device: {device}"
+    )
+    try:
+        return SentenceTransformerEmbedder(
+            model_name=settings.EMBEDDING_MODEL,
+            device=device,
+            query_prefix=settings.EMBEDDING_QUERY_PREFIX,
+            document_prefix=settings.EMBEDDING_DOCUMENT_PREFIX,
+            max_seq_length=settings.EMBEDDING_MAX_SEQ_LENGTH,
+            batch_size=settings.EMBEDDING_BATCH_SIZE,
         )
     except ImportError:
-        pass
-
-    # Fallback to FastEmbed
-    try:
-        import fastembed  # noqa: F401
-
-        logger.info(f"Using FastEmbed with model: {MODEL_NAME}")
-        return FastEmbedEmbeddingFunction(model_name=MODEL_NAME)
-    except ImportError:
-        logger.error("Neither sentence-transformers nor fastembed found.")
+        logger.error(f"sentence-transformers is not available: {_INSTALL_HINT}.")
         return None
+
+
+def collection_metadata(embedder: SentenceTransformerEmbedder) -> dict[str, Any]:
+    """Metadata stored on the Chroma collection when it is first created."""
+    return {
+        EMBEDDING_MODEL_METADATA_KEY: embedder.model_name,
+        "embedding_dim": embedder.dimension,
+        "hnsw:space": "cosine",
+        "description": "Chunks from PDF manuals",
+    }
+
+
+def check_collection_model(collection: Any, expected_model: str) -> None:
+    """
+    Verifies that a Chroma collection was built with the expected model.
+
+    Vectors from different models are not comparable, so a mismatch has to stop
+    the caller instead of silently returning nonsense results.
+    """
+    metadata = getattr(collection, "metadata", None) or {}
+    stored_model = metadata.get(EMBEDDING_MODEL_METADATA_KEY)
+
+    if stored_model is None:
+        raise RuntimeError(
+            "The vector collection does not record an embedding model, so it "
+            "predates this check and was almost certainly built with another "
+            f"model; settings.EMBEDDING_MODEL is '{expected_model}'. "
+            "Rebuild with `db_manager build --reset`."
+        )
+
+    if stored_model != expected_model:
+        raise RuntimeError(
+            f"The vector collection was built with '{stored_model}', but "
+            f"settings.EMBEDDING_MODEL is '{expected_model}'. "
+            "Rebuild with `db_manager build --reset`."
+        )

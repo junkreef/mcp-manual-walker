@@ -12,7 +12,13 @@ from sqlalchemy import select
 from mcp_manual_walker.builder import build
 from mcp_manual_walker.config import settings
 from mcp_manual_walker.database import SessionLocal, init_db
-from mcp_manual_walker.embeddings import get_embedding_function
+from mcp_manual_walker.embeddings import (
+    COLLECTION_NAME,
+    EMBEDDING_MODEL_METADATA_KEY,
+    check_collection_model,
+    collection_metadata,
+    get_embedder,
+)
 from mcp_manual_walker.models import Bookmark, Manual
 
 try:
@@ -111,7 +117,7 @@ def command_export(args):
 
     session = SessionLocal()
     client = get_chroma_client()
-    collection = client.get_collection(name="manual_chunks")
+    collection = client.get_collection(name=COLLECTION_NAME)
 
     try:
         stmt = select(Manual).where(Manual.relative_path.startswith(target))
@@ -163,6 +169,8 @@ def command_export(args):
             "target": target,
             "manual_count": len(manuals),
             "chunk_count": len(chroma_results["ids"]),
+            # Vectors are only reusable by the model that produced them.
+            EMBEDDING_MODEL_METADATA_KEY: settings.EMBEDDING_MODEL,
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -199,23 +207,6 @@ def command_import(args):
     session = SessionLocal()
     client = get_chroma_client()
 
-    # Try to load embedding function.
-    logger.info("Loading embedding function...")
-    ef = get_embedding_function()
-
-    if ef:
-        collection = client.get_or_create_collection(
-            name="manual_chunks",
-            embedding_function=ef,
-            metadata={"description": "Chunks from PDF manuals"},
-        )
-    else:
-        # If we can't load EF, we assume collection exists or create without specific EF (dangerous if mixed).
-        collection = client.get_or_create_collection(
-            name="manual_chunks",
-            metadata={"description": "Chunks from PDF manuals"},
-        )
-
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -234,6 +225,44 @@ def command_import(args):
 
             with open(temp_path / "chroma.json", "r", encoding="utf-8") as f:
                 chroma_data = json.load(f)
+
+        # Imported vectors are only usable with the model that produced them.
+        exported_model = manifest.get(EMBEDDING_MODEL_METADATA_KEY)
+        if exported_model is None:
+            logger.warning(
+                "The export does not record an embedding model. Its vectors may "
+                f"have been built with a model other than {settings.EMBEDDING_MODEL}."
+            )
+        elif exported_model != settings.EMBEDDING_MODEL:
+            logger.error(
+                f"The export was built with '{exported_model}', but "
+                f"settings.EMBEDDING_MODEL is '{settings.EMBEDDING_MODEL}'. "
+                "Import aborted: re-export the data with the current model."
+            )
+            return
+
+        # Load the embedding model only to stamp the collection metadata; every
+        # vector comes from the archive, so Chroma never embeds anything here.
+        logger.info("Loading embedding model...")
+        embedder = get_embedder()
+
+        if embedder:
+            collection = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=None,
+                metadata=collection_metadata(embedder),
+            )
+        else:
+            # Without the model we cannot stamp the model name on a freshly
+            # created collection; an existing one keeps its own metadata.
+            logger.warning(
+                "Embedding model unavailable: a newly created collection will "
+                "not record which model built its vectors."
+            )
+            collection = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=None,
+            )
 
         # Import SQLite Data
         imported_count = 0
@@ -333,7 +362,7 @@ def command_delete(args):
 
     session = SessionLocal()
     client = get_chroma_client()
-    collection = client.get_collection(name="manual_chunks")
+    collection = client.get_collection(name=COLLECTION_NAME)
 
     try:
         # Find manuals starting with the target string (directory or specific file)
@@ -380,16 +409,23 @@ def command_search(args):
 
     client = get_chroma_client()
 
-    logger.info("Loading embedding function...")
-    ef = get_embedding_function()
-    if not ef:
-        logger.error("Could not load embedding function.")
+    logger.info("Loading embedding model...")
+    embedder = get_embedder()
+    if not embedder:
+        logger.error("Could not load the embedding model.")
         return
 
-    collection = client.get_collection(name="manual_chunks")
+    collection = client.get_collection(name=COLLECTION_NAME)
 
-    # Manually embed the query to avoid EF validation conflict with persisted "sentence_transformer"
-    query_embeddings = ef([query])
+    try:
+        check_collection_model(collection, settings.EMBEDDING_MODEL)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return
+
+    # The query is embedded here and passed explicitly: the collection has no
+    # embedding function of its own.
+    query_embeddings = [embedder.embed_query(query)]
 
     results = collection.query(
         query_embeddings=query_embeddings,

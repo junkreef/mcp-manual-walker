@@ -2,6 +2,7 @@ import concurrent.futures
 import importlib
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -112,8 +113,15 @@ def builder_env(mock_settings):
 
         importlib.reload(builder)
 
-        def fake_embedding_fn(docs):
-            return [[0.1, 0.2, 0.3] for _ in docs]
+        # Stand-in for the sentence-transformers embedder: no model download.
+        fake_embedder = SimpleNamespace(
+            embed_documents=lambda docs: [[0.1, 0.2, 0.3] for _ in docs],
+            model_name=settings.EMBEDDING_MODEL,
+            dimension=3,
+        )
+        # get_or_create_collection returns the metadata of an already existing
+        # collection, so the mock has to look like a matching one.
+        mock_coll.metadata = {"embedding_model": settings.EMBEDDING_MODEL}
 
         with (
             patch("mcp_manual_walker.pdf_utils.extract_pdf_metadata") as mock_meta,
@@ -124,8 +132,8 @@ def builder_env(mock_settings):
                 side_effect=_thread_executor,
             ),
             patch(
-                "mcp_manual_walker.builder.get_ef",
-                return_value=fake_embedding_fn,
+                "mcp_manual_walker.builder.get_embedder",
+                return_value=fake_embedder,
             ),
         ):
             mock_hash.return_value = "dummy_hash"
@@ -150,6 +158,7 @@ def builder_env(mock_settings):
             yield types.SimpleNamespace(
                 builder=builder,
                 mock_inst=mock_inst,
+                mock_client=mock_client_inst,
                 mock_res=mock_res,
                 mock_coll=mock_coll,
                 mock_hash=mock_hash,
@@ -177,6 +186,12 @@ def test_builder_smoke(pdf_dir, mock_settings, builder_env):
 
     assert builder_env.mock_inst.convert.call_count == 2
     assert builder_env.mock_coll.add.call_count == 2
+
+    # Chroma must never embed anything itself: vectors are always passed in,
+    # and the collection records which model produced them.
+    create_kwargs = builder_env.mock_client.get_or_create_collection.call_args.kwargs
+    assert create_kwargs["embedding_function"] is None
+    assert create_kwargs["metadata"]["embedding_model"] == settings.EMBEDDING_MODEL
 
     # Check args of last call
     kwargs = builder_env.mock_coll.add.call_args[1]

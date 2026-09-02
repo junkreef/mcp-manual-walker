@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import SessionLocal, init_db
-from .embeddings import get_embedding_function
+from .embeddings import COLLECTION_NAME, check_collection_model, get_embedder
 from .models import Bookmark, Manual
 from .schemas import (
     BookmarkNode,
@@ -32,9 +32,60 @@ class AppState:
     def __init__(self):
         self.chroma_client = None
         self.collection = None
-        self.embedding_fn = None
+        self.embedder = None
+        # Reason why the vector store could not be used, surfaced by the tools.
+        self.init_error = None
+
 
 app_state = AppState()
+
+
+def init_vector_store() -> None:
+    """
+    Connects app_state to the persisted vector collection.
+
+    Kept out of the lifespan so it can be re-run (the test suite reuses a single
+    server object). A failure is recorded instead of raised, so the server still
+    starts and every tool can explain why the vector store is unusable.
+    """
+    logger.info("Initializing ChromaDB...")
+    app_state.chroma_client = None
+    app_state.collection = None
+    app_state.embedder = None
+    app_state.init_error = None
+
+    try:
+        chroma_client = chromadb.PersistentClient(
+            path=str(settings.CHROMADB_PATH.resolve())
+        )
+
+        # Load the embedding model (the same one the builder used)
+        embedder = get_embedder()
+
+        # Get the collection without an embedding function: queries are embedded
+        # here and passed to Chroma explicitly.
+        collection = chroma_client.get_collection(name=COLLECTION_NAME)
+
+        # Vectors built with another model are not comparable to ours.
+        check_collection_model(collection, settings.EMBEDDING_MODEL)
+
+        app_state.chroma_client = chroma_client
+        app_state.embedder = embedder
+        app_state.collection = collection
+
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB: {e}")
+        app_state.init_error = str(e)
+
+
+def _require_collection():
+    """Returns the collection, or raises a ToolError explaining why it is missing."""
+    if app_state.collection is None:
+        message = "Vector database is not initialized."
+        if app_state.init_error:
+            message = f"{message} {app_state.init_error}"
+        raise ToolError(message)
+    return app_state.collection
 
 
 @asynccontextmanager
@@ -49,27 +100,7 @@ async def lifespan(app: FastMCP):
     logger.info("Initializing database...")
     init_db()
 
-    logger.info("Initializing ChromaDB...")
-    try:
-        chroma_client = chromadb.PersistentClient(
-            path=str(settings.CHROMADB_PATH.resolve())
-        )
-
-        # Load embedding function using factory
-        embedding_fn = get_embedding_function()
-
-        # Get collection without enforcing EF to avoid strict validation mismatch
-        # We will handle embedding manually in search_manual
-        collection = chroma_client.get_collection(name="manual_chunks")
-        
-        # Store in explicit app_state
-        app_state.chroma_client = chroma_client
-        app_state.embedding_fn = embedding_fn
-        app_state.collection = collection
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize ChromaDB: {e}")
-        # We don't raise here to allow server to start, but tools will fail if not fixed.
+    init_vector_store()
 
     yield
 
@@ -252,9 +283,7 @@ def get_markdown_content(
     ],
 ) -> MarkdownContent:
     """Returns the Markdown content for a specific bookmark from the Vector DB."""
-    if app_state.collection is None:
-        raise ToolError("Vector database is not initialized.")
-    collection = app_state.collection
+    collection = _require_collection()
 
     db: Session = SessionLocal()
     try:
@@ -401,15 +430,12 @@ def search_manual(
     ] = None,
 ) -> SearchResult:
     """Searches for text in a manual and returns matches with context and hierarchy."""
-    """Searches for text in a manual and returns matches with context and hierarchy."""
-    if app_state.collection is None:
-        raise ToolError("Vector database is not initialized.")
+    collection = _require_collection()
 
-    if app_state.embedding_fn is None:
-        raise ToolError("Embedding function is not initialized.")
+    if app_state.embedder is None:
+        raise ToolError("Embedding model is not initialized.")
 
-    collection = app_state.collection
-    embedding_fn = app_state.embedding_fn
+    embedder = app_state.embedder
 
     db: Session = SessionLocal()
     try:
@@ -423,7 +449,7 @@ def search_manual(
             }
 
         # Query ChromaDB with manual embedding
-        query_vec = embedding_fn([query])
+        query_vec = [embedder.embed_query(query)]
         results = collection.query(
             query_embeddings=query_vec, n_results=5, where=where_clause
         )
