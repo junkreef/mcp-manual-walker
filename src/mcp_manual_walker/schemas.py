@@ -27,10 +27,42 @@ class ManualMetadata(ManualInfo):
     )
 
 
+class FigureRef(BaseModel):
+    id: str = Field(..., description="The unique identifier of the figure.")
+    page: int = Field(..., description="The page the figure appears on.")
+    caption: Optional[str] = Field(
+        None, description="The caption printed next to the figure, if any."
+    )
+    description: Optional[str] = Field(
+        None,
+        description="A textual description of the figure generated at build time.",
+    )
+    bookmark_id: Optional[str] = Field(
+        None, description="The unique identifier of the bookmark the figure belongs to."
+    )
+
+
+class FigureInfo(FigureRef):
+    manual_id: str = Field(..., description="The unique identifier of the manual.")
+    labels: Optional[str] = Field(
+        None, description="Comma-joined text labels drawn inside the figure."
+    )
+    width: Optional[int] = Field(None, description="The image width in pixels.")
+    height: Optional[int] = Field(None, description="The image height in pixels.")
+    mime_type: str = Field(..., description="The MIME type of the image bytes.")
+
+
 class MarkdownContent(BaseModel):
     markdown_content: str = Field(
         ...,
         description="The complete Markdown content for the requested bookmark section and its subsections.",
+    )
+    figures: List[FigureRef] = Field(
+        default_factory=list,
+        description=(
+            "The figures appearing in the returned section, in document order. "
+            "Use `get_figure` with an id to fetch the image itself."
+        ),
     )
 
 
@@ -44,6 +76,17 @@ class SearchResultItem(BaseModel):
     manual_id: str = Field(..., description="The unique identifier of the manual.")
     bookmark_id: Optional[str] = Field(
         None, description="The unique identifier of the bookmark this chunk belongs to."
+    )
+    chunk_type: str = Field(
+        "text",
+        description='The kind of chunk that matched: "text", "table" or "figure".',
+    )
+    figure: Optional[FigureRef] = Field(
+        None,
+        description=(
+            "The figure this chunk describes, set only for figure chunks. "
+            "Use `get_figure` with its id to fetch the image itself."
+        ),
     )
 
 

@@ -71,8 +71,41 @@ The server provides a set of tools for AI agents. The typical workflow is as fol
 1.  Call `list_manuals()` to get a list of all available manuals and their unique IDs.
 2.  Use `get_manual_metadata(manual_id)` to retrieve the hierarchical table of contents (bookmarks) for a specific manual.
 3.  Finally, call `get_markdown_content(bookmark_id)` to get the token-efficient Markdown content for the desired section.
+4.  When a section or a search hit points at a figure, call `get_figure(figure_id)` to look at the picture itself.
 
 This process allows an agent to intelligently navigate large documents and only pull the necessary information into its context.
+
+### Tools
+
+| Tool | Input | Output |
+| --- | --- | --- |
+| `list_manuals` | — | Every manual with its `id`, `file_name` and `document_title`. |
+| `get_manual_metadata` | `manual_id` | The manual's metadata and its hierarchical `table_of_contents`; each bookmark carries the `id` the content tools need. |
+| `get_markdown_content` | `bookmark_id` | The Markdown of that section and its subsections, plus the `figures` it contains. |
+| `search_manual` | `manual_id`, `query`, optional `bookmark_id` | The top matching chunks with their bookmark path, `chunk_type` and, for figures, a `figure` reference. |
+| `get_figure` | `figure_id` | The figure's PNG image plus a JSON block of its metadata. |
+
+### Figures in the tool responses
+
+Figures are first-class results, so an agent can find a diagram by what it shows and then actually look at it:
+
+*   `search_manual` reports a `chunk_type` for every hit — `"text"`, `"table"` or `"figure"`. A figure hit matched the figure's caption, its on-page labels and its description (see "Figure descriptions" below), which are also returned as the hit's `context`, and it carries a `figure` object with the figure's `id`, `page`, `caption`, `description` and `bookmark_id`. Text and table hits have `figure: null`.
+*   `get_markdown_content` inserts each figure into the Markdown as a marker followed by the same text, so the picture keeps its place in the section:
+
+    ```
+    [Figure: 3f6c1c1e-... (page 12)]
+
+    Figure 4: Wiring of the control unit
+
+    Labels: Power unit, Controller, Sensor
+
+    A diagram showing the controller wired to the sensor.
+    ```
+
+    The same figures are listed in document order in the response's `figures` field, so the ids can be used without parsing the Markdown. Sections without figures return an empty list.
+*   `get_figure(figure_id)` returns two content blocks: the PNG image itself (an image content block, `image/png`) and a JSON text block with the figure's `id`, `manual_id`, `bookmark_id`, `page`, `caption`, `labels`, `description`, `width`, `height` and `mime_type`. An unknown id is an error.
+
+The typical figure workflow is therefore: `search_manual(...)` → take `figure.id` from a hit whose `chunk_type` is `"figure"` (or an id from the `figures` list of `get_markdown_content`) → `get_figure(figure_id=...)`.
 
 ## 🏗️ Building the Database
 
