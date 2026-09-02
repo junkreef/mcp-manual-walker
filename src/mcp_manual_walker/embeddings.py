@@ -44,16 +44,17 @@ class SentenceTransformerEmbedder:
 
     Qwen3-Embedding is a decoder model: last-token pooling and L2 normalisation
     are part of its Sentence Transformers pipeline, so this class only has to
-    feed it left-padded inputs and the right prompt. Queries carry an
-    instruction prefix, documents carry none.
+    feed it left-padded inputs and the right prompt. The prefixes default to
+    the model's own stored prompts (`model.prompts`); an explicit prefix in
+    settings overrides that.
     """
 
     def __init__(
         self,
         model_name: str,
         device: str,
-        query_prefix: str,
-        document_prefix: str,
+        query_prefix: Optional[str],
+        document_prefix: Optional[str],
         max_seq_length: int,
         batch_size: int,
     ):
@@ -61,22 +62,48 @@ class SentenceTransformerEmbedder:
         from sentence_transformers import SentenceTransformer
 
         self._model_name = model_name
-        self._query_prefix = query_prefix
-        self._document_prefix = document_prefix
         self._batch_size = batch_size
 
-        # Left padding is required for last-token pooling: with right padding the
-        # final position of a short input would be a pad token.
-        self.model = SentenceTransformer(
-            model_name,
-            device=device,
-            tokenizer_kwargs={"padding_side": "left"},
-        )
+        self.model = SentenceTransformer(model_name, device=device)
+
+        # Left padding is required for last-token pooling: with right padding
+        # the final position of a short input would be a pad token. This is
+        # set directly on the tokenizer rather than via the constructor's
+        # `tokenizer_kwargs` because that argument is deprecated in
+        # sentence-transformers 6 (renamed to `processor_kwargs`, which does
+        # not exist in 5.x); setting the attribute works on both.
+        self.model.tokenizer.padding_side = "left"
+
         self.model.max_seq_length = max_seq_length
+
+        self._query_prefix = self._resolve_prefix(query_prefix, "query")
+        self._document_prefix = self._resolve_prefix(document_prefix, "document")
+        logger.info("Resolved embedding query prefix: %r", self._query_prefix)
+        logger.info("Resolved embedding document prefix: %r", self._document_prefix)
+
+    def _resolve_prefix(self, configured: Optional[str], prompt_name: str) -> str:
+        """
+        Resolves a query/document prefix.
+
+        An explicit setting (even an empty string) always wins; otherwise the
+        model's own stored prompt for that name is used, if any.
+        """
+        if configured is not None:
+            return configured
+        prompts = getattr(self.model, "prompts", None) or {}
+        return prompts.get(prompt_name, "")
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    @property
+    def query_prefix(self) -> str:
+        return self._query_prefix
+
+    @property
+    def document_prefix(self) -> str:
+        return self._document_prefix
 
     @property
     def dimension(self) -> int:

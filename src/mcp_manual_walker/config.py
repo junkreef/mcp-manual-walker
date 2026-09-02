@@ -1,5 +1,6 @@
 import multiprocessing
 from pathlib import Path
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -43,12 +44,11 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-0.6B"
     # "auto" | "cpu" | "cuda" ... for SentenceTransformers
     EMBEDDING_DEVICE: str = "auto"
-    # Qwen3-Embedding expects an instruction prefix on queries and none on documents
-    EMBEDDING_QUERY_PREFIX: str = (
-        "Instruct: Given a web search query, retrieve relevant passages that "
-        "answer the query\nQuery: "
-    )
-    EMBEDDING_DOCUMENT_PREFIX: str = ""
+    # None means: use the prompt the model ships under the names "query" /
+    # "document" (Qwen3-Embedding: an instruction on queries, nothing on
+    # documents). An explicit string (possibly empty) overrides it.
+    EMBEDDING_QUERY_PREFIX: Optional[str] = None
+    EMBEDDING_DOCUMENT_PREFIX: Optional[str] = None
     # Tokens per input; Qwen3 supports 32k but VRAM/RAM grows with the window
     EMBEDDING_MAX_SEQ_LENGTH: int = 4096
     EMBEDDING_BATCH_SIZE: int = 32

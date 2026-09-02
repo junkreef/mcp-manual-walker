@@ -27,6 +27,8 @@ def mock_sentence_transformers():
     mock_model = MagicMock()
     mock_model.encode.return_value = np.array([[0.1, 0.2, 0.3]], dtype=np.float32)
     mock_model.get_sentence_embedding_dimension.return_value = 1024
+    mock_model.prompts = {"query": "Instruct: test\nQuery:", "document": ""}
+    mock_model.tokenizer = SimpleNamespace(padding_side="right")
     mock_module.SentenceTransformer.return_value = mock_model
 
     with patch.dict(sys.modules, {"sentence_transformers": mock_module}):
@@ -38,17 +40,21 @@ def test_constructor_configures_the_model(mock_sentence_transformers):
     with (
         patch.object(settings, "EMBEDDING_DEVICE", "cpu"),
         patch.object(settings, "EMBEDDING_MAX_SEQ_LENGTH", 512),
+        patch.object(settings, "EMBEDDING_QUERY_PREFIX", None),
+        patch.object(settings, "EMBEDDING_DOCUMENT_PREFIX", None),
     ):
         embedder = get_embedder()
 
     mock_sentence_transformers.module.SentenceTransformer.assert_called_once_with(
         settings.EMBEDDING_MODEL,
         device="cpu",
-        tokenizer_kwargs={"padding_side": "left"},
     )
+    assert mock_sentence_transformers.model.tokenizer.padding_side == "left"
     assert mock_sentence_transformers.model.max_seq_length == 512
     assert embedder.model_name == settings.EMBEDDING_MODEL
     assert embedder.dimension == 1024
+    assert embedder.query_prefix == "Instruct: test\nQuery:"
+    assert embedder.document_prefix == ""
 
 
 def test_embed_documents(mock_sentence_transformers):
@@ -98,11 +104,11 @@ def test_call_is_an_alias_of_embed_documents(mock_sentence_transformers):
 
 
 def test_embed_query_uses_the_instruction_prefix(mock_sentence_transformers):
-    """Queries carry the Qwen3 instruction prefix and return a flat vector."""
+    """Queries carry the configured instruction prefix and return a flat vector."""
     embedder = SentenceTransformerEmbedder(
         model_name=settings.EMBEDDING_MODEL,
         device="cpu",
-        query_prefix=settings.EMBEDDING_QUERY_PREFIX,
+        query_prefix="Instruct: test\nQuery:",
         document_prefix=settings.EMBEDDING_DOCUMENT_PREFIX,
         max_seq_length=512,
         batch_size=8,
@@ -111,12 +117,59 @@ def test_embed_query_uses_the_instruction_prefix(mock_sentence_transformers):
 
     mock_sentence_transformers.model.encode.assert_called_once_with(
         ["how to reset"],
-        prompt=settings.EMBEDDING_QUERY_PREFIX,
+        prompt="Instruct: test\nQuery:",
         batch_size=8,
         normalize_embeddings=True,
         convert_to_numpy=True,
     )
     assert result == pytest.approx([0.1, 0.2, 0.3])
+
+
+def test_explicit_prefix_overrides_model_prompt(mock_sentence_transformers):
+    """An explicit prefix in settings wins over the model's stored prompt."""
+    embedder = SentenceTransformerEmbedder(
+        model_name=settings.EMBEDDING_MODEL,
+        device="cpu",
+        query_prefix="query: ",
+        document_prefix="passage: ",
+        max_seq_length=512,
+        batch_size=8,
+    )
+
+    embedder.embed_query("how to reset")
+    assert mock_sentence_transformers.model.encode.call_args.kwargs["prompt"] == (
+        "query: "
+    )
+
+    embedder.embed_documents(["doc a"])
+    assert mock_sentence_transformers.model.encode.call_args.kwargs["prompt"] == (
+        "passage: "
+    )
+
+
+def test_prefix_defaults_to_model_prompt_when_model_has_none(
+    mock_sentence_transformers,
+):
+    """With no configured prefix and no model prompts, prompt is None."""
+    del mock_sentence_transformers.model.prompts
+
+    embedder = SentenceTransformerEmbedder(
+        model_name=settings.EMBEDDING_MODEL,
+        device="cpu",
+        query_prefix=None,
+        document_prefix=None,
+        max_seq_length=512,
+        batch_size=8,
+    )
+    embedder.embed_query("how to reset")
+
+    mock_sentence_transformers.model.encode.assert_called_once_with(
+        ["how to reset"],
+        prompt=None,
+        batch_size=8,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
 
 
 def test_get_embedder_without_sentence_transformers():

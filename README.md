@@ -121,8 +121,8 @@ uv run db_manager build --pdf_dir ./data/pdfs --reset
 | --- | --- | --- |
 | `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Sentence Transformers model id. Must be identical for the builder and the server. |
 | `EMBEDDING_DEVICE` | `auto` | Device for the embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
-| `EMBEDDING_QUERY_PREFIX` | `Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ` | Text prepended to search queries before embedding. Qwen3 expects an instruction on the query side only; keep the default unless you switch models (e5-style models use `query: ` / `passage: ` instead). |
-| `EMBEDDING_DOCUMENT_PREFIX` | *(empty)* | Text prepended to every chunk at build time. |
+| `EMBEDDING_QUERY_PREFIX` | *(model default)* | Text prepended to search queries before embedding. Unset (`None`) uses the prompt the model ships under the name `query` (for Qwen3-Embedding: the "Instruct: ... \nQuery:" instruction). Set it explicitly only when switching to a model without stored prompts (e5-style models use `query: ` / `passage: `). |
+| `EMBEDDING_DOCUMENT_PREFIX` | *(model default)* | Text prepended to every chunk at build time. Unset (`None`) uses the prompt the model ships under the name `document` (for Qwen3-Embedding: nothing). |
 | `EMBEDDING_MAX_SEQ_LENGTH` | `4096` | Token cap per text passed to the model. Raise for very long chunks, at the cost of VRAM/RAM. |
 | `EMBEDDING_BATCH_SIZE` | `32` | Encode batch size used by the builder. |
 
