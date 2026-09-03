@@ -42,12 +42,14 @@ def test_constructor_configures_the_model(mock_sentence_transformers):
         patch.object(settings, "EMBEDDING_MAX_SEQ_LENGTH", 512),
         patch.object(settings, "EMBEDDING_QUERY_PREFIX", None),
         patch.object(settings, "EMBEDDING_DOCUMENT_PREFIX", None),
+        patch.object(settings, "EMBEDDING_DTYPE", "auto"),
     ):
         embedder = get_embedder()
 
     mock_sentence_transformers.module.SentenceTransformer.assert_called_once_with(
         settings.EMBEDDING_MODEL,
         device="cpu",
+        model_kwargs={"dtype": "auto"},
     )
     assert mock_sentence_transformers.model.tokenizer.padding_side == "left"
     assert mock_sentence_transformers.model.max_seq_length == 512
@@ -55,6 +57,21 @@ def test_constructor_configures_the_model(mock_sentence_transformers):
     assert embedder.dimension == 1024
     assert embedder.query_prefix == "Instruct: test\nQuery:"
     assert embedder.document_prefix == ""
+
+
+def test_constructor_forwards_an_explicit_dtype(mock_sentence_transformers):
+    """EMBEDDING_DTYPE overrides the checkpoint's dtype (float32 for CPU)."""
+    with (
+        patch.object(settings, "EMBEDDING_DEVICE", "cpu"),
+        patch.object(settings, "EMBEDDING_DTYPE", "float32"),
+    ):
+        get_embedder()
+
+    mock_sentence_transformers.module.SentenceTransformer.assert_called_once_with(
+        settings.EMBEDDING_MODEL,
+        device="cpu",
+        model_kwargs={"dtype": "float32"},
+    )
 
 
 def test_embed_documents(mock_sentence_transformers):
