@@ -248,6 +248,9 @@ def _create_converter(num_threads: int):
 
     # Derive section-header levels from PDF bookmarks / numbering / font style
     pipeline_options.heading_hierarchy_options = HeadingHierarchyOptions(enabled=True)
+    # The font-style signal reads the parsed PDF cells, which the pipeline
+    # discards unless they are explicitly kept.
+    pipeline_options.generate_parsed_pages = True
 
     # Render the detected pictures: the crops are persisted as PNG blobs in the
     # SQLite figures table (and written next to the markdown dump on request).
