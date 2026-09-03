@@ -57,6 +57,7 @@ class SentenceTransformerEmbedder:
         document_prefix: Optional[str],
         max_seq_length: int,
         batch_size: int,
+        dtype: str = "auto",
     ):
         # Imported here so this module stays importable without torch installed.
         from sentence_transformers import SentenceTransformer
@@ -64,7 +65,12 @@ class SentenceTransformerEmbedder:
         self._model_name = model_name
         self._batch_size = batch_size
 
-        self.model = SentenceTransformer(model_name, device=device)
+        # The dtype is always stated rather than left to the library default:
+        # transformers 4.x resolved an unset dtype to float32 and 5.x resolves
+        # it to "auto", so the footprint silently halved on an upgrade.
+        self.model = SentenceTransformer(
+            model_name, device=device, model_kwargs={"dtype": dtype}
+        )
 
         # Left padding is required for last-token pooling: with right padding
         # the final position of a short input would be a pad token. This is
@@ -143,7 +149,8 @@ def get_embedder() -> Optional[SentenceTransformerEmbedder]:
     """
     device = _resolve_device(settings.EMBEDDING_DEVICE)
     logger.info(
-        f"Loading embedding model {settings.EMBEDDING_MODEL} on device: {device}"
+        f"Loading embedding model {settings.EMBEDDING_MODEL} on device: {device} "
+        f"(dtype={settings.EMBEDDING_DTYPE})"
     )
     try:
         return SentenceTransformerEmbedder(
@@ -153,6 +160,7 @@ def get_embedder() -> Optional[SentenceTransformerEmbedder]:
             document_prefix=settings.EMBEDDING_DOCUMENT_PREFIX,
             max_seq_length=settings.EMBEDDING_MAX_SEQ_LENGTH,
             batch_size=settings.EMBEDDING_BATCH_SIZE,
+            dtype=settings.EMBEDDING_DTYPE,
         )
     except ImportError:
         logger.error(f"sentence-transformers is not available: {_INSTALL_HINT}.")

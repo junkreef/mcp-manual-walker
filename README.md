@@ -137,6 +137,7 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `DOCLING_OCR_LANG` | `japan` | RapidOCR language token for the recognition model. `japan`/`chinese`/`en` need no download; other languages (e.g. `korean`) are fetched on first use. |
 | `DOCLING_IMAGES_SCALE` | `2.0` | Render scale for the figure crops stored in SQLite (`1.0` = 72 dpi, `2.0` = 144 dpi). Higher means sharper PNGs and a bigger database file. |
 | `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
+| `EMBEDDING_DTYPE` | `auto` | Dtype the weights load under. `auto` reads it from the checkpoint (bfloat16); set `float32` on a CPU-only server (see below). |
 
 OCR only runs on layout regions without a PDF text layer (scanned pages, text
 inside images) — text-based PDFs are read from their text layer, so the OCR
@@ -217,6 +218,8 @@ Both the builder and the server embed text with [Sentence Transformers](https://
 *   **A permissive, self-hostable license** (Apache-2.0).
 *   **A size (0.6B params, 1024-dim output) small enough to run on CPU** for query embedding at search time — the server only embeds one short query per call, so it never needs a GPU, even though the builder does for embedding whole manuals at scale.
 
+    On a CPU-only server, set `EMBEDDING_DTYPE=float32`. The checkpoint is bfloat16, and `auto` honours that, but bfloat16 has no fast CPU kernels: one query measured **0.86 s** under bfloat16 against **0.43 s** under float32 on an L4 host's CPU. float32 doubles the resident weights (1.11 GiB → 2.22 GiB) and halves the latency. Leave it on `auto` for the GPU builder, where bfloat16 is both smaller and fast.
+
 The chosen model is recorded in the ChromaDB collection's metadata when the database is built. The server checks this against its own configured `EMBEDDING_MODEL` at startup and refuses to serve searches if they don't match, with an error telling you to rebuild. **Any existing database (e.g. one built with the earlier `intfloat/multilingual-e5-small` model) must be rebuilt after an embedding model change:**
 
 ```sh
@@ -227,6 +230,7 @@ uv run db_manager build --pdf_dir ./data/pdfs --reset
 | --- | --- | --- |
 | `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Sentence Transformers model id. Must be identical for the builder and the server. |
 | `EMBEDDING_DEVICE` | `auto` | Device for the embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
+| `EMBEDDING_DTYPE` | `auto` | Dtype the weights load under (`auto`, `float32`, `bfloat16`, `float16`). |
 | `EMBEDDING_QUERY_PREFIX` | *(model default)* | Text prepended to search queries before embedding. Unset (`None`) uses the prompt the model ships under the name `query` (for Qwen3-Embedding: the "Instruct: ... \nQuery:" instruction). Set it explicitly only when switching to a model without stored prompts (e5-style models use `query: ` / `passage: `). |
 | `EMBEDDING_DOCUMENT_PREFIX` | *(model default)* | Text prepended to every chunk at build time. Unset (`None`) uses the prompt the model ships under the name `document` (for Qwen3-Embedding: nothing). |
 | `EMBEDDING_MAX_SEQ_LENGTH` | `4096` | Token cap per text passed to the model. Raise for very long chunks, at the cost of VRAM/RAM. |

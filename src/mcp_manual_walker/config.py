@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-0.6B"
     # "auto" | "cpu" | "cuda" ... for SentenceTransformers
     EMBEDDING_DEVICE: str = "auto"
+    # Torch dtype the weights are loaded under. "auto" takes the dtype from the
+    # checkpoint (bfloat16 for Qwen3-Embedding); any torch dtype name
+    # ("float32", "bfloat16", "float16") forces that instead. This is passed
+    # explicitly rather than left to the library default, which has already
+    # flipped once between transformers 4.x (float32) and 5.x (auto).
+    # Prefer "float32" on a CPU-only search server: bfloat16 has no fast CPU
+    # kernels, and query embedding measured ~2x slower than float32 on one.
+    EMBEDDING_DTYPE: str = "auto"
     # None means: use the prompt the model ships under the names "query" /
     # "document" (Qwen3-Embedding: an instruction on queries, nothing on
     # documents). An explicit string (possibly empty) overrides it.
