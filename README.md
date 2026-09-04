@@ -164,7 +164,15 @@ three separate ways in one afternoon:
   16 GB.
 
 `DOCLING_GPU_SLOTS` puts a semaphore in front of the device, shared by the
-worker processes and the parent. A slot is held for one conversion or one
+worker processes and the parent. The embedder also hands the device back when
+it is done: torch's caching allocator keeps the activation peak in its own
+pool and the weights stay resident, so an idle embedder was still holding
+5.1 GB against the 1.3 GB it starts with. A slot returned while that memory is
+held frees the right to run but not the room to run in, so the weights are
+moved off and the pool emptied *before* the slot is released — after would
+race the worker that took it.
+
+A slot is held for one conversion or one
 embedding call, so a finished document's embedding simply costs a converting
 worker until it is done, and the peak becomes a number you set rather than
 whatever happens to overlap.

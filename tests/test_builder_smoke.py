@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import importlib
 import io
 import sys
@@ -192,6 +193,8 @@ def builder_env(mock_settings):
             embed_documents=lambda docs: [[0.1, 0.2, 0.3] for _ in docs],
             model_name=settings.EMBEDDING_MODEL,
             dimension=3,
+            # The builder brackets embedding with the device handover.
+            on_device=contextlib.nullcontext,
         )
         # get_or_create_collection returns the metadata of an already existing
         # collection, so the mock has to look like a matching one.
