@@ -246,6 +246,10 @@ def _create_converter(num_threads: int):
     pipeline_options.ocr_batch_size = settings.DOCLING_OCR_BATCH_SIZE
     pipeline_options.layout_batch_size = settings.DOCLING_LAYOUT_BATCH_SIZE
     pipeline_options.table_batch_size = settings.DOCLING_TABLE_BATCH_SIZE
+    # Bound the pages in flight. Every page in a queue holds its rendered image
+    # until the assemble stage releases it, so this caps the peak far more
+    # effectively than the page count suggests.
+    pipeline_options.queue_max_size = settings.DOCLING_QUEUE_MAX_SIZE
 
     # Derive section-header levels from PDF bookmarks / numbering / font style
     pipeline_options.heading_hierarchy_options = HeadingHierarchyOptions(enabled=True)
