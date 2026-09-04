@@ -108,6 +108,8 @@ def build_args(tmp_path, **overrides):
         include=None,
         progress_file=str(tmp_path / "progress.jsonl"),
         no_progress=True,
+        min_pages=None,
+        max_pages=None,
     )
     args.update(overrides)
     return Namespace(**args)
@@ -118,7 +120,8 @@ def test_cli_forwards_include_to_build(tmp_path):
     with patch("mcp_manual_walker.db_manager.build") as mock_build:
         command_build(args)
     mock_build.assert_called_once_with(
-        Path(tmp_path), False, False, ["zOS/V3R1/*"], None
+        Path(tmp_path), False, False, ["zOS/V3R1/*"], None,
+        min_pages=None, max_pages=None,
     )
 
 
@@ -126,7 +129,9 @@ def test_cli_passes_none_when_the_flag_is_absent(tmp_path):
     args = build_args(tmp_path)
     with patch("mcp_manual_walker.db_manager.build") as mock_build:
         command_build(args)
-    mock_build.assert_called_once_with(Path(tmp_path), False, False, None, None)
+    mock_build.assert_called_once_with(
+        Path(tmp_path), False, False, None, None, min_pages=None, max_pages=None
+    )
 
 
 def test_cli_passes_the_progress_file_through(tmp_path):

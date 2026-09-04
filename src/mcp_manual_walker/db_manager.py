@@ -65,7 +65,15 @@ def command_build(args):
         logger.info(
             f"Progress: uv run db_manager watch --progress-file {progress_file}"
         )
-    build(pdf_dir, args.reset, args.save_markdown, args.include, progress_file)
+    build(
+        pdf_dir,
+        args.reset,
+        args.save_markdown,
+        args.include,
+        progress_file,
+        min_pages=args.min_pages,
+        max_pages=args.max_pages,
+    )
 
 
 def command_watch(args):
@@ -626,6 +634,24 @@ def main():
         "--no-progress",
         action="store_true",
         help="Do not write a progress log.",
+    )
+    parser_build.add_argument(
+        "--min-pages",
+        type=int,
+        metavar="N",
+        help=(
+            "Only convert documents with at least N pages. With --max-pages, "
+            "splits a corpus by document length so the biggest manuals can be "
+            "run at a lower DOCLING_WORKERS than the rest: peak memory per "
+            "worker is set by the length of the document it holds, so one pass "
+            "sized for the longest manual wastes the machine on all the others."
+        ),
+    )
+    parser_build.add_argument(
+        "--max-pages",
+        type=int,
+        metavar="N",
+        help="Only convert documents with at most N pages.",
     )
     parser_build.set_defaults(func=command_build)
 

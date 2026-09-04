@@ -8,6 +8,7 @@ import pytest
 
 from mcp_manual_walker import progress
 from mcp_manual_walker.progress import (
+    STAGE_CONVERTED,
     STAGE_CONVERTING,
     STAGE_DONE,
     STAGE_FAILED,
@@ -312,3 +313,118 @@ def test_polling_an_unchanged_file_is_stable(log):
     first = reader.poll()
     assert reader.poll() is first
     assert len(first.files) == 1
+
+
+# -- per-page progress and the resume-relevant stages -------------------------
+
+
+def test_page_events_advance_the_per_document_count():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_SCANNED, pages=200),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+            make("page", path="a.pdf", pages_done=10),
+            make("page", path="a.pdf", pages_done=50),
+        ]
+    )
+    assert run.files["a.pdf"].pages_done == 50
+    assert run.files["a.pdf"].fraction == 0.25
+
+
+def test_page_counts_only_move_forward():
+    # Three processes append at once, so a late event can carry a stale count.
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+            make("page", path="a.pdf", pages_done=90),
+            make("page", path="a.pdf", pages_done=30),
+        ]
+    )
+    assert run.files["a.pdf"].pages_done == 90
+
+
+def test_a_reconversion_restarts_the_page_count():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+            make("page", path="a.pdf", pages_done=90),
+            make("stage", path="a.pdf", stage=STAGE_FAILED, error="died"),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+        ]
+    )
+    assert run.files["a.pdf"].pages_done == 0
+
+
+def test_fraction_is_unknown_until_both_numbers_exist():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+            make("page", path="a.pdf", pages_done=5),
+            make("stage", path="b.pdf", stage=STAGE_SCANNED, pages=10),
+        ]
+    )
+    assert run.files["a.pdf"].fraction is None  # no page count from the scan
+    assert run.files["b.pdf"].fraction is None  # no page reported yet
+
+
+def test_fraction_is_clamped_when_the_page_counts_disagree():
+    # Docling counts pages it processed, pypdf counts pages in the file; a
+    # malformed page makes them differ, and a bar past 100% reads as a bug.
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_SCANNED, pages=100),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+            make("page", path="a.pdf", pages_done=140),
+        ]
+    )
+    assert run.files["a.pdf"].fraction == 1.0
+
+
+def test_overall_pages_include_partial_progress_on_files_in_flight():
+    # Otherwise the bar does not move for the length of a 2900-page manual.
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_DONE, pages=100),
+            make("stage", path="b.pdf", stage=STAGE_SCANNED, pages=1000),
+            make("stage", path="b.pdf", stage=STAGE_CONVERTING),
+            make("page", path="b.pdf", pages_done=400),
+        ]
+    )
+    assert run.pages_done() == 500
+
+
+def test_a_converted_file_counts_all_its_pages_before_it_is_ingested():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_SCANNED, pages=300),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+            make("page", path="a.pdf", pages_done=200),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED),
+        ]
+    )
+    assert run.pages_done() == 300
+
+
+def test_partial_progress_never_exceeds_the_document():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_SCANNED, pages=100),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+            make("page", path="a.pdf", pages_done=150),
+        ]
+    )
+    assert run.pages_done() == 100
+
+
+def test_converted_counts_as_work_in_flight():
+    run = reduce_events([make("stage", path="a.pdf", stage=STAGE_CONVERTED)])
+    assert run.files["a.pdf"].is_active
+
+
+def test_page_range_label():
+    assert reduce_events([make("run_start")]).page_range == ""
+    assert reduce_events([make("run_start", min_pages=1800)]).page_range == "1,800-"
+    assert reduce_events([make("run_start", max_pages=999)]).page_range == "-999"
+    assert (
+        reduce_events([make("run_start", min_pages=1, max_pages=2)]).page_range == "1-2"
+    )
