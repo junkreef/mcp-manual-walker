@@ -709,6 +709,11 @@ def _convert_part_task(
             pages=(page_range[1] - page_range[0] + 1) if page_range else None,
         ):
             result = _converter.convert(str(pdf_path), **kwargs)
+            # Inside the slot, like the embedder's. Handing the slot back
+            # first leaves this worker holding its peak while whoever takes
+            # it starts allocating -- which is the collision the slot exists
+            # to prevent, moved a few lines later.
+            _release_device_cache()
     finally:
         _end_document()
     doc = result.document
@@ -747,11 +752,9 @@ def _convert_part_task(
     # memory they occupied, and it converts one document after another. Drop
     # the conversion result explicitly, then return the arenas to the OS.
     del result
+    # Host arenas only: the device cache was already returned inside the slot,
+    # while this worker still held the right to be using it.
     _trim_heap()
-    # The GPU blocks too, not just the host arenas: a worker that keeps its
-    # peak reserved between parts is a worker that has taken the memory the
-    # next slot holder needs.
-    _release_device_cache()
 
     progress.emit_file(
         pdf_path, progress.STAGE_CONVERTED, figures=len(figures), part=start_page
