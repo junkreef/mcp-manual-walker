@@ -577,6 +577,32 @@ def _count_missing_descriptions(doc) -> tuple[int, int]:
     return missing, total
 
 
+def _release_device_cache() -> None:
+    """Returns a worker's cached GPU blocks to the device.
+
+    Torch's caching allocator keeps the peak a process reached in its own
+    pool, so a Docling worker between parts goes on holding whatever its
+    heaviest page needed. Measured on a live build, the three workers sat at
+    6104 / 5588 / 4810 MB for twenty minutes without moving, rising when a
+    heavier part came along and never falling; the parent's embedding then had
+    4.8 GB to fit into 1.4 GB of headroom and did not.
+
+    DOCLING_GPU_SLOTS cannot help with this: it rations who may *use* the
+    device, not who may *hold* it. The same release was already added to the
+    embedder; this is its other half.
+
+    Never raises -- a worker that cannot free its cache has still converted
+    its pages.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:  # noqa: BLE001 - releasing is best effort
+        logger.debug(f"Could not release the device cache: {e}")
+
+
 def _trim_heap() -> None:
     """
     Hands the heap freed by a conversion back to the operating system.
@@ -722,6 +748,10 @@ def _convert_part_task(
     # the conversion result explicitly, then return the arenas to the OS.
     del result
     _trim_heap()
+    # The GPU blocks too, not just the host arenas: a worker that keeps its
+    # peak reserved between parts is a worker that has taken the memory the
+    # next slot holder needs.
+    _release_device_cache()
 
     progress.emit_file(
         pdf_path, progress.STAGE_CONVERTED, figures=len(figures), part=start_page
