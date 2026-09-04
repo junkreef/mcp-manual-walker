@@ -15,6 +15,7 @@ dependencies = [
     "pydantic-settings",
     "chromadb",
     "sentence-transformers>=5.2.0",
+    "rich",
 ]
 
 [project.optional-dependencies]
