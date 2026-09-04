@@ -103,12 +103,19 @@ TIMED_STAGES = frozenset(
 
 
 def file_elapsed(state, now: float) -> float | None:
-    """Time the file took, or has been taking, where that is meaningful."""
+    """How long the document has been going, where that is meaningful.
+
+    Measured from the first part's start rather than from the current stage,
+    because a document split into twelve parts emits twelve "converting"
+    events and a clock keyed on the latest one restarts at every part
+    boundary -- which reads as a document that keeps starting over. The slot
+    rows are the place for per-part timing; this column is the document.
+    """
     if state.stage not in TIMED_STAGES:
         return None
-    if state.convert_started and state.stage in (STAGE_DONE, STAGE_FAILED):
-        # The whole conversion, not just the last leg of it.
-        return (state.finished_at or now) - state.convert_started
+    if state.convert_started:
+        end = state.finished_at if state.is_terminal else now
+        return (end or now) - state.convert_started
     if state.stage_since:
         end = state.finished_at if state.is_terminal else now
         return (end or now) - state.stage_since
