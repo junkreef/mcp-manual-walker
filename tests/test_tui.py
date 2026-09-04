@@ -4,6 +4,7 @@ import pytest
 from rich.console import Console
 
 from mcp_manual_walker.progress import (
+    STAGE_CONVERTED,
     STAGE_CONVERTING,
     STAGE_DONE,
     STAGE_INGESTING,
@@ -18,6 +19,7 @@ from mcp_manual_walker.tui import (
     BuildMonitor,
     convert_started_at,
     file_elapsed,
+    file_progress,
     format_duration,
     render_plain,
     watch,
@@ -198,8 +200,8 @@ def test_render_produces_a_screenful_without_touching_a_terminal(monitor):
     console.print(monitor.render(height=20))
     out = console.export_text()
     assert "converting" in out and "b.pdf" in out
-    # Percentage over pages, excluding the skipped file: 10 of 100.
-    assert "10.0%" in out
+    # Pages, excluding the skipped file: 10 done + 30 past conversion, of 100.
+    assert "40.0%" in out
 
 
 def test_render_marks_a_finished_run(monitor):
@@ -264,3 +266,78 @@ def test_watch_once_exits_nonzero_when_a_file_failed(tmp_path, capsys):
         ' "error": "boom"}\n'
     )
     assert watch(log, once=True) == 1
+
+
+# -- the per-document progress cell -------------------------------------------
+
+
+def converting(pages, done):
+    run = reduce_events(
+        [
+            stage("a.pdf", "scanned", pages=pages),
+            stage("a.pdf", STAGE_CONVERTING),
+            {"event": "page", "ts": 101.0, "path": "a.pdf", "pages_done": done},
+        ]
+    )
+    return run.files["a.pdf"]
+
+
+def test_a_converting_file_shows_its_own_percentage():
+    assert "50%" in file_progress(converting(200, 100)).plain
+
+
+def test_a_converting_file_with_no_page_report_yet_shows_a_placeholder():
+    run = reduce_events(
+        [stage("a.pdf", "scanned", pages=200), stage("a.pdf", STAGE_CONVERTING)]
+    )
+    assert "..." in file_progress(run.files["a.pdf"]).plain
+
+
+def test_a_file_past_conversion_reads_as_complete():
+    for name in (STAGE_CONVERTED, STAGE_INGESTING):
+        run = reduce_events([stage("a.pdf", name)])
+        assert "100%" in file_progress(run.files["a.pdf"]).plain
+
+
+def test_a_file_not_in_flight_has_no_bar():
+    for name in (STAGE_QUEUED, STAGE_DONE, STAGE_SKIPPED):
+        run = reduce_events([stage("a.pdf", name)])
+        assert file_progress(run.files["a.pdf"]).plain == ""
+
+
+def test_the_bar_fills_as_the_document_converts():
+    widths = [file_progress(converting(100, n)).plain.count("█") for n in (0, 25, 100)]
+    assert widths == sorted(widths)
+    assert widths[0] < widths[-1]
+
+
+def test_the_row_shows_the_percentage(monitor):
+    run = reduce_events(
+        [
+            stage("big.pdf", "scanned", pages=1000),
+            stage("big.pdf", STAGE_CONVERTING),
+            {"event": "page", "ts": 101.0, "path": "big.pdf", "pages_done": 730},
+        ]
+    )
+    monitor.run = run
+    console = Console(width=120, height=20, record=True)
+    console.print(monitor.render(height=20))
+    assert "73%" in console.export_text()
+
+
+def test_the_header_hides_stages_with_nothing_in_them(monitor):
+    console = Console(width=140, height=20, record=True)
+    console.print(monitor.render(height=20))
+    out = console.export_text()
+    # The fixture has no scanning/pending files; those counters are noise.
+    assert "scanning" not in out
+    assert "pending" not in out
+    # done and failed are always shown, so a zero there is a statement.
+    assert "failed 0" in out
+
+
+def test_the_header_names_the_page_range_of_the_pass(monitor):
+    monitor.run.min_pages = 1800
+    console = Console(width=140, height=20, record=True)
+    console.print(monitor.render(height=20))
+    assert "1,800-" in console.export_text()

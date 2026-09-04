@@ -24,6 +24,7 @@ from rich.table import Table
 from rich.text import Text
 
 from mcp_manual_walker.progress import (
+    STAGE_CONVERTED,
     STAGE_CONVERTING,
     STAGE_DONE,
     STAGE_FAILED,
@@ -53,6 +54,7 @@ STAGE_STYLE = {
     STAGE_SCANNED: ("◍", "scanned", "cyan"),
     STAGE_QUEUED: ("◇", "queued", "yellow"),
     STAGE_CONVERTING: ("▶", "converting", "bright_blue"),
+    STAGE_CONVERTED: ("⇢", "converted", "cyan"),
     STAGE_INGESTING: ("◆", "ingesting", "magenta"),
     STAGE_DONE: ("✓", "done", "green"),
     STAGE_SKIPPED: ("=", "skipped", "grey50"),
@@ -89,7 +91,14 @@ def convert_started_at(run: RunState) -> float | None:
 # whole batch was queued -- the same number on every row, which reads like a
 # per-file measurement and is not one.
 TIMED_STAGES = frozenset(
-    {STAGE_SCANNING, STAGE_CONVERTING, STAGE_INGESTING, STAGE_DONE, STAGE_FAILED}
+    {
+        STAGE_SCANNING,
+        STAGE_CONVERTING,
+        STAGE_CONVERTED,
+        STAGE_INGESTING,
+        STAGE_DONE,
+        STAGE_FAILED,
+    }
 )
 
 
@@ -106,11 +115,26 @@ def file_elapsed(state, now: float) -> float | None:
     return None
 
 
-def progress_bar(fraction: float, width: int = 28) -> Text:
+def progress_bar(fraction: float, width: int = 28, style: str = "green") -> Text:
     filled = max(0, min(width, round(fraction * width)))
-    bar = Text("█" * filled, style="green")
+    bar = Text("█" * filled, style=style)
     bar.append("░" * (width - filled), style="grey35")
     return bar
+
+
+def file_progress(state) -> Text:
+    """The per-document bar: only meaningful while a document is converting."""
+    if state.stage == STAGE_CONVERTING:
+        fraction = state.fraction
+        if fraction is None:
+            # Pages are reported in batches, so the first one takes a moment.
+            return Text("      ...", style="grey42")
+        cell = progress_bar(fraction, width=8, style="bright_blue")
+        cell.append(f" {fraction * 100:3.0f}%", style="bright_blue")
+        return cell
+    if state.stage in (STAGE_CONVERTED, STAGE_INGESTING):
+        return Text("        100%", style="grey50")
+    return Text("")
 
 
 class BuildMonitor:
@@ -192,6 +216,9 @@ class BuildMonitor:
         if run.include:
             title.append("  include=", style="grey62")
             title.append(" ".join(run.include), style="bold yellow")
+        if run.page_range:
+            title.append("  pages=", style="grey62")
+            title.append(run.page_range, style="bold yellow")
         if run.workers:
             title.append(f"  {run.workers} worker(s)", style="grey62")
         if run.reset:
@@ -201,6 +228,7 @@ class BuildMonitor:
         for stage in (
             STAGE_DONE,
             STAGE_CONVERTING,
+            STAGE_CONVERTED,
             STAGE_INGESTING,
             STAGE_QUEUED,
             STAGE_SCANNING,
@@ -210,7 +238,9 @@ class BuildMonitor:
             STAGE_FAILED,
         ):
             count = counts.get(stage, 0)
-            if not count and stage in (STAGE_PENDING, STAGE_SCANNED, STAGE_SCANNING):
+            # Only the two that matter even at zero: "done" anchors the run,
+            # and "failed" must never be something the eye has to hunt for.
+            if not count and stage not in (STAGE_DONE, STAGE_FAILED):
                 continue
             _, label, colour = STAGE_STYLE[stage]
             if line:
@@ -261,6 +291,7 @@ class BuildMonitor:
         # Wide enough for the longest marker + label ("▶ converting").
         table.add_column("stage", width=12, no_wrap=True)
         table.add_column("pages", justify="right", width=6, no_wrap=True)
+        table.add_column("progress", width=13, no_wrap=True)
         table.add_column("time", justify="right", width=8, no_wrap=True)
         table.add_column("chunks", justify="right", width=7, no_wrap=True)
         table.add_column("figs", justify="right", width=5, no_wrap=True)
@@ -277,6 +308,7 @@ class BuildMonitor:
                 str(self.cursor + offset + 1),
                 Text(f"{marker} {label}", style=colour),
                 f"{state.pages:,}" if state.pages else "",
+                file_progress(state),
                 format_duration(file_elapsed(state, now)),
                 f"{state.chunks:,}" if state.chunks else "",
                 str(state.figures) if state.figures else "",

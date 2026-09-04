@@ -13,6 +13,7 @@ from PIL import Image
 from mcp_manual_walker import database, progress
 from mcp_manual_walker.config import settings
 from mcp_manual_walker.progress import (
+    STAGE_CONVERTED,
     STAGE_CONVERTING,
     STAGE_DONE,
     STAGE_FAILED,
@@ -150,6 +151,15 @@ def builder_env(mock_settings):
     mock_chromadb.PersistentClient.return_value = mock_client_inst
 
     pipeline_options = mock_docling.datamodel.pipeline_options
+
+    # `patch.dict` restores sys.modules on exit, deleting anything imported
+    # inside it -- including mcp_manual_walker.builder. The package object
+    # keeps its `builder` attribute, so the `from ... import builder` below
+    # still succeeds via getattr on a later test, and `importlib.reload` then
+    # fails with "not in sys.modules". Importing it here, before the snapshot,
+    # means the entry is part of what gets restored. Without this the file
+    # only passes when some earlier test file happens to import the builder.
+    import mcp_manual_walker.builder  # noqa: F401
 
     with patch.dict(
         sys.modules,
@@ -466,6 +476,109 @@ def test_a_run_that_matches_nothing_still_opens_and_closes(
     run = read_progress(log)
     assert run.total == 0
     assert run.is_finished
+
+
+def test_an_interrupted_build_is_resumed_not_skipped(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    """The whole point of `converted_at`.
+
+    The metadata pass writes a manual's row before anything is converted, so
+    on a re-run the file hash matches for a document that never made it into
+    the vector store. Trusting the hash alone silently stores nothing.
+    """
+    log = tmp_path / "progress.jsonl"
+    builder_env.mock_inst.convert.side_effect = RuntimeError("interrupted")
+    builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+    assert builder_env.mock_coll.add.call_count == 0
+
+    # Rows exist for both files, hashes unchanged, nothing converted.
+    session = database.SessionLocal()
+    try:
+        manuals = session.query(Manual).all()
+        assert len(manuals) == 2
+        assert all(m.converted_at is None for m in manuals)
+    finally:
+        session.close()
+
+    builder_env.mock_inst.convert.side_effect = None
+    builder_env.builder.build(pdf_dir, reset=False, progress_file=log)
+
+    run = read_progress(log)
+    assert run.summary["skipped"] == 0
+    assert run.summary["converted"] == 2
+    assert builder_env.mock_coll.add.call_count == 2
+
+    session = database.SessionLocal()
+    try:
+        assert all(m.converted_at is not None for m in session.query(Manual).all())
+    finally:
+        session.close()
+
+
+def test_a_finished_manual_is_still_skipped_on_a_re_run(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    log = tmp_path / "progress.jsonl"
+    builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+    builder_env.mock_coll.add.reset_mock()
+    builder_env.builder.build(pdf_dir, reset=False, progress_file=log)
+
+    assert builder_env.mock_coll.add.call_count == 0
+    assert read_progress(log).summary["skipped"] == 2
+
+
+def test_a_document_yielding_no_chunks_is_not_reconverted_forever(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    log = tmp_path / "progress.jsonl"
+    builder_env.mock_chunk.return_value = []
+    builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+    builder_env.builder.build(pdf_dir, reset=False, progress_file=log)
+    assert read_progress(log).summary["skipped"] == 2
+
+
+def test_page_range_defers_the_documents_outside_it(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    # The mocked metadata pass reports 5 pages for every file.
+    log = tmp_path / "progress.jsonl"
+    builder_env.builder.build(
+        pdf_dir, reset=True, progress_file=log, min_pages=10
+    )
+    assert builder_env.mock_inst.convert.call_count == 0
+    run = read_progress(log)
+    assert run.summary["deferred"] == 2
+    assert run.summary["converted"] == 0
+
+
+def test_a_deferred_document_is_converted_by_a_later_pass(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    # Splitting a corpus by document length must add up to the same database
+    # as one pass over all of it.
+    log = tmp_path / "progress.jsonl"
+    builder_env.builder.build(pdf_dir, reset=True, progress_file=log, min_pages=10)
+    assert builder_env.mock_coll.add.call_count == 0
+
+    builder_env.builder.build(pdf_dir, reset=False, progress_file=log, max_pages=9)
+    assert builder_env.mock_coll.add.call_count == 2
+    assert read_progress(log).summary["converted"] == 2
+
+
+def test_the_progress_log_reports_pages_as_they_convert(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    log = tmp_path / "progress.jsonl"
+    builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+    # The fake converter never runs a real pipeline, so no page events are
+    # produced -- but the stage that would carry them must still be recorded.
+    stages = {
+        e.get("stage")
+        for e in parse_lines(log.read_text().splitlines())
+        if e.get("event") == "stage"
+    }
+    assert STAGE_CONVERTED in stages
 
 
 def test_builder_skips_unchanged(pdf_dir, mock_settings, builder_env):

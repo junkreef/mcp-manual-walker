@@ -7,10 +7,12 @@ import multiprocessing as mp
 import os
 import shutil
 import sys
+import threading
 import uuid
 import warnings
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Imports for dependencies
@@ -42,11 +44,13 @@ try:
         RapidOcrOptions,
     )
     from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
     from docling_core.types.doc import ImageRefMode
     # We might need specific options if we want to speed up or customize
 except ImportError as e:
     logger.error(f"Failed to import docling: {e}", exc_info=True)
     DocumentConverter = None
+    StandardPdfPipeline = None
 
 try:
     from langchain_text_splitters import MarkdownHeaderTextSplitter
@@ -284,14 +288,78 @@ def _create_converter(num_threads: int):
     # PARTIAL_SUCCESS) and segfaulting the worker; cross-document parallelism
     # already comes from DOCLING_WORKERS, so the single-threaded parser is
     # used here for deterministic output.
-    return DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(
-                pipeline_options=pipeline_options,
-                backend=DoclingParseDocumentBackend,
-            )
-        }
+    pdf_format_option = PdfFormatOption(
+        pipeline_options=pipeline_options,
+        backend=DoclingParseDocumentBackend,
     )
+    pipeline_cls = _make_reporting_pipeline_cls()
+    if pipeline_cls is not None:
+        pdf_format_option.pipeline_cls = pipeline_cls
+
+    return DocumentConverter(format_options={InputFormat.PDF: pdf_format_option})
+
+
+# Pages between progress events while a document converts. Small enough that a
+# long manual visibly moves, large enough that the event log stays a rounding
+# error next to the conversion itself (~17k events for a 172k-page corpus).
+_PAGE_REPORT_STEP = 10
+
+# The document this worker process is converting. A worker converts one at a
+# time, so a module global is the whole state that is needed -- but the page
+# callback runs on the pipeline's assemble thread, hence the lock.
+_page_lock = threading.Lock()
+_current_document: str | None = None
+_pages_converted = 0
+
+
+def _begin_document(rel_path: str) -> None:
+    global _current_document, _pages_converted
+    with _page_lock:
+        _current_document = rel_path
+        _pages_converted = 0
+
+
+def _end_document() -> None:
+    global _current_document
+    with _page_lock:
+        _current_document = None
+
+
+def _report_page() -> None:
+    """Called once per page, as that page leaves the last pipeline stage."""
+    global _pages_converted
+    with _page_lock:
+        _pages_converted += 1
+        count = _pages_converted
+        document = _current_document
+    if document and (count == 1 or count % _PAGE_REPORT_STEP == 0):
+        progress.emit("page", path=document, pages_done=count)
+
+
+def _make_reporting_pipeline_cls():
+    """A pipeline that reports pages, or None if the hook is not there.
+
+    `_release_page_resources` is Docling's own per-page postprocess on the
+    final stage -- the one place that sees every page exactly once, after it
+    is finished. It is internal API, so if a Docling upgrade renames it this
+    returns None and the build runs on the stock pipeline without per-page
+    progress, rather than failing.
+    """
+    if StandardPdfPipeline is None:
+        return None
+    if not hasattr(StandardPdfPipeline, "_release_page_resources"):
+        logger.warning(
+            "Docling's StandardPdfPipeline._release_page_resources is gone; "
+            "per-page progress is disabled."
+        )
+        return None
+
+    class ProgressReportingPdfPipeline(StandardPdfPipeline):
+        def _release_page_resources(self, item):
+            super()._release_page_resources(item)
+            _report_page()
+
+    return ProgressReportingPdfPipeline
 
 
 def _init_docling_worker(num_threads: int):
@@ -396,7 +464,11 @@ def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
     progress.emit_file(
         pdf_path, progress.STAGE_CONVERTING, worker=os.getpid()
     )
-    result = _converter.convert(str(pdf_path))
+    _begin_document(progress.relative_path(pdf_path))
+    try:
+        result = _converter.convert(str(pdf_path))
+    finally:
+        _end_document()
     doc = result.document
 
     if save_markdown:
@@ -437,6 +509,7 @@ def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
     del result
     _trim_heap()
 
+    progress.emit_file(pdf_path, progress.STAGE_CONVERTED, figures=len(figures))
     return doc, figures
 
 
@@ -474,6 +547,10 @@ def _ingest_document(
 
     logger.info(f"Generated {len(chunks)} chunks for {rel_path}")
     if not chunks:
+        # A document that yields nothing is still converted; without the mark
+        # every later build would convert it again.
+        manual.converted_at = datetime.now(UTC)
+        session.commit()
         return 0
 
     figures_by_index = {f["picture_index"]: f for f in figures}
@@ -552,6 +629,11 @@ def _ingest_document(
         )
 
     logger.info(f"Added {len(chunks)} chunks to ChromaDB for {pdf_path.name}")
+
+    # Only now is the manual really in the database. Until this commit lands,
+    # its row is just the metadata pass's promise that the file exists.
+    manual.converted_at = datetime.now(UTC)
+    session.commit()
     return len(chunks)
 
 
@@ -589,6 +671,8 @@ def build(
     save_markdown: bool = False,
     include: list[str] | None = None,
     progress_file: Path | None = None,
+    min_pages: int | None = None,
+    max_pages: int | None = None,
 ):
     check_dependencies()
 
@@ -672,6 +756,8 @@ def build(
         total=len(pdf_files),
         workers=max(1, settings.DOCLING_WORKERS),
         metadata_workers=max(1, settings.METADATA_WORKERS),
+        min_pages=min_pages,
+        max_pages=max_pages,
     )
     # One event per file rather than one list: a line has to stay small enough
     # for the kernel to append it atomically next to the workers' writes.
@@ -702,6 +788,7 @@ def build(
     skipped = 0
     failed = 0
     converted = 0
+    deferred = 0
     total_chunks = 0
 
     session = SessionLocal()
@@ -737,7 +824,19 @@ def build(
             except ValueError:
                 rel_path_str = pdf_path.name
 
-            if not updated and not reset:
+            pages = manual.page_count or 0
+            if (min_pages is not None and pages < min_pages) or (
+                max_pages is not None and pages > max_pages
+            ):
+                logger.info(
+                    f"File {rel_path_str} ({pages} pages) is outside the "
+                    "requested page range. Leaving it for another run."
+                )
+                deferred += 1
+                continue
+
+            unchanged = not updated and not reset
+            if unchanged and manual.converted_at is not None:
                 logger.info(f"File {rel_path_str} unchanged. Skipping.")
                 progress.emit_file(
                     pdf_path, progress.STAGE_SKIPPED, pages=manual.page_count
@@ -745,14 +844,24 @@ def build(
                 skipped += 1
                 continue
 
+            if unchanged:
+                # The row is here but the conversion never finished: an
+                # interrupted build, or one whose ingestion raised. Convert it
+                # again rather than trusting the hash, which only says the file
+                # on disk has not changed since the metadata pass wrote the row.
+                logger.info(
+                    f"File {rel_path_str} was registered but never converted. "
+                    "Resuming it."
+                )
+
             progress.emit_file(
                 pdf_path, progress.STAGE_QUEUED, pages=manual.page_count
             )
             tasks.append((pdf_path, str(manual.id), rel_path_str))
 
-            # A manual that already existed and changed still holds its old
-            # chunks in Chroma; they must be dropped before re-inserting.
-            if existed and updated:
+            # A manual that already existed still holds whatever chunks a
+            # previous run wrote; they must be dropped before re-inserting.
+            if existed:
                 stale_manual_ids.append(str(manual.id))
 
         logger.info(f"Queued {len(tasks)} files for processing.")
@@ -878,12 +987,14 @@ def build(
             skipped=skipped,
             converted=converted,
             failed=failed,
+            deferred=deferred,
             chunks=total_chunks,
         )
 
     logger.info(
         f"Summary: {len(pdf_files)} file(s) found, {skipped} unchanged, "
-        f"{converted} converted, {failed} failed, {total_chunks} chunk(s) stored."
+        f"{deferred} outside the page range, {converted} converted, "
+        f"{failed} failed, {total_chunks} chunk(s) stored."
     )
     logger.info("Build complete.")
     logger.info(f"Database saved to {settings.CHROMADB_PATH}")
@@ -911,6 +1022,8 @@ if __name__ == "__main__":
             "glob (repeatable; '*' also matches '/')."
         ),
     )
+    parser.add_argument("--min-pages", type=int, metavar="N")
+    parser.add_argument("--max-pages", type=int, metavar="N")
 
     args = parser.parse_args()
 
@@ -920,4 +1033,11 @@ if __name__ == "__main__":
         logger.error(f"PDF directory not found: {pdf_dir}")
         sys.exit(1)
 
-    build(pdf_dir, args.reset, args.save_markdown, args.include)
+    build(
+        pdf_dir,
+        args.reset,
+        args.save_markdown,
+        args.include,
+        min_pages=args.min_pages,
+        max_pages=args.max_pages,
+    )

@@ -35,6 +35,13 @@ class Manual(Base):
         default=lambda: datetime.now(UTC),
         onupdate=lambda: datetime.now(UTC),
     )
+    # Set once the manual's chunks have reached ChromaDB. A row exists from the
+    # moment the metadata pass syncs it, long before it is converted, so the
+    # file hash alone cannot tell a finished manual from one an interrupted
+    # build never got to -- see `builder.build`.
+    converted_at: Mapped[Optional[datetime]] = Column(
+        DateTime(timezone=True), nullable=True
+    )
 
     bookmarks: Mapped[List["Bookmark"]] = relationship(
         "Bookmark", back_populates="manual", cascade="all, delete-orphan"

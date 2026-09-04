@@ -56,6 +56,11 @@ STAGE_SCANNING = "scanning"
 STAGE_SCANNED = "scanned"
 STAGE_QUEUED = "queued"
 STAGE_CONVERTING = "converting"
+# Converted, but the parent has not picked the result up yet. The parent
+# collects one finished document at a time while it embeds and writes the
+# previous one, so without this a finished file would look like it was still
+# converting -- and look stuck, since its clock keeps running.
+STAGE_CONVERTED = "converted"
 STAGE_INGESTING = "ingesting"
 STAGE_DONE = "done"
 STAGE_SKIPPED = "skipped"
@@ -67,6 +72,7 @@ STAGE_ORDER = (
     STAGE_SCANNED,
     STAGE_QUEUED,
     STAGE_CONVERTING,
+    STAGE_CONVERTED,
     STAGE_INGESTING,
     STAGE_DONE,
     STAGE_SKIPPED,
@@ -74,7 +80,7 @@ STAGE_ORDER = (
 )
 
 TERMINAL_STAGES = frozenset({STAGE_DONE, STAGE_SKIPPED, STAGE_FAILED})
-ACTIVE_STAGES = frozenset({STAGE_CONVERTING, STAGE_INGESTING})
+ACTIVE_STAGES = frozenset({STAGE_CONVERTING, STAGE_CONVERTED, STAGE_INGESTING})
 
 
 def configure(progress_file: Path | str | None, root: Path | str | None = None) -> None:
@@ -148,6 +154,10 @@ class FileState:
     stage_since: float = 0.0
     size: int | None = None
     pages: int | None = None
+    # Pages that have left the last pipeline stage, for the file being
+    # converted right now. Reset when it enters "converting" so a re-run does
+    # not start from the previous attempt's count.
+    pages_done: int = 0
     chunks: int | None = None
     figures: int | None = None
     worker: int | None = None
@@ -159,6 +169,19 @@ class FileState:
     @property
     def is_terminal(self) -> bool:
         return self.stage in TERMINAL_STAGES
+
+    @property
+    def fraction(self) -> float | None:
+        """How far through the document the conversion is, 0.0-1.0.
+
+        None until there is both a page count (from the scan) and a page
+        report. Clamped, because Docling counts the pages it actually
+        processed and pypdf counts the pages in the file; a malformed page can
+        make them disagree, and a bar past 100% reads as a bug in the build.
+        """
+        if not self.pages or not self.pages_done:
+            return None
+        return min(1.0, self.pages_done / self.pages)
 
     @property
     def is_active(self) -> bool:
@@ -176,10 +199,21 @@ class RunState:
     include: list[str] = field(default_factory=list)
     workers: int | None = None
     reset: bool = False
+    min_pages: int | None = None
+    max_pages: int | None = None
     total: int = 0
     files: dict[str, FileState] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def page_range(self) -> str:
+        """The run's --min-pages/--max-pages as a label, empty when unbounded."""
+        if self.min_pages is None and self.max_pages is None:
+            return ""
+        low = f"{self.min_pages:,}" if self.min_pages is not None else ""
+        high = f"{self.max_pages:,}" if self.max_pages is not None else ""
+        return f"{low}-{high}"
 
     def ordered(self) -> list[FileState]:
         """Files in discovery order (largest first, as the builder submits)."""
@@ -192,7 +226,18 @@ class RunState:
         return counts
 
     def pages_done(self) -> int:
-        return sum(f.pages or 0 for f in self.files.values() if f.stage == STAGE_DONE)
+        """Pages converted so far, counting partial progress on files in flight.
+
+        Without the in-flight part the bar sits still for the length of a
+        2900-page manual, which is exactly when someone is watching it.
+        """
+        total = 0
+        for state in self.files.values():
+            if state.stage in (STAGE_DONE, STAGE_CONVERTED, STAGE_INGESTING):
+                total += state.pages or 0
+            elif state.stage == STAGE_CONVERTING:
+                total += min(state.pages_done, state.pages or state.pages_done)
+        return total
 
     def pages_total(self) -> int:
         """Pages of everything still expected to convert, plus what is done.
@@ -233,6 +278,8 @@ def apply_event(run: RunState, event: dict[str, Any]) -> RunState:
         run.workers = event.get("workers")
         run.reset = bool(event.get("reset"))
         run.total = event.get("total") or 0
+        run.min_pages = event.get("min_pages")
+        run.max_pages = event.get("max_pages")
         return run
 
     if kind == "run_end":
@@ -242,7 +289,7 @@ def apply_event(run: RunState, event: dict[str, Any]) -> RunState:
         }
         return run
 
-    if kind not in ("discovered", "stage"):
+    if kind not in ("discovered", "stage", "page"):
         return run
     path = event.get("path")
     if not isinstance(path, str):
@@ -253,10 +300,19 @@ def apply_event(run: RunState, event: dict[str, Any]) -> RunState:
         state.size = event.get("size", state.size)
         return run
 
+    if kind == "page":
+        done = event.get("pages_done")
+        if isinstance(done, int):
+            # Page events can be reordered against each other by three
+            # processes appending at once; only ever move forward.
+            state.pages_done = max(state.pages_done, done)
+        return run
+
     stage = event.get("stage")
     if stage:
         if stage == STAGE_CONVERTING:
             state.convert_started = ts
+            state.pages_done = 0
         if stage in TERMINAL_STAGES:
             state.finished_at = ts
         state.stage = stage

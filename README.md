@@ -120,7 +120,8 @@ The `builder` extra pulls in Docling, `sentence-transformers`, and PyTorch's CUD
 Then run the builder:
 
 ```sh
-uv run db_manager build --pdf_dir ./data/pdfs [--reset] [--save-markdown] [--include GLOB]
+uv run db_manager build --pdf_dir ./data/pdfs \
+    [--reset] [--save-markdown] [--include GLOB] [--min-pages N] [--max-pages N]
 ```
 
 `--include` converts only the PDFs whose path *relative to `--pdf_dir`* matches
@@ -159,8 +160,13 @@ uv run db_manager watch
 ```
 
 The display lists every file in the run with the stage it is in — `scanning`,
-`queued`, `converting`, `ingesting`, `done`, `skipped` or `failed` — the page
-count, how long it has been there, and the chunks and figures it produced.
+`queued`, `converting`, `converted`, `ingesting`, `done`, `skipped` or
+`failed` — the page count, how long it has been there, and the chunks and
+figures it produced. A document being converted carries its own progress bar,
+fed by pages leaving the last pipeline stage, so a 2900-page manual visibly
+moves rather than sitting on `converting` for forty minutes. (`converted`
+means the conversion finished and the parent has not collected the result yet;
+it collects one at a time while embedding the previous one.)
 Above the list are the per-stage totals, progress measured in pages rather
 than files (files differ by two orders of magnitude in length), the observed
 pages/min and an ETA. A failed file carries its error on its own row.
@@ -192,7 +198,7 @@ The pipeline's concurrency and device placement are tuned through environment va
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `METADATA_WORKERS` | `max(1, cpu_count // 2)` | Processes used for the fast hashing/bookmark pass. 1 or less runs it inline. |
-| `DOCLING_WORKERS` | `1` | Number of Docling converter processes, each with its own copy of the models in VRAM. The main knob for GPU utilization. Host RAM usually binds before VRAM: a worker peaks at roughly 2.6 GB + 1.9 MB per page of the document it is converting + `DOCLING_QUEUE_MAX_SIZE`-bounded working memory, so size it against your longest manual (measured: 8.3 GB for a 2252-page one, i.e. 3 workers in 31 GB). |
+| `DOCLING_WORKERS` | `1` | Number of Docling converter processes, each with its own copy of the models in VRAM. The main knob for GPU utilization, and the one that will run you out of memory — see [Sizing the workers](#sizing-the-workers) below. |
 | `DOCLING_NUM_THREADS` | CPU count | Total CPU-thread budget for Docling, split evenly across `DOCLING_WORKERS`. |
 | `DOCLING_QUEUE_MAX_SIZE` | `16` | Pages allowed to queue in front of each pipeline stage. A queued page holds its rendered image, so this — not the page count — sets peak memory per worker (600-page manual: `100` → 8.2 GB, `16` → 5.0 GB, same output, same wall time). |
 | `DOCLING_DEVICE` | `auto` | Accelerator for Docling's layout/table/OCR models (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`). |
@@ -205,6 +211,62 @@ The pipeline's concurrency and device placement are tuned through environment va
 OCR only runs on layout regions without a PDF text layer (scanned pages, text
 inside images) — text-based PDFs are read from their text layer, so the OCR
 backend/language choice doesn't affect them.
+
+### Sizing the workers
+
+Both host RAM and VRAM bind, and **what sets the peak is the length and the
+table density of the single document a worker happens to be holding**, not the
+size of the corpus. A worker accumulates per-page structures for the whole
+document it is converting and only releases them when it finishes, so a long
+manual is a long, rising ramp.
+
+Measured on an L4 host (31 GB RAM, 23 GB VRAM) at `DOCLING_QUEUE_MAX_SIZE=16`:
+
+| Document | Peak RSS | Per page |
+| --- | --- | --- |
+| 2252 pages, moderate tables | 8.3 GB | 1.9 MB |
+| 2900 pages, table-dense | 16.7 GB *(still climbing)* | ≥ 4.9 MB |
+
+So per-page retention varies by **more than 2.5x with content**, and a formula
+fitted to one document will not hold for another. Budget with the pessimistic
+figure:
+
+    per worker ≈ 4 GB  (models, CUDA context, allocator floor, pages in flight)
+               + 4.5 MB x pages of the longest document that worker may hold
+
+VRAM is the second ceiling and it is easy to miss, because the *builder's own
+embedding model shares the GPU with the workers*. Three workers were measured
+holding 7.2 + 6.9 + 5.3 = 19.4 GB of 22 GB, at which point the parent process
+could not allocate 542 MB to embed a finished document and the ingest failed
+with `torch.OutOfMemoryError` — the conversion had gone fine.
+
+Because peak is per document, one pass sized for the longest manual wastes the
+machine on all the others. `--min-pages` / `--max-pages` split the corpus by
+document length so each pass can use the concurrency it can actually afford:
+
+```sh
+# the handful of giants, one at a time
+DOCLING_WORKERS=1 uv run db_manager build --pdf_dir ./data/pdfs --min-pages 1800
+# the long tail, in parallel
+DOCLING_WORKERS=3 uv run db_manager build --pdf_dir ./data/pdfs --max-pages 999
+```
+
+Builds are resumable, so passes accumulate into one database (see below) and a
+run that dies can simply be run again.
+
+### Resuming an interrupted build
+
+A manual's row in SQLite is written by the fast metadata pass, before anything
+is converted. A build therefore cannot decide what to skip from the file hash
+alone: the hash of a document an interrupted build never reached matches
+perfectly. Each manual instead carries a `converted_at` stamp, set only once
+its chunks are in ChromaDB, and a re-run skips a file only when the hash
+matches **and** that stamp is present.
+
+So a build that dies at file 200 of 369 — out of memory, a killed worker, a
+disconnected session — is resumed by re-running the same command without
+`--reset`. The 199 finished manuals are skipped and the rest are converted.
+Re-running is also how you retry the failures from a previous pass.
 
 ### 🖼️ Figures
 
