@@ -148,6 +148,37 @@ would have produced.
 
 The build pipeline is designed to keep the GPU busy instead of processing one PDF at a time. The main process scans the PDF directory (largest files first), runs a fast metadata pass (hashing + bookmark extraction), and syncs the results to SQLite. It then submits each new or changed PDF to a pool of Docling worker processes for conversion; as each conversion finishes, the main process chunks the text, computes embeddings on the GPU, and writes the result into ChromaDB, so embedding of one file overlaps with Docling converting the next ones. Files whose SHA256 hash hasn't changed are skipped entirely, and rebuilding a manual first removes its old chunks from ChromaDB before adding the new ones.
 
+### 🎛️ Rationing the GPU
+
+The Docling workers and the builder's own embedding model share one device,
+and neither yields to the other. On a 23 GB L4 with three workers that is
+about 17 GB of converting plus 5 GB of embedding, and the collision showed up
+three separate ways in one afternoon:
+
+- `torch.OutOfMemoryError` in the parent, unable to allocate 192 MB to embed a
+  finished document — the document was lost and re-converted from scratch;
+- RapidOCR's ONNX arena unable to allocate 142 MB, which does **not** fail the
+  document: the page's OCR is simply dropped, the conversion is recorded as a
+  success, and nothing afterwards can tell you which pages are missing;
+- earlier, before `EMBEDDING_TOKEN_BUDGET`, the embedder alone asking for
+  16 GB.
+
+`DOCLING_GPU_SLOTS` puts a semaphore in front of the device, shared by the
+worker processes and the parent. A slot is held for one conversion or one
+embedding call, so a finished document's embedding simply costs a converting
+worker until it is done, and the peak becomes a number you set rather than
+whatever happens to overlap.
+
+The slot is deliberately coarse — a whole conversion, not an allocation — and
+the parent can therefore wait minutes for one. That is the trade: the
+alternative is a lock around every allocation inside Docling and torch, which
+neither library offers.
+
+Sizing it against `DOCLING_WORKERS`: leaving them equal means the embedder
+displaces a worker whenever it runs, which is the intended behaviour. Setting
+slots *below* the worker count reserves headroom permanently; setting it
+above lets everything race again.
+
 ### 👀 Watching a build
 
 A build spreads its work over three process pools, so nothing on the console
@@ -200,6 +231,7 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `METADATA_WORKERS` | `max(1, cpu_count // 2)` | Processes used for the fast hashing/bookmark pass. 1 or less runs it inline. |
 | `DOCLING_WORKERS` | `1` | Number of Docling converter processes, each with its own copy of the models in VRAM. The main knob for GPU utilization, and the one that will run you out of memory — see [Sizing the workers](#sizing-the-workers) below. |
 | `DOCLING_NUM_THREADS` | CPU count | Total CPU-thread budget for Docling, split evenly across `DOCLING_WORKERS`. |
+| `DOCLING_GPU_SLOTS` | `3` | How many things may use the GPU at once. Docling workers and the builder's own embedding model share one device and neither yields, so this rations it: embedding a finished document costs one converting worker until it is done. `0` removes the limit. |
 | `DOCLING_SPLIT_PAGES` | `250` | Pages per conversion unit. A longer document is converted as several page ranges in parallel and merged, which makes a worker's peak memory a function of this number instead of the longest document in the corpus. `0` converts every document whole. |
 | `DOCLING_QUEUE_MAX_SIZE` | `16` | Pages allowed to queue in front of each pipeline stage. A queued page holds its rendered image, so this — not the page count — sets peak memory per worker (600-page manual: `100` → 8.2 GB, `16` → 5.0 GB, same output, same wall time). |
 | `DOCLING_DEVICE` | `auto` | Accelerator for Docling's layout/table/OCR models (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`). |

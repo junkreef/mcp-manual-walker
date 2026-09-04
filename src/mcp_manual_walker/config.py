@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     # converted whole, 286 s / 3.94 GB peak worker as 250-page parts across 3
     # workers, with byte-identical output. 0 disables splitting.
     DOCLING_SPLIT_PAGES: int = 250
+    # How many things may use the GPU at once. Docling workers and the
+    # builder's own embedding model share one device and neither yields to the
+    # other, so on a 23 GB L4 three converting workers (17 GB) plus an
+    # embedding batch (5 GB) is 22 GB and something fails -- observed three
+    # different ways in one afternoon: the embedder unable to allocate 192 MB,
+    # RapidOCR's arena unable to allocate 142 MB, and a document lost outright.
+    # A slot is held for the length of one conversion or one embedding call, so
+    # embedding a finished document simply costs one converting worker until it
+    # is done. 0 disables the limit and lets everything race as before.
+    DOCLING_GPU_SLOTS: int = 3
     # Render scale for the figure crops persisted to SQLite (1.0 = 72 dpi,
     # 2.0 = 144 dpi). Higher values give sharper PNGs and a bigger database.
     DOCLING_IMAGES_SCALE: float = 2.0

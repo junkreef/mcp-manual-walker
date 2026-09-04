@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import ctypes
 import fnmatch
 import io
@@ -9,6 +10,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 import uuid
 import warnings
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
@@ -328,6 +330,34 @@ def _create_converter(num_threads: int):
 # error next to the conversion itself (~17k events for a 172k-page corpus).
 _PAGE_REPORT_STEP = 10
 
+# Shared with the worker processes through the pool initializer, and held by
+# the parent while it embeds. None means "no limit".
+_gpu_slot = None
+
+
+@contextlib.contextmanager
+def gpu_slot(what: str):
+    """Holds one of the GPU slots for the duration of the block.
+
+    The Docling workers and the embedding model share one device and neither
+    yields to the other, so without this they simply race to exhaust it. The
+    slot is coarse on purpose: it is held for a whole conversion or a whole
+    embedding call, which is long, but the alternative is a lock around every
+    allocation, and there is no way to reach inside Docling or torch for that.
+    """
+    if _gpu_slot is None:
+        yield
+        return
+    waited = time.monotonic()
+    _gpu_slot.acquire()
+    delay = time.monotonic() - waited
+    if delay > 1.0:
+        logger.info(f"Waited {delay:.0f}s for a GPU slot before {what}.")
+    try:
+        yield
+    finally:
+        _gpu_slot.release()
+
 # The document this worker process is converting. A worker converts one at a
 # time, so a module global is the whole state that is needed -- but the page
 # callback runs on the pipeline's assemble thread, hence the lock.
@@ -471,9 +501,10 @@ def plan_parts(page_count: int, split_pages: int) -> list[tuple[int, int]]:
     return ranges
 
 
-def _init_docling_worker(num_threads: int):
+def _init_docling_worker(num_threads: int, gpu_slot=None):
     """Process pool initializer: loads the Docling models once per worker."""
-    global _converter
+    global _converter, _gpu_slot
+    _gpu_slot = gpu_slot
     logger.info(f"[Docling-{os.getpid()}] Initializing converter...")
     _converter = _create_converter(num_threads)
     if settings.PICTURE_DESCRIPTION_URL:
@@ -630,7 +661,8 @@ def _convert_part_task(
     _begin_document(progress.relative_path(pdf_path), part=start_page)
     try:
         kwargs = {"page_range": page_range} if page_range else {}
-        result = _converter.convert(str(pdf_path), **kwargs)
+        with gpu_slot(f"converting {label}"):
+            result = _converter.convert(str(pdf_path), **kwargs)
     finally:
         _end_document()
     doc = result.document
@@ -823,7 +855,10 @@ def _ingest_document(
         session.commit()
         logger.info(f"Stored {stored_figures} figure(s) in SQLite for {rel_path}")
 
-    embeddings = embedder.embed_documents(documents)
+    # One of the GPU slots, so embedding a finished document costs a
+    # converting worker for its duration instead of colliding with three.
+    with gpu_slot(f"embedding {len(documents)} chunks of {rel_path}"):
+        embeddings = embedder.embed_documents(documents)
 
     for start in range(0, len(ids), CHROMA_ADD_BATCH_SIZE):
         end = start + CHROMA_ADD_BATCH_SIZE
@@ -1119,10 +1154,23 @@ def build(
             f"{threads_per_worker} thread(s) each."
         )
 
+        # Docling workers and this process's embedding model share the GPU.
+        # The slots are what stop them from racing to exhaust it; the parent
+        # takes one to embed, which simply costs a converting worker until the
+        # embedding is done.
+        global _gpu_slot
+        slots = settings.DOCLING_GPU_SLOTS
+        _gpu_slot = mp.get_context("spawn").Semaphore(slots) if slots > 0 else None
+        if _gpu_slot is not None:
+            logger.info(
+                f"Limiting the GPU to {slots} concurrent user(s): "
+                f"{num_workers} Docling worker(s) plus this process's embedder."
+            )
+
         with _make_process_executor(
             num_workers,
             initializer=_init_docling_worker,
-            initargs=(threads_per_worker,),
+            initargs=(threads_per_worker, _gpu_slot),
         ) as executor:
             # A document is submitted as one task per page range. Every part
             # is the same size, so a worker's peak memory follows
