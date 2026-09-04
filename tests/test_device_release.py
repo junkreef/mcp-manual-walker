@@ -137,3 +137,54 @@ def test_a_worker_release_failure_does_not_fail_the_part(monkeypatch):
     )
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
     builder._release_device_cache()  # a converted part is still a converted part
+
+
+def test_a_worker_frees_the_device_before_giving_the_slot_back(monkeypatch):
+    """Ordering, not just occurrence.
+
+    Releasing after the slot is handed back leaves the worker holding its peak
+    while whoever takes the slot starts allocating -- which is the collision
+    the slot exists to prevent, moved a few lines later. It was written that
+    way once and cost a document six hours into a run.
+    """
+    import mcp_manual_walker.builder as builder
+
+    events = []
+
+    class RecordingSemaphore:
+        def acquire(self):
+            events.append("slot acquired")
+
+        def release(self):
+            events.append("slot released")
+
+    monkeypatch.setattr(builder, "_gpu_slot", RecordingSemaphore())
+    monkeypatch.setattr(
+        builder, "_release_device_cache", lambda: events.append("device freed")
+    )
+    monkeypatch.setattr(builder, "_trim_heap", lambda: events.append("heap trimmed"))
+    monkeypatch.setattr(builder, "_extract_figures", lambda doc: [])
+    monkeypatch.setattr(
+        builder,
+        "_converter",
+        SimpleNamespace(
+            convert=lambda path, **kw: SimpleNamespace(
+                document=SimpleNamespace(pictures=[]), pages=[]
+            )
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(builder, "assign_heading_levels", lambda *a, **k: None)
+    monkeypatch.setattr(builder, "_read_outline", lambda p: None)
+
+    from pathlib import Path
+
+    builder._convert_part_task(Path("a.pdf"), "a.pdf", (1, 10), False, 1, 2)
+
+    assert events.index("device freed") < events.index("slot released"), events
+    assert events == [
+        "slot acquired",
+        "device freed",
+        "slot released",
+        "heap trimmed",
+    ]
