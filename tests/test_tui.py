@@ -433,3 +433,61 @@ def test_the_panel_does_not_crowd_out_the_file_list(monitor):
     out = console.export_text()
     assert "GPU slots" in out
     assert "a.pdf" in out  # the file table still has room
+
+
+def test_a_part_boundary_does_not_restart_the_document_clock():
+    """The document column measures the document, not the current part.
+
+    Twelve parts emit twelve "converting" events; a clock keyed on the latest
+    one restarts at every boundary and reads as a document starting over.
+    """
+    run = reduce_events(
+        [
+            stage("a.pdf", STAGE_CONVERTING, ts=100.0, part=1),
+            stage("a.pdf", STAGE_CONVERTED, ts=200.0, part=1),
+            stage("a.pdf", STAGE_CONVERTING, ts=205.0, part=243),
+        ]
+    )
+    assert file_elapsed(run.files["a.pdf"], now=300.0) == 200.0
+
+
+def test_the_clock_keeps_running_through_the_stages_after_conversion():
+    run = reduce_events(
+        [
+            stage("a.pdf", STAGE_CONVERTING, ts=100.0, part=1),
+            stage("a.pdf", STAGE_CONVERTED, ts=250.0, part=1),
+            stage("a.pdf", STAGE_INGESTING, ts=260.0),
+        ]
+    )
+    assert file_elapsed(run.files["a.pdf"], now=300.0) == 200.0
+
+
+def test_a_finished_document_reports_its_total_not_its_last_leg():
+    run = reduce_events(
+        [
+            stage("a.pdf", STAGE_CONVERTING, ts=100.0, part=1),
+            stage("a.pdf", STAGE_INGESTING, ts=280.0),
+            stage("a.pdf", STAGE_DONE, ts=300.0),
+        ]
+    )
+    assert file_elapsed(run.files["a.pdf"], now=9999.0) == 200.0
+
+
+def test_scanning_still_times_the_stage_it_is_in():
+    # Nothing has converted yet, so there is no document clock to use.
+    run = reduce_events([stage("a.pdf", STAGE_SCANNING, ts=100.0)])
+    assert file_elapsed(run.files["a.pdf"], now=130.0) == 30.0
+
+
+def test_slot_rows_still_time_the_part_not_the_document():
+    run = reduce_events(
+        [
+            {"event": "run_start", "ts": 0.0, "gpu_slots": 1},
+            stage("a.pdf", STAGE_CONVERTING, ts=100.0, part=1),
+            slot_event(101, "convert", "a.pdf", part_index=5, part_count=12),
+        ]
+    )
+    (slot,) = run.active_slots()
+    # The slot was taken at 100.0 by the event above, not when the document
+    # started; the panel is per part on purpose.
+    assert slot.since == 100.0
