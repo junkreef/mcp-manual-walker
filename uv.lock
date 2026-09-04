@@ -2081,6 +2081,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pypdf" },
+    { name = "rich" },
     { name = "sentence-transformers" },
     { name = "sqlalchemy" },
 ]
@@ -2135,6 +2136,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "reportlab", marker = "extra == 'dev'" },
+    { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "sentence-transformers", specifier = ">=5.2.0" },
     { name = "sqlalchemy" },

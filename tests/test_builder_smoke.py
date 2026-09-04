@@ -10,8 +10,20 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
-from mcp_manual_walker import database
+from mcp_manual_walker import database, progress
 from mcp_manual_walker.config import settings
+from mcp_manual_walker.progress import (
+    STAGE_CONVERTING,
+    STAGE_DONE,
+    STAGE_FAILED,
+    STAGE_INGESTING,
+    STAGE_QUEUED,
+    STAGE_SCANNED,
+    STAGE_SCANNING,
+    STAGE_SKIPPED,
+    parse_lines,
+    read_progress,
+)
 from mcp_manual_walker.models import Figure, Manual
 
 # Size of the image the fake Docling picture renders.
@@ -362,6 +374,98 @@ def test_extract_figures_skips_pictures_without_image_or_prov(builder_env):
     assert [f["picture_index"] for f in figures] == [2]
     assert no_image.image is None
     assert no_prov.image is None
+
+
+def test_build_records_every_stage_in_the_progress_log(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    """The event log has to describe a whole run, written by three pools."""
+    log = tmp_path / "progress.jsonl"
+    builder_env.builder.build(
+        pdf_dir, reset=True, save_markdown=False, progress_file=log
+    )
+
+    run = read_progress(log)
+    assert run.is_finished
+    assert run.total == 2
+    assert run.summary["converted"] == 2
+    assert run.summary["failed"] == 0
+
+    # Paths are relative to --pdf_dir, i.e. the same identifier the database
+    # stores, so a watcher and the DB agree on what a file is called.
+    assert sorted(run.files) == ["sample.pdf", "subdir/nested.pdf"]
+
+    for state in run.files.values():
+        assert state.stage == STAGE_DONE
+        assert state.pages == 5  # from the mocked pypdf metadata
+        assert state.chunks == 2
+        assert state.convert_started is not None
+        assert state.finished_at is not None
+
+    # Every stage of the pipeline is represented, including the ones written
+    # from inside the worker processes.
+    stages = {
+        e.get("stage")
+        for e in parse_lines(log.read_text().splitlines())
+        if e.get("event") == "stage"
+    }
+    assert {
+        STAGE_SCANNING,
+        STAGE_SCANNED,
+        STAGE_QUEUED,
+        STAGE_CONVERTING,
+        STAGE_INGESTING,
+        STAGE_DONE,
+    } <= stages
+
+
+def test_progress_log_marks_unchanged_files_skipped(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    log = tmp_path / "progress.jsonl"
+    builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+    builder_env.builder.build(pdf_dir, reset=False, progress_file=log)
+
+    # The second build truncates the log, so what is left describes that run.
+    run = read_progress(log)
+    assert run.summary["skipped"] == 2
+    assert all(f.stage == STAGE_SKIPPED for f in run.files.values())
+    assert run.pages_done() == 0
+
+
+def test_progress_log_records_a_failed_conversion(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    log = tmp_path / "progress.jsonl"
+    builder_env.mock_inst.convert.side_effect = RuntimeError("conversion exploded")
+    builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+
+    run = read_progress(log)
+    assert run.summary["failed"] == 2
+    for state in run.files.values():
+        assert state.stage == STAGE_FAILED
+        assert "conversion exploded" in state.error
+
+
+def test_a_build_without_a_progress_file_writes_nothing(
+    pdf_dir, tmp_path, mock_settings, builder_env, monkeypatch
+):
+    monkeypatch.delenv(progress.PROGRESS_FILE_ENV, raising=False)
+    builder_env.builder.build(pdf_dir, reset=True, progress_file=None)
+    assert progress.is_enabled() is False
+
+
+def test_a_run_that_matches_nothing_still_opens_and_closes(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    # Otherwise a watcher on a mistyped --include sits on an empty screen.
+    log = tmp_path / "progress.jsonl"
+    builder_env.builder.build(
+        pdf_dir, reset=False, include=["nothing/*"], progress_file=log
+    )
+    run = read_progress(log)
+    assert run.total == 0
+    assert run.is_finished
 
 
 def test_builder_skips_unchanged(pdf_dir, mock_settings, builder_env):

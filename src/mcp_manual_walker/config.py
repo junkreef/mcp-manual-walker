@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     DB_FILE_PATH: Path = Path("./data/mcp_manual_walker.db")
     CHROMADB_PATH: Path = Path("./data/db/chroma_db")
     MARKDOWN_OUTPUT_DIR: Path = Path("./data/markdown")
+    # Append-only JSONL log of per-file build progress, truncated at the start
+    # of every build and read by `db_manager watch`. Purely observational: the
+    # build never reads it back.
+    BUILD_PROGRESS_FILE: Path = Path("./data/build_progress.jsonl")
     LOG_LEVEL: str = "INFO"
     MAX_PAGES_PER_REQUEST: int = 20
 

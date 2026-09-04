@@ -20,6 +20,7 @@ from mcp_manual_walker.embeddings import (
     get_embedder,
 )
 from mcp_manual_walker.models import Bookmark, Figure, Manual
+from mcp_manual_walker.tui import watch
 
 try:
     import chromadb
@@ -55,11 +56,27 @@ def command_build(args):
         logger.error(f"PDF directory not found: {pdf_dir}")
         sys.exit(1)
 
+    progress_file = None if args.no_progress else Path(args.progress_file)
     if args.include:
         logger.info(f"Starting build from {pdf_dir} (include={args.include})...")
     else:
         logger.info(f"Starting build from {pdf_dir}...")
-    build(pdf_dir, args.reset, args.save_markdown, args.include)
+    if progress_file:
+        logger.info(
+            f"Progress: uv run db_manager watch --progress-file {progress_file}"
+        )
+    build(pdf_dir, args.reset, args.save_markdown, args.include, progress_file)
+
+
+def command_watch(args):
+    """Watch a build's progress file."""
+    sys.exit(
+        watch(
+            Path(args.progress_file),
+            once=args.once,
+            exit_when_finished=args.exit_when_finished,
+        )
+    )
 
 
 def command_list(args):
@@ -595,7 +612,44 @@ def main():
             "so stored paths stay consistent across subset builds."
         ),
     )
+    parser_build.add_argument(
+        "--progress-file",
+        type=str,
+        default=str(settings.BUILD_PROGRESS_FILE),
+        help=(
+            "Where to write the per-file progress log that `db_manager watch` "
+            "reads (default: BUILD_PROGRESS_FILE). Truncated at the start of "
+            "every build."
+        ),
+    )
+    parser_build.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Do not write a progress log.",
+    )
     parser_build.set_defaults(func=command_build)
+
+    # Watch Command
+    parser_watch = subparsers.add_parser(
+        "watch", help="Live view of a build's per-file progress"
+    )
+    parser_watch.add_argument(
+        "--progress-file",
+        type=str,
+        default=str(settings.BUILD_PROGRESS_FILE),
+        help="Progress log to read (default: BUILD_PROGRESS_FILE).",
+    )
+    parser_watch.add_argument(
+        "--once",
+        action="store_true",
+        help="Print a single snapshot and exit instead of watching.",
+    )
+    parser_watch.add_argument(
+        "--exit-when-finished",
+        action="store_true",
+        help="Quit on the run's final event rather than waiting for 'q'.",
+    )
+    parser_watch.set_defaults(func=command_watch)
 
     # List Command
     parser_list = subparsers.add_parser("list", help="List registered manuals")

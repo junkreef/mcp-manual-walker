@@ -147,6 +147,46 @@ would have produced.
 
 The build pipeline is designed to keep the GPU busy instead of processing one PDF at a time. The main process scans the PDF directory (largest files first), runs a fast metadata pass (hashing + bookmark extraction), and syncs the results to SQLite. It then submits each new or changed PDF to a pool of Docling worker processes for conversion; as each conversion finishes, the main process chunks the text, computes embeddings on the GPU, and writes the result into ChromaDB, so embedding of one file overlaps with Docling converting the next ones. Files whose SHA256 hash hasn't changed are skipped entirely, and rebuilding a manual first removes its old chunks from ChromaDB before adding the new ones.
 
+### 👀 Watching a build
+
+A build spreads its work over three process pools, so nothing on the console
+tells you where any individual PDF is. Every process therefore appends its
+state changes to a JSONL log (`BUILD_PROGRESS_FILE`, truncated at the start of
+each build), and a second terminal can render it:
+
+```sh
+uv run db_manager watch
+```
+
+The display lists every file in the run with the stage it is in — `scanning`,
+`queued`, `converting`, `ingesting`, `done`, `skipped` or `failed` — the page
+count, how long it has been there, and the chunks and figures it produced.
+Above the list are the per-stage totals, progress measured in pages rather
+than files (files differ by two orders of magnitude in length), the observed
+pages/min and an ETA. A failed file carries its error on its own row.
+
+| Key | |
+| --- | --- |
+| `j` / `k`, `↑` / `↓` | scroll one row |
+| `PgUp` / `PgDn` | scroll one screen |
+| `g` / `G` | jump to the top or the bottom |
+| `f` | follow the files currently being converted (on by default) |
+| `a` | cycle the view: all files → in flight only → everything unfinished |
+| `q` | quit (the build keeps running) |
+
+The monitor only ever reads the log, so it can be started, stopped and
+restarted while the build runs, and reading it after the build has finished
+replays the whole run. `--once` prints a single snapshot instead of taking
+over the terminal — useful from a script, since it exits non-zero if any file
+failed — and `--no-progress` on `build` turns the log off entirely.
+
+Running the build under `tmux` keeps the two apart:
+
+```sh
+tmux new-session -d -s build 'uv run db_manager build --pdf_dir ./data/pdfs --include "zOS/V3R1/*"'
+uv run db_manager watch
+```
+
 The pipeline's concurrency and device placement are tuned through environment variables (see `.env.example`):
 
 | Variable | Default | What it does |

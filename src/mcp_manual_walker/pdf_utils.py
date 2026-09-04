@@ -7,6 +7,8 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 from pypdf.generic import NullObject
 
+from mcp_manual_walker import progress
+
 logger = logging.getLogger(__name__)
 
 
@@ -109,17 +111,28 @@ def extract_pdf_fingerprint(pdf_path: Path) -> Dict[str, Any]:
     instead of the heavy Docling/torch stack that builder.py imports.
 
     It never raises: any failure is reported back through the "error" key.
+
+    The progress events it emits keep the module standard-library-only, so the
+    reason this function lives here still holds.
     """
+    progress.emit_file(pdf_path, progress.STAGE_SCANNING)
     try:
         file_hash = calculate_file_hash(pdf_path)
         metadata = extract_pdf_metadata(pdf_path)
         if not metadata:
+            error = f"Failed to extract metadata from {pdf_path}"
+            progress.emit_file(pdf_path, progress.STAGE_FAILED, error=error)
             return {
                 "pdf_path": pdf_path,
                 "file_hash": None,
                 "metadata": None,
-                "error": f"Failed to extract metadata from {pdf_path}",
+                "error": error,
             }
+        progress.emit_file(
+            pdf_path,
+            progress.STAGE_SCANNED,
+            pages=metadata.get("page_count"),
+        )
         return {
             "pdf_path": pdf_path,
             "file_hash": file_hash,
@@ -127,9 +140,11 @@ def extract_pdf_fingerprint(pdf_path: Path) -> Dict[str, Any]:
             "error": None,
         }
     except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        progress.emit_file(pdf_path, progress.STAGE_FAILED, error=error)
         return {
             "pdf_path": pdf_path,
             "file_hash": None,
             "metadata": None,
-            "error": f"{type(e).__name__}: {e}",
+            "error": error,
         }

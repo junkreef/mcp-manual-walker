@@ -17,6 +17,8 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from mcp_manual_walker import progress
+
 # Suppress warnings from libraries
 warnings.filterwarnings("ignore")
 
@@ -391,6 +393,9 @@ def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
     Conversion errors are left to propagate through the future.
     """
     logger.info(f"[Docling-{os.getpid()}] Converting {pdf_path.name}...")
+    progress.emit_file(
+        pdf_path, progress.STAGE_CONVERTING, worker=os.getpid()
+    )
     result = _converter.convert(str(pdf_path))
     doc = result.document
 
@@ -583,8 +588,22 @@ def build(
     reset: bool,
     save_markdown: bool = False,
     include: list[str] | None = None,
+    progress_file: Path | None = None,
 ):
     check_dependencies()
+
+    # Every process in the run appends to this file; truncate it first so a
+    # monitor sees this build and not the tail of the previous one. Configure
+    # before the pools are created: they inherit the setting through the
+    # environment, which is what survives the "spawn" start method.
+    if progress_file is not None:
+        try:
+            progress_file.parent.mkdir(parents=True, exist_ok=True)
+            progress_file.write_text("", encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"Could not open progress file {progress_file}: {e}")
+            progress_file = None
+    progress.configure(progress_file, pdf_dir)
 
     # Prepare directories
     if reset:
@@ -620,6 +639,14 @@ def build(
             )
         else:
             logger.warning(f"No PDF files found in {pdf_dir}")
+        progress.emit(
+            "run_start",
+            pdf_dir=str(pdf_dir),
+            include=list(include) if include else None,
+            reset=reset,
+            total=0,
+        )
+        progress.emit("run_end", found=0, skipped=0, converted=0, failed=0, chunks=0)
         return
 
     if include:
@@ -629,7 +656,31 @@ def build(
 
     # Sort files by size (descending) to process largest files first (LPT scheduling)
     # This helps balanced load distribution among workers and reduces total make-span
-    pdf_files.sort(key=lambda p: p.stat().st_size, reverse=True)
+    sizes = {}
+    for pdf_path in pdf_files:
+        try:
+            sizes[pdf_path] = pdf_path.stat().st_size
+        except OSError:
+            sizes[pdf_path] = 0
+    pdf_files.sort(key=lambda p: sizes[p], reverse=True)
+
+    progress.emit(
+        "run_start",
+        pdf_dir=str(pdf_dir),
+        include=list(include) if include else None,
+        reset=reset,
+        total=len(pdf_files),
+        workers=max(1, settings.DOCLING_WORKERS),
+        metadata_workers=max(1, settings.METADATA_WORKERS),
+    )
+    # One event per file rather than one list: a line has to stay small enough
+    # for the kernel to append it atomically next to the workers' writes.
+    for pdf_path in pdf_files:
+        progress.emit(
+            "discovered",
+            path=progress.relative_path(pdf_path),
+            size=sizes[pdf_path],
+        )
 
     # Phase 1: hash + pypdf metadata extraction (CPU bound, no GPU involved)
     # The task itself lives in pdf_utils: spawned workers import the module that
@@ -650,6 +701,8 @@ def build(
     stale_manual_ids: list[str] = []
     skipped = 0
     failed = 0
+    converted = 0
+    total_chunks = 0
 
     session = SessionLocal()
     try:
@@ -657,6 +710,9 @@ def build(
             pdf_path = result["pdf_path"]
             if result["error"] or result["metadata"] is None:
                 logger.error(f"Failed to read {pdf_path}: {result['error']}")
+                progress.emit_file(
+                    pdf_path, progress.STAGE_FAILED, error=str(result["error"])
+                )
                 failed += 1
                 continue
 
@@ -670,6 +726,9 @@ def build(
                 )
             except Exception as e:
                 logger.error(f"Failed to sync DB for {pdf_path}: {e}", exc_info=True)
+                progress.emit_file(
+                    pdf_path, progress.STAGE_FAILED, error=f"{type(e).__name__}: {e}"
+                )
                 failed += 1
                 continue
 
@@ -680,9 +739,15 @@ def build(
 
             if not updated and not reset:
                 logger.info(f"File {rel_path_str} unchanged. Skipping.")
+                progress.emit_file(
+                    pdf_path, progress.STAGE_SKIPPED, pages=manual.page_count
+                )
                 skipped += 1
                 continue
 
+            progress.emit_file(
+                pdf_path, progress.STAGE_QUEUED, pages=manual.page_count
+            )
             tasks.append((pdf_path, str(manual.id), rel_path_str))
 
             # A manual that already existed and changed still holds its old
@@ -737,9 +802,6 @@ def build(
             f"{threads_per_worker} thread(s) each."
         )
 
-        converted = 0
-        total_chunks = 0
-
         with _make_process_executor(
             num_workers,
             initializer=_init_docling_worker,
@@ -766,11 +828,19 @@ def build(
                     logger.error(
                         f"Failed to convert {pdf_path}: {e}", exc_info=True
                     )
+                    progress.emit_file(
+                        pdf_path,
+                        progress.STAGE_FAILED,
+                        error=f"{type(e).__name__}: {e}",
+                    )
                     failed += 1
                     continue
 
+                progress.emit_file(
+                    pdf_path, progress.STAGE_INGESTING, figures=len(figures)
+                )
                 try:
-                    total_chunks += _ingest_document(
+                    chunks = _ingest_document(
                         session,
                         collection,
                         embedder,
@@ -780,14 +850,36 @@ def build(
                         doc,
                         figures,
                     )
+                    total_chunks += chunks
+                    progress.emit_file(
+                        pdf_path,
+                        progress.STAGE_DONE,
+                        chunks=chunks,
+                        figures=len(figures),
+                    )
                     converted += 1
                 except Exception as e:
                     logger.error(
                         f"Failed to ingest {pdf_path}: {e}", exc_info=True
                     )
+                    progress.emit_file(
+                        pdf_path,
+                        progress.STAGE_FAILED,
+                        error=f"{type(e).__name__}: {e}",
+                    )
                     failed += 1
     finally:
         session.close()
+        # In the finally so that an early return, a sys.exit() or a broken
+        # worker pool still closes the run out for whoever is watching.
+        progress.emit(
+            "run_end",
+            found=len(pdf_files),
+            skipped=skipped,
+            converted=converted,
+            failed=failed,
+            chunks=total_chunks,
+        )
 
     logger.info(
         f"Summary: {len(pdf_files)} file(s) found, {skipped} unchanged, "
