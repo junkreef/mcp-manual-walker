@@ -1,5 +1,6 @@
 import argparse
 import ctypes
+import fnmatch
 import io
 import logging
 import multiprocessing as mp
@@ -549,7 +550,40 @@ def _ingest_document(
     return len(chunks)
 
 
-def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
+def select_pdf_files(pdf_dir: Path, include: list[str] | None = None) -> list[Path]:
+    """
+    Lists the PDFs under ``pdf_dir``, optionally narrowed by glob patterns.
+
+    Patterns are matched against each file's path relative to ``pdf_dir``, in
+    POSIX form, case-sensitively, and a file is kept when it matches any of
+    them. These are :mod:`fnmatch` patterns, so ``*`` also matches ``/``:
+    ``zOS/V3R1/*`` selects that directory and everything below it.
+
+    Narrowing the scan this way rather than by pointing ``--pdf_dir`` at the
+    subdirectory matters, because ``pdf_dir`` is also the anchor every stored
+    ``relative_path`` is computed from. Keeping the anchor at the corpus root
+    means a subset build writes the same paths a whole-corpus build would, so
+    subsets can be built one at a time and still add up to one consistent
+    database.
+    """
+    pdf_files = sorted(pdf_dir.rglob("*.pdf"))
+    if not include:
+        return pdf_files
+
+    selected = []
+    for pdf_path in pdf_files:
+        rel = pdf_path.relative_to(pdf_dir).as_posix()
+        if any(fnmatch.fnmatchcase(rel, pattern) for pattern in include):
+            selected.append(pdf_path)
+    return selected
+
+
+def build(
+    pdf_dir: Path,
+    reset: bool,
+    save_markdown: bool = False,
+    include: list[str] | None = None,
+):
     check_dependencies()
 
     # Prepare directories
@@ -578,12 +612,20 @@ def build(pdf_dir: Path, reset: bool, save_markdown: bool = False):
     init_db()
 
     # Process PDFs - Recursive scan
-    pdf_files = list(pdf_dir.rglob("*.pdf"))
+    pdf_files = select_pdf_files(pdf_dir, include)
     if not pdf_files:
-        logger.warning(f"No PDF files found in {pdf_dir}")
+        if include:
+            logger.warning(
+                f"No PDF files under {pdf_dir} matched {include}"
+            )
+        else:
+            logger.warning(f"No PDF files found in {pdf_dir}")
         return
 
-    logger.info(f"Found {len(pdf_files)} PDF files.")
+    if include:
+        logger.info(f"Found {len(pdf_files)} PDF file(s) matching {include}.")
+    else:
+        logger.info(f"Found {len(pdf_files)} PDF files.")
 
     # Sort files by size (descending) to process largest files first (LPT scheduling)
     # This helps balanced load distribution among workers and reduces total make-span
@@ -768,6 +810,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--reset", action="store_true", help="Delete output directory before starting."
     )
+    parser.add_argument(
+        "--include",
+        action="append",
+        metavar="GLOB",
+        help=(
+            "Only convert PDFs whose path relative to --pdf_dir matches this "
+            "glob (repeatable; '*' also matches '/')."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -777,4 +828,4 @@ if __name__ == "__main__":
         logger.error(f"PDF directory not found: {pdf_dir}")
         sys.exit(1)
 
-    build(pdf_dir, args.reset, args.save_markdown)
+    build(pdf_dir, args.reset, args.save_markdown, args.include)
