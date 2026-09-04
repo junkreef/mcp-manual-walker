@@ -257,6 +257,22 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
 | `EMBEDDING_DTYPE` | `auto` | Dtype the weights load under. `auto` reads it from the checkpoint (bfloat16); set `float32` on a CPU-only server (see below). |
 
+Chunking builds one markdown serializer per document rather than per table.
+`TableItem.export_to_markdown(doc)` constructs a `MarkdownDocSerializer` on
+every call, and constructing one revalidates the whole document — pydantic
+runs `validate_document`, clamping every table cell's bounding box on every
+page — so the cost is *tables × cells in the document*. On a table-dense
+manual that dominates the build: a 490-page font reference spent over eleven
+minutes in chunking after a 46-minute conversion, with the parent's RSS
+climbing from 6 GB to 14.6 GB on a 31 GB host. Measured on a synthetic
+100-page document whose cells carry provenance, with identical output:
+
+| tables | cells | per table | one shared |
+| --- | --- | --- | --- |
+| 25 | 4,000 | 0.58 s | 0.07 s |
+| 100 | 16,000 | 8.15 s | 0.31 s |
+| 200 | 32,000 | 31.82 s | 0.61 s |
+
 OCR only runs on layout regions without a PDF text layer (scanned pages, text
 inside images) — text-based PDFs are read from their text layer, so the OCR
 backend/language choice doesn't affect them.

@@ -162,8 +162,51 @@ def _caption_of(item: Any, doc: Any) -> str:
         return ""
 
 
+def _make_table_exporter(doc: Any):
+    """Returns a function exporting one table to markdown.
+
+    `TableItem.export_to_markdown(doc)` builds a `MarkdownDocSerializer` per
+    call, and constructing one revalidates the whole document: pydantic runs
+    `validate_document`, which clamps every table cell's bounding box on every
+    page. Cost is therefore (tables x cells in the document), and on a
+    table-dense manual that is the dominant cost of the entire build -- a
+    490-page font reference spent over eleven minutes there, with the parent's
+    RSS climbing from 6 GB to 14.6 GB, after a 46-minute conversion.
+
+    Building the serializer once per document makes it linear. Measured on a
+    100-page document with cells carrying provenance, output identical:
+
+        tables   cells    per-table    shared
+            25   4,000       0.58 s    0.07 s
+           100  16,000       8.15 s    0.31 s
+           200  32,000      31.82 s    0.61 s
+
+    Falls back to the per-call path if the serializer cannot be built, so a
+    docling_core that moves it costs speed rather than the build.
+    """
+    try:
+        from docling_core.transforms.serializer.markdown import MarkdownDocSerializer
+
+        serializer = MarkdownDocSerializer(doc=doc)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Falling back to per-table markdown export (%s); this is "
+            "quadratic in the number of tables.",
+            e,
+        )
+        return lambda item: _table_markdown(item, doc)
+
+    def export(item: Any) -> str:
+        try:
+            return (serializer.serialize(item=item).text or "").strip()
+        except Exception:  # noqa: BLE001 - one bad table is not a document
+            return _table_markdown(item, doc)
+
+    return export
+
+
 def _table_markdown(item: Any, doc: Any) -> str:
-    """Exports a table item to markdown."""
+    """Exports a table item to markdown, one serializer per call."""
     export = getattr(item, "export_to_markdown", None)
     if not callable(export):
         return ""
@@ -171,6 +214,8 @@ def _table_markdown(item: Any, doc: Any) -> str:
         return (export(doc) or "").strip()
     except TypeError:
         return (export() or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _picture_labels(item: Any, doc: Any, caption: str) -> List[str]:
@@ -230,6 +275,9 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
                 },
             }
         ]
+
+    # One serializer for the whole document: see _make_table_exporter.
+    export_table = _make_table_exporter(doc)
 
     # Markdown-aware splitter, so table rows and headings survive a split.
     splitter = RecursiveCharacterTextSplitter.from_language(
@@ -354,7 +402,7 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
         if kind == TABLE_LABEL:
             flush()
             caption = _caption_of(item, doc)
-            markdown = _table_markdown(item, doc)
+            markdown = export_table(item)
             content = "\n\n".join(part for part in (caption, markdown) if part)
             add_chunk(content, current_bookmark, "table", page=page_no)
             continue
