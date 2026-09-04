@@ -200,6 +200,7 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `METADATA_WORKERS` | `max(1, cpu_count // 2)` | Processes used for the fast hashing/bookmark pass. 1 or less runs it inline. |
 | `DOCLING_WORKERS` | `1` | Number of Docling converter processes, each with its own copy of the models in VRAM. The main knob for GPU utilization, and the one that will run you out of memory — see [Sizing the workers](#sizing-the-workers) below. |
 | `DOCLING_NUM_THREADS` | CPU count | Total CPU-thread budget for Docling, split evenly across `DOCLING_WORKERS`. |
+| `DOCLING_SPLIT_PAGES` | `250` | Pages per conversion unit. A longer document is converted as several page ranges in parallel and merged, which makes a worker's peak memory a function of this number instead of the longest document in the corpus. `0` converts every document whole. |
 | `DOCLING_QUEUE_MAX_SIZE` | `16` | Pages allowed to queue in front of each pipeline stage. A queued page holds its rendered image, so this — not the page count — sets peak memory per worker (600-page manual: `100` → 8.2 GB, `16` → 5.0 GB, same output, same wall time). |
 | `DOCLING_DEVICE` | `auto` | Accelerator for Docling's layout/table/OCR models (`auto`, `cpu`, `cuda`, `cuda:N`, `mps`). |
 | `DOCLING_OCR_BACKEND` | `onnxruntime` | RapidOCR inference backend: `onnxruntime` (default; models for `japan`/`chinese`/`en` ship with the rapidocr wheel, works offline, GPU via `onnxruntime-gpu`) or `torch` (downloads checkpoints from modelscope.cn on first use). |
@@ -240,19 +241,23 @@ holding 7.2 + 6.9 + 5.3 = 19.4 GB of 22 GB, at which point the parent process
 could not allocate 542 MB to embed a finished document and the ingest failed
 with `torch.OutOfMemoryError` — the conversion had gone fine.
 
-Because peak is per document, one pass sized for the longest manual wastes the
-machine on all the others. `--min-pages` / `--max-pages` split the corpus by
-document length so each pass can use the concurrency it can actually afford:
+`DOCLING_SPLIT_PAGES` is what stops that variability from deciding the worker
+count. A document longer than it is converted as several page ranges, spread
+across the pool and merged in the parent, so a worker's peak becomes
 
-```sh
-# the handful of giants, one at a time
-DOCLING_WORKERS=1 uv run db_manager build --pdf_dir ./data/pdfs --min-pages 1800
-# the long tail, in parallel
-DOCLING_WORKERS=3 uv run db_manager build --pdf_dir ./data/pdfs --max-pages 999
-```
+    per worker ≈ 4 GB + 4.5 MB x DOCLING_SPLIT_PAGES
 
-Builds are resumable, so passes accumulate into one database (see below) and a
-run that dies can simply be run again.
+— a number you choose, the same for every document in the corpus. It also
+stops one 2900-page manual from occupying a single worker for forty minutes
+while the rest of the GPU idles. Measured on a 1246-page manual, 250-page
+parts across 3 workers: 403 s and 5.93 GB whole against 286 s and a 3.94 GB
+worst worker, with byte-identical output.
+
+Set it to 0 to convert every document whole.
+
+`--min-pages` / `--max-pages` still select part of a corpus by document length,
+which is useful for retrying or for building the long documents separately, but
+they are no longer how you keep a build inside its memory budget.
 
 ### Resuming an interrupted build
 

@@ -154,10 +154,15 @@ class FileState:
     stage_since: float = 0.0
     size: int | None = None
     pages: int | None = None
-    # Pages that have left the last pipeline stage, for the file being
-    # converted right now. Reset when it enters "converting" so a re-run does
+    # Pages that have left the last pipeline stage, keyed by the first page of
+    # the part that reported them. A long document is converted as several
+    # page ranges in parallel, so the reports arrive interleaved and out of
+    # order: keeping them apart and summing is the only way to get a number
+    # that only ever grows. Cleared when the file is queued, so a re-run does
     # not start from the previous attempt's count.
-    pages_done: int = 0
+    part_pages: dict[int, int] = field(default_factory=dict)
+    # Parts still expected, from the "converting" event. None until known.
+    parts: int | None = None
     chunks: int | None = None
     figures: int | None = None
     worker: int | None = None
@@ -169,6 +174,10 @@ class FileState:
     @property
     def is_terminal(self) -> bool:
         return self.stage in TERMINAL_STAGES
+
+    @property
+    def pages_done(self) -> int:
+        return sum(self.part_pages.values())
 
     @property
     def fraction(self) -> float | None:
@@ -303,23 +312,40 @@ def apply_event(run: RunState, event: dict[str, Any]) -> RunState:
     if kind == "page":
         done = event.get("pages_done")
         if isinstance(done, int):
-            # Page events can be reordered against each other by three
-            # processes appending at once; only ever move forward.
-            state.pages_done = max(state.pages_done, done)
+            # Within one part the reports are monotonic, but two processes
+            # appending at once can still interleave them; only move forward.
+            part = event.get("part") or 0
+            state.part_pages[part] = max(state.part_pages.get(part, 0), done)
         return run
 
     stage = event.get("stage")
+    if (
+        stage
+        and state.stage == STAGE_FAILED
+        and stage not in (STAGE_QUEUED, STAGE_SKIPPED)
+    ):
+        # A document is failed by its first bad part, but its other parts keep
+        # running and report back: without this, a later part's "converted"
+        # would quietly promote a failed document back into the pipeline.
+        # Only a fresh attempt -- which starts by queuing it -- clears that.
+        return run
+
     if stage:
         if stage == STAGE_CONVERTING:
-            state.convert_started = ts
-            state.pages_done = 0
+            # Parts start at different times; the first one to report owns the
+            # document's clock, and the later ones must not reset it.
+            if state.convert_started is None:
+                state.convert_started = ts
+        elif stage == STAGE_QUEUED:
+            state.part_pages = {}
+            state.convert_started = None
         if stage in TERMINAL_STAGES:
             state.finished_at = ts
         state.stage = stage
         if isinstance(ts, (int, float)):
             state.stage_since = ts
 
-    for key in ("pages", "chunks", "figures", "worker", "size"):
+    for key in ("pages", "chunks", "figures", "worker", "size", "parts"):
         if event.get(key) is not None:
             setattr(state, key, event[key])
     # An error belongs to the transition that reported it; a later successful

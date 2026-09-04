@@ -344,15 +344,61 @@ def test_page_counts_only_move_forward():
 
 
 def test_a_reconversion_restarts_the_page_count():
+    # Queuing is what starts a document over, not converting: a long document
+    # is converted as several parts, each of which emits its own "converting",
+    # and those must not wipe the progress of the parts already running.
     run = reduce_events(
         [
             make("stage", path="a.pdf", stage=STAGE_CONVERTING),
             make("page", path="a.pdf", pages_done=90),
             make("stage", path="a.pdf", stage=STAGE_FAILED, error="died"),
+            make("stage", path="a.pdf", stage=STAGE_QUEUED),
             make("stage", path="a.pdf", stage=STAGE_CONVERTING),
         ]
     )
     assert run.files["a.pdf"].pages_done == 0
+
+
+def test_a_second_part_does_not_reset_the_first_ones_progress():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=1, ts=10.0),
+            make("page", path="a.pdf", part=1, pages_done=90),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=251, ts=20.0),
+            make("page", path="a.pdf", part=251, pages_done=40),
+        ]
+    )
+    state = run.files["a.pdf"]
+    assert state.pages_done == 130
+    # The document's clock belongs to whichever part started first.
+    assert state.convert_started == 10.0
+
+
+def test_parts_are_summed_not_maximised():
+    # Taking a maximum would report a 12-part document as barely started for as
+    # long as the last part lags, and jump when it catches up.
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_SCANNED, pages=1200),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=1),
+            make("page", path="a.pdf", part=1, pages_done=300),
+            make("page", path="a.pdf", part=301, pages_done=300),
+            make("page", path="a.pdf", part=601, pages_done=200),
+        ]
+    )
+    assert run.files["a.pdf"].pages_done == 800
+    assert run.files["a.pdf"].fraction == pytest.approx(800 / 1200)
+
+
+def test_an_out_of_order_report_within_a_part_is_ignored():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=1),
+            make("page", path="a.pdf", part=1, pages_done=90),
+            make("page", path="a.pdf", part=1, pages_done=30),
+        ]
+    )
+    assert run.files["a.pdf"].pages_done == 90
 
 
 def test_fraction_is_unknown_until_both_numbers_exist():
@@ -428,3 +474,31 @@ def test_page_range_label():
     assert (
         reduce_events([make("run_start", min_pages=1, max_pages=2)]).page_range == "1-2"
     )
+
+
+def test_a_failed_document_is_not_revived_by_its_other_parts():
+    # The parts of a split document keep running after one of them fails, and
+    # they report back. A document that failed must stay failed.
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=1),
+            make("stage", path="a.pdf", stage=STAGE_FAILED, error="part exploded"),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=251),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=501),
+        ]
+    )
+    assert run.files["a.pdf"].stage == STAGE_FAILED
+    assert run.files["a.pdf"].error == "part exploded"
+
+
+def test_requeuing_clears_a_failure():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_FAILED, error="boom"),
+            make("stage", path="a.pdf", stage=STAGE_QUEUED),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING),
+            make("stage", path="a.pdf", stage=STAGE_DONE, chunks=5),
+        ]
+    )
+    assert run.files["a.pdf"].stage == STAGE_DONE
+    assert run.files["a.pdf"].error is None
