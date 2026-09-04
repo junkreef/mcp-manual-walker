@@ -883,7 +883,12 @@ def _ingest_document(
         path=str(rel_path),
         chunks=len(documents),
     ):
-        embeddings = embedder.embed_documents(documents)
+        # Both the move and the release happen inside the slot. A slot handed
+        # back while the embedder still holds the device frees the right to
+        # run but not the memory to run in, and releasing after the slot is
+        # gone would race the worker that took it.
+        with embedder.on_device():
+            embeddings = embedder.embed_documents(documents)
 
     for start in range(0, len(ids), CHROMA_ADD_BATCH_SIZE):
         end = start + CHROMA_ADD_BATCH_SIZE

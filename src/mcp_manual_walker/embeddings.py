@@ -1,3 +1,4 @@
+import contextlib
 import logging
 from typing import Any, Optional
 
@@ -66,6 +67,10 @@ class SentenceTransformerEmbedder:
         self._model_name = model_name
         self._batch_size = batch_size
         self._token_budget = token_budget
+        self._device = device
+        # "auto" has already been resolved by the caller; anything that is not
+        # plain CPU is worth moving off the device between uses.
+        self._is_accelerated = not str(device).startswith("cpu")
 
         # The dtype is always stated rather than left to the library default:
         # transformers 4.x resolved an unset dtype to float32 and 5.x resolves
@@ -188,6 +193,48 @@ class SentenceTransformerEmbedder:
             for index, vector in zip(batch, vectors.tolist()):
                 results[index] = vector
         return results  # type: ignore[return-value]
+
+    def _empty_cache(self) -> None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:  # noqa: BLE001 - releasing is best effort
+            logger.debug("Could not empty the device cache: %s", e)
+
+    @contextlib.contextmanager
+    def on_device(self):
+        """Puts the model on the accelerator for the block, and takes it off.
+
+        Two things keep a GPU occupied by an idle embedder, and both have to
+        go. Torch's caching allocator holds the activation peak it reached in
+        its own pool, and the weights themselves stay resident: measured in
+        the builder's parent at 5114 MB long after its last batch, against
+        1346 MB before its first, of which about 1.2 GB is the weights.
+
+        On a GPU shared with the Docling workers that is not a cache, it is a
+        reservation -- the worker that takes the freed slot finds the device
+        still full. Moving the weights back and forth costs a fraction of a
+        second against conversions measured in minutes.
+
+        A CPU embedder has nothing to move, so this is a no-op there.
+        """
+        if not self._is_accelerated:
+            yield
+            return
+        try:
+            self.model.to(self._device)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not move the embedder to %s: %s", self._device, e)
+        try:
+            yield
+        finally:
+            try:
+                self.model.to("cpu")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Could not move the embedder off the device: %s", e)
+            self._empty_cache()
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embeds passages for storage (no instruction prefix)."""
