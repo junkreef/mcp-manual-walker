@@ -502,3 +502,106 @@ def test_requeuing_clears_a_failure():
     )
     assert run.files["a.pdf"].stage == STAGE_DONE
     assert run.files["a.pdf"].error is None
+
+
+# -- a document is converted only when all of its parts are -------------------
+
+
+def parted(n_parts, converted_parts, pages=1200):
+    events = [
+        make("stage", path="a.pdf", stage=STAGE_SCANNED, pages=pages),
+        make("stage", path="a.pdf", stage=STAGE_QUEUED, parts=n_parts),
+    ]
+    starts = [1 + i * (pages // n_parts) for i in range(n_parts)]
+    for start in starts:
+        events.append(make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=start))
+    for start in starts[:converted_parts]:
+        events.append(make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=start))
+    return reduce_events(events).files["a.pdf"]
+
+
+def test_one_finished_part_does_not_convert_the_document():
+    # The regression: pages_done() credits a converted document with all of its
+    # pages, so a premature flag reported a 2900-page manual as finished while
+    # eleven of its twelve parts were still running -- and made the throughput
+    # figure derived from it about twelve times too high.
+    state = parted(12, 1)
+    assert state.stage == STAGE_CONVERTING
+
+
+def test_the_document_converts_when_the_last_part_lands():
+    assert parted(12, 11).stage == STAGE_CONVERTING
+    assert parted(12, 12).stage == STAGE_CONVERTED
+
+
+def test_a_single_part_document_converts_on_its_only_part():
+    assert parted(1, 1).stage == STAGE_CONVERTED
+
+
+def test_a_repeated_part_report_does_not_count_twice():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_QUEUED, parts=3),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=1),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=1),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=1),
+        ]
+    )
+    assert run.files["a.pdf"].stage != STAGE_CONVERTED
+
+
+def test_pages_are_not_credited_in_full_until_every_part_is_in():
+    # What the broken stage actually cost: the page total, and every rate
+    # computed from it.
+    assert parted(12, 1, pages=2900).pages_done == 0
+    assert parted(12, 12, pages=2900).stage == STAGE_CONVERTED
+
+
+def test_an_unknown_part_count_does_not_block_the_document():
+    # A log that starts mid-run has no "queued" event, so parts is None. Better
+    # to flag the document early than to leave it converting forever.
+    run = reduce_events([make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=1)])
+    assert run.files["a.pdf"].stage == STAGE_CONVERTED
+
+
+def test_requeuing_forgets_which_parts_had_converted():
+    # Without clearing the set, the retry would inherit the previous attempt's
+    # converted parts and flag the document on its first part.
+    attempt = [
+        make("stage", path="a.pdf", stage=STAGE_QUEUED, parts=2),
+        make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=1),
+        make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=1),
+        make("stage", path="a.pdf", stage=STAGE_FAILED, error="other part died"),
+    ]
+    retry = [
+        make("stage", path="a.pdf", stage=STAGE_QUEUED, parts=2),
+        make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=1),
+        make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=1),
+    ]
+    state = reduce_events(attempt + retry).files["a.pdf"]
+    assert state.stage == STAGE_CONVERTING
+    assert state.parts_converted == {1}
+
+    # Only the second part of the retry finishes it.
+    state = reduce_events(
+        attempt
+        + retry
+        + [
+            make("stage", path="a.pdf", stage=STAGE_CONVERTING, part=601),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=601),
+        ]
+    ).files["a.pdf"]
+    assert state.stage == STAGE_CONVERTED
+
+
+def test_a_failed_document_still_ignores_its_remaining_parts():
+    run = reduce_events(
+        [
+            make("stage", path="a.pdf", stage=STAGE_QUEUED, parts=3),
+            make("stage", path="a.pdf", stage=STAGE_FAILED, error="boom"),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=1),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=251),
+            make("stage", path="a.pdf", stage=STAGE_CONVERTED, part=501),
+        ]
+    )
+    assert run.files["a.pdf"].stage == STAGE_FAILED
