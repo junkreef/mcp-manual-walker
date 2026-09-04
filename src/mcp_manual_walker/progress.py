@@ -79,6 +79,9 @@ STAGE_ORDER = (
     STAGE_FAILED,
 )
 
+ROLE_CONVERT = "convert"
+ROLE_EMBED = "embed"
+
 TERMINAL_STAGES = frozenset({STAGE_DONE, STAGE_SKIPPED, STAGE_FAILED})
 ACTIVE_STAGES = frozenset({STAGE_CONVERTING, STAGE_CONVERTED, STAGE_INGESTING})
 
@@ -202,6 +205,31 @@ class FileState:
 
 
 @dataclass
+class SlotState:
+    """One GPU slot, and what is holding it.
+
+    The build lets a fixed number of things touch the GPU at once: the Docling
+    workers converting page ranges, and the parent embedding a finished
+    document. This is that set, so the monitor can show the semaphore's state
+    rather than leaving it to be inferred from which documents happen to be
+    moving.
+    """
+
+    owner: int  # the pid holding it
+    role: str  # "convert" or "embed"
+    path: str
+    since: float = 0.0
+    part_index: int | None = None
+    part_count: int | None = None
+    pages: int | None = None
+    chunks: int | None = None
+
+    @property
+    def is_embedding(self) -> bool:
+        return self.role == ROLE_EMBED
+
+
+@dataclass
 class RunState:
     """The whole run, as reconstructed from the event log."""
 
@@ -217,7 +245,45 @@ class RunState:
     total: int = 0
     files: dict[str, FileState] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
+    # Keyed by the pid holding the slot. A worker that dies without releasing
+    # would linger here, which is exactly what one wants to see.
+    slots: dict[int, SlotState] = field(default_factory=dict)
+    gpu_slots: int | None = None
     summary: dict[str, Any] = field(default_factory=dict)
+
+    def active_slots(self) -> list[SlotState]:
+        """What is holding the GPU, newest last.
+
+        Falls back to reconstructing conversions from the per-file stages when
+        the log predates the slot events, so a monitor attached to a running
+        build still shows something rather than an empty panel.
+        """
+        if self.slots:
+            return sorted(self.slots.values(), key=lambda s: s.since)
+
+        reconstructed: list[SlotState] = []
+        for state in self.files.values():
+            if state.stage == STAGE_CONVERTING and state.worker:
+                reconstructed.append(
+                    SlotState(
+                        owner=state.worker,
+                        role=ROLE_CONVERT,
+                        path=state.path,
+                        since=state.stage_since,
+                        part_count=state.parts,
+                    )
+                )
+            elif state.stage == STAGE_INGESTING:
+                reconstructed.append(
+                    SlotState(
+                        owner=0,
+                        role=ROLE_EMBED,
+                        path=state.path,
+                        since=state.stage_since,
+                        chunks=state.chunks,
+                    )
+                )
+        return sorted(reconstructed, key=lambda s: s.since)
 
     @property
     def page_range(self) -> str:
@@ -293,6 +359,8 @@ def apply_event(run: RunState, event: dict[str, Any]) -> RunState:
         run.total = event.get("total") or 0
         run.min_pages = event.get("min_pages")
         run.max_pages = event.get("max_pages")
+        run.gpu_slots = event.get("gpu_slots")
+        run.slots = {}
         return run
 
     if kind == "run_end":
@@ -300,6 +368,25 @@ def apply_event(run: RunState, event: dict[str, Any]) -> RunState:
         run.summary = {
             key: value for key, value in event.items() if key not in ("ts", "event")
         }
+        return run
+
+    if kind == "slot":
+        owner = event.get("owner")
+        if not isinstance(owner, int):
+            return run
+        if event.get("state") == "end":
+            run.slots.pop(owner, None)
+            return run
+        run.slots[owner] = SlotState(
+            owner=owner,
+            role=event.get("role") or ROLE_CONVERT,
+            path=event.get("path") or "",
+            since=ts if isinstance(ts, (int, float)) else 0.0,
+            part_index=event.get("part_index"),
+            part_count=event.get("part_count"),
+            pages=event.get("pages"),
+            chunks=event.get("chunks"),
+        )
         return run
 
     if kind not in ("discovered", "stage", "page"):

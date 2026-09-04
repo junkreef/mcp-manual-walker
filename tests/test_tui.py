@@ -341,3 +341,95 @@ def test_the_header_names_the_page_range_of_the_pass(monitor):
     console = Console(width=140, height=20, record=True)
     console.print(monitor.render(height=20))
     assert "1,800-" in console.export_text()
+
+
+# -- the GPU slot panel -------------------------------------------------------
+
+
+def slot_event(owner, role, path, **fields):
+    return {
+        "event": "slot",
+        "ts": 100.0,
+        "owner": owner,
+        "role": role,
+        "path": path,
+        "state": "start",
+        **fields,
+    }
+
+
+def test_the_panel_shows_what_holds_each_slot():
+    run = reduce_events(
+        [
+            {"event": "run_start", "ts": 0.0, "gpu_slots": 3, "workers": 3},
+            slot_event(101, "convert", "a.pdf", part_index=2, part_count=12, pages=242),
+            slot_event(102, "embed", "b.pdf", chunks=10994),
+        ]
+    )
+    monitor = BuildMonitor(run, "p.jsonl")
+    console = Console(width=140, height=30, record=True)
+    console.print(monitor.render(height=30))
+    out = console.export_text()
+    assert "part 2/12" in out
+    assert "242p" in out
+    assert "10,994 chunks" in out
+    assert "a.pdf" in out and "b.pdf" in out
+
+
+def test_an_unheld_slot_is_drawn_as_idle():
+    run = reduce_events(
+        [
+            {"event": "run_start", "ts": 0.0, "gpu_slots": 3},
+            slot_event(101, "convert", "a.pdf", part_index=1, part_count=1),
+        ]
+    )
+    console = Console(width=140, height=30, record=True)
+    console.print(BuildMonitor(run, "p.jsonl").render(height=30))
+    assert console.export_text().count("idle") == 2
+
+
+def test_releasing_a_slot_empties_it():
+    run = reduce_events(
+        [
+            {"event": "run_start", "ts": 0.0, "gpu_slots": 2},
+            slot_event(101, "convert", "a.pdf"),
+            {"event": "slot", "ts": 101.0, "owner": 101, "state": "end"},
+        ]
+    )
+    assert run.active_slots() == []
+
+
+def test_slots_are_reconstructed_from_a_log_without_slot_events():
+    # A monitor attached to a build started before slot reporting existed
+    # should still show something rather than an empty panel.
+    run = reduce_events(
+        [
+            {"event": "run_start", "ts": 0.0, "workers": 3},
+            stage("a.pdf", STAGE_CONVERTING, ts=10.0, worker=777, parts=4),
+            stage("b.pdf", STAGE_INGESTING, ts=20.0, chunks=500),
+        ]
+    )
+    slots = run.active_slots()
+    assert [s.role for s in slots] == ["convert", "embed"]
+    assert slots[0].owner == 777
+    assert slots[1].chunks == 500
+
+
+def test_a_new_run_forgets_the_previous_run_slots():
+    run = reduce_events(
+        [
+            {"event": "run_start", "ts": 0.0, "gpu_slots": 3},
+            slot_event(101, "convert", "a.pdf"),
+            {"event": "run_start", "ts": 200.0, "gpu_slots": 3},
+        ]
+    )
+    assert run.slots == {}
+
+
+def test_the_panel_does_not_crowd_out_the_file_list(monitor):
+    monitor.run.gpu_slots = 3
+    console = Console(width=140, height=24, record=True)
+    console.print(monitor.render(height=24))
+    out = console.export_text()
+    assert "GPU slots" in out
+    assert "a.pdf" in out  # the file table still has room
