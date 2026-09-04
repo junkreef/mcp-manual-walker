@@ -161,8 +161,12 @@ class FileState:
     # that only ever grows. Cleared when the file is queued, so a re-run does
     # not start from the previous attempt's count.
     part_pages: dict[int, int] = field(default_factory=dict)
-    # Parts still expected, from the "converting" event. None until known.
+    # Parts the document was split into, from the "queued" event. None until
+    # known, which is why the "all parts in" check falls through rather than
+    # blocking when it is.
     parts: int | None = None
+    # Which parts have reported themselves converted.
+    parts_converted: set[int] = field(default_factory=set)
     chunks: int | None = None
     figures: int | None = None
     worker: int | None = None
@@ -319,6 +323,20 @@ def apply_event(run: RunState, event: dict[str, Any]) -> RunState:
         return run
 
     stage = event.get("stage")
+
+    if stage == STAGE_CONVERTED:
+        # Emitted per part. A document with twelve parts is not converted
+        # because one of them is: counting them and holding the stage at
+        # "converting" until the last one lands is the difference between a
+        # progress figure and a fiction -- pages_done() credits a converted
+        # document with all of its pages, so a premature flag reported a
+        # 2900-page manual as finished while eleven parts were still running.
+        part = event.get("part")
+        if part is not None:
+            state.parts_converted.add(part)
+        if state.parts and len(state.parts_converted) < state.parts:
+            return run
+
     if (
         stage
         and state.stage == STAGE_FAILED
@@ -338,6 +356,7 @@ def apply_event(run: RunState, event: dict[str, Any]) -> RunState:
                 state.convert_started = ts
         elif stage == STAGE_QUEUED:
             state.part_pages = {}
+            state.parts_converted = set()
             state.convert_started = None
         if stage in TERMINAL_STAGES:
             state.finished_at = ts
