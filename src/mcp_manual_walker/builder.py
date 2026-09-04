@@ -336,7 +336,7 @@ _gpu_slot = None
 
 
 @contextlib.contextmanager
-def gpu_slot(what: str):
+def gpu_slot(what: str, role: str, path: str, **fields):
     """Holds one of the GPU slots for the duration of the block.
 
     The Docling workers and the embedding model share one device and neither
@@ -344,19 +344,25 @@ def gpu_slot(what: str):
     slot is coarse on purpose: it is held for a whole conversion or a whole
     embedding call, which is long, but the alternative is a lock around every
     allocation, and there is no way to reach inside Docling or torch for that.
+
+    Holding one is also reported, so the monitor can show what the semaphore is
+    doing rather than leaving it to be inferred from which documents move.
     """
-    if _gpu_slot is None:
-        yield
-        return
     waited = time.monotonic()
-    _gpu_slot.acquire()
-    delay = time.monotonic() - waited
-    if delay > 1.0:
-        logger.info(f"Waited {delay:.0f}s for a GPU slot before {what}.")
+    if _gpu_slot is not None:
+        _gpu_slot.acquire()
+        delay = time.monotonic() - waited
+        if delay > 1.0:
+            logger.info(f"Waited {delay:.0f}s for a GPU slot before {what}.")
+    progress.emit(
+        "slot", owner=os.getpid(), role=role, path=path, state="start", **fields
+    )
     try:
         yield
     finally:
-        _gpu_slot.release()
+        progress.emit("slot", owner=os.getpid(), state="end")
+        if _gpu_slot is not None:
+            _gpu_slot.release()
 
 # The document this worker process is converting. A worker converts one at a
 # time, so a module global is the whole state that is needed -- but the page
@@ -632,6 +638,8 @@ def _convert_part_task(
     rel_path: str,
     page_range: tuple[int, int] | None,
     save_markdown: bool,
+    part_index: int = 1,
+    part_count: int = 1,
 ):
     """
     Converts one document, or one page range of it, with the worker's converter.
@@ -656,12 +664,24 @@ def _convert_part_task(
     )
     logger.info(f"[Docling-{os.getpid()}] Converting {label}...")
     progress.emit_file(
-        pdf_path, progress.STAGE_CONVERTING, worker=os.getpid(), part=start_page
+        pdf_path,
+        progress.STAGE_CONVERTING,
+        worker=os.getpid(),
+        part=start_page,
+        part_index=part_index,
+        part_count=part_count,
     )
     _begin_document(progress.relative_path(pdf_path), part=start_page)
     try:
         kwargs = {"page_range": page_range} if page_range else {}
-        with gpu_slot(f"converting {label}"):
+        with gpu_slot(
+            f"converting {label}",
+            role=progress.ROLE_CONVERT,
+            path=progress.relative_path(pdf_path),
+            part_index=part_index,
+            part_count=part_count,
+            pages=(page_range[1] - page_range[0] + 1) if page_range else None,
+        ):
             result = _converter.convert(str(pdf_path), **kwargs)
     finally:
         _end_document()
@@ -857,7 +877,12 @@ def _ingest_document(
 
     # One of the GPU slots, so embedding a finished document costs a
     # converting worker for its duration instead of colliding with three.
-    with gpu_slot(f"embedding {len(documents)} chunks of {rel_path}"):
+    with gpu_slot(
+        f"embedding {len(documents)} chunks of {rel_path}",
+        role=progress.ROLE_EMBED,
+        path=str(rel_path),
+        chunks=len(documents),
+    ):
         embeddings = embedder.embed_documents(documents)
 
     for start in range(0, len(ids), CHROMA_ADD_BATCH_SIZE):
@@ -999,6 +1024,7 @@ def build(
         metadata_workers=max(1, settings.METADATA_WORKERS),
         min_pages=min_pages,
         max_pages=max_pages,
+        gpu_slots=settings.DOCLING_GPU_SLOTS or None,
     )
     # One event per file rather than one list: a line has to stay small enough
     # for the kernel to append it atomically next to the workers' writes.
@@ -1198,13 +1224,15 @@ def build(
                 progress.emit_file(
                     pdf_path, progress.STAGE_QUEUED, parts=len(ranges)
                 )
-                for page_range in ranges:
+                for index, page_range in enumerate(ranges, start=1):
                     future = executor.submit(
                         _convert_part_task,
                         pdf_path,
                         rel_path_str,
                         None if single else page_range,
                         save_markdown,
+                        index,
+                        len(ranges),
                     )
                     futures[future] = (pdf_path, manual_id, rel_path_str)
 

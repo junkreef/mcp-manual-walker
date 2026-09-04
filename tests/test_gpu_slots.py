@@ -26,13 +26,13 @@ def slot(monkeypatch):
 
 def test_without_a_semaphore_the_block_just_runs(slot):
     slot(0)
-    with builder.gpu_slot("nothing configured"):
+    with builder.gpu_slot("nothing configured", role="convert", path="a.pdf"):
         pass
 
 
 def test_the_slot_is_held_for_the_block(slot):
     sem = slot(1)
-    with builder.gpu_slot("work"):
+    with builder.gpu_slot("work", role="convert", path="a.pdf"):
         assert sem.acquire(block=False) is False
     assert sem.acquire(block=False) is True
     sem.release()
@@ -43,7 +43,7 @@ def test_the_slot_is_released_even_when_the_block_raises(slot):
     # deadlocks one worker at a time until nothing can run.
     sem = slot(1)
     with pytest.raises(RuntimeError):
-        with builder.gpu_slot("doomed"):
+        with builder.gpu_slot("doomed", role="convert", path="a.pdf"):
             raise RuntimeError("boom")
     assert sem.acquire(block=False) is True
     sem.release()
@@ -55,7 +55,7 @@ def test_only_as_many_run_at_once_as_there_are_slots(slot):
 
     def worker():
         nonlocal concurrent, peak
-        with builder.gpu_slot("work"):
+        with builder.gpu_slot("work", role="convert", path="a.pdf"):
             with lock:
                 concurrent += 1
                 peak = max(peak, concurrent)
@@ -81,7 +81,7 @@ def test_the_embedder_competes_for_the_same_slots(slot):
     held = []
 
     def convert(name):
-        with builder.gpu_slot(name):
+        with builder.gpu_slot(name, role="convert", path=f"{name}.pdf"):
             held.append(name)
             time.sleep(0.2)
             held.remove(name)
@@ -95,7 +95,7 @@ def test_the_embedder_competes_for_the_same_slots(slot):
     embedded = threading.Event()
 
     def embed():
-        with builder.gpu_slot("embedding"):
+        with builder.gpu_slot("embedding", role="embed", path="b.pdf"):
             embedded.set()
 
     parent = threading.Thread(target=embed)
@@ -110,7 +110,7 @@ def test_the_embedder_competes_for_the_same_slots(slot):
 def test_a_slot_is_not_leaked_across_uses(slot):
     sem = slot(1)
     for _ in range(5):
-        with builder.gpu_slot("work"):
+        with builder.gpu_slot("work", role="convert", path="a.pdf"):
             pass
     assert sem.acquire(block=False) is True
     sem.release()

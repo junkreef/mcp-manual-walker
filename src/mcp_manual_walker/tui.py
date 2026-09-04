@@ -283,6 +283,59 @@ class BuildMonitor:
             padding=(0, 1),
         )
 
+    def slots(self, now: float) -> Table:
+        """One row per GPU slot: what holds it, and what it is working on.
+
+        The build lets a fixed number of things touch the GPU at once, and the
+        interesting question during a long run is which they are -- three
+        conversions, or two conversions and an embedding. Empty slots are drawn
+        too, so the shape of the limit is visible rather than implied.
+        """
+        table = Table(
+            expand=True, box=None, pad_edge=False, show_edge=False, padding=(0, 1)
+        )
+        table.add_column("slot", width=6, no_wrap=True)
+        table.add_column("doing", width=11, no_wrap=True)
+        # Wide enough for "part 12/12  242p" without truncating the pages.
+        table.add_column("what", width=17, no_wrap=True)
+        table.add_column("time", justify="right", width=8, no_wrap=True)
+        table.add_column("document", ratio=1, no_wrap=True, overflow="ellipsis")
+
+        active = self.run.active_slots()
+        total = self.run.gpu_slots or self.run.workers or len(active)
+        for index in range(max(total, len(active))):
+            if index >= len(active):
+                table.add_row(
+                    Text(f"{index + 1}", style="grey42"),
+                    Text("idle", style="grey42"),
+                    "",
+                    "",
+                    Text("waiting for a slot or out of work", style="grey42"),
+                )
+                continue
+            slot = active[index]
+            if slot.is_embedding:
+                what = f"{slot.chunks:,} chunks" if slot.chunks else ""
+                doing = Text("◆ embedding", style="magenta")
+            else:
+                if slot.part_index and slot.part_count and slot.part_count > 1:
+                    what = f"part {slot.part_index}/{slot.part_count}"
+                elif slot.part_count and slot.part_count > 1:
+                    what = f"1 of {slot.part_count}"
+                else:
+                    what = "whole doc"
+                if slot.pages:
+                    what += f"  {slot.pages}p"
+                doing = Text("▶ convert", style="bright_blue")
+            table.add_row(
+                Text(f"{index + 1}", style="grey62"),
+                doing,
+                Text(what, style="grey62"),
+                format_duration(now - slot.since if slot.since else None),
+                Text(slot.path, style="bold" if not slot.is_embedding else "magenta"),
+            )
+        return table
+
     def table(self, files: list, now: float) -> Table:
         table = Table(
             expand=True, box=None, pad_edge=False, show_edge=False, padding=(0, 1)
@@ -333,13 +386,29 @@ class BuildMonitor:
 
     def render(self, height: int) -> Group:
         now = time.time()
-        # Header (5 lines incl. borders), footer, and the table header row.
-        self.rows_visible = max(3, height - 8)
+        slot_rows = max(
+            len(self.run.active_slots()), self.run.gpu_slots or self.run.workers or 0
+        )
+        # Header (5 lines incl. borders), the slot panel and its border, the
+        # file table's header row, and the footer.
+        chrome = 8 + (slot_rows + 3 if slot_rows else 0)
+        self.rows_visible = max(3, height - chrome)
         files = self.visible_files()
         if self.follow:
             self.cursor = self.follow_target(files)
         self.clamp(files)
-        return Group(self.header(now), self.table(files, now), self.footer(files))
+        parts = [self.header(now)]
+        if slot_rows:
+            parts.append(
+                Panel(
+                    self.slots(now),
+                    title="GPU slots",
+                    border_style="grey42",
+                    padding=(0, 1),
+                )
+            )
+        parts += [self.table(files, now), self.footer(files)]
+        return Group(*parts)
 
 
 class KeyReader:

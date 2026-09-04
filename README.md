@@ -190,6 +190,14 @@ each build), and a second terminal can render it:
 uv run db_manager watch
 ```
 
+A panel above the list shows the GPU slots — one row each, whether it is a
+worker converting (which document, which part of how many) or the parent
+embedding (which document, how many chunks), and how long it has held the
+slot. Empty slots are drawn too, so the shape of `DOCLING_GPU_SLOTS` is
+visible rather than implied. The rows come from the slot acquisition itself,
+so the panel is the semaphore's state rather than an inference from which
+documents happen to be moving.
+
 The display lists every file in the run with the stage it is in — `scanning`,
 `queued`, `converting`, `converted`, `ingesting`, `done`, `skipped` or
 `failed` — the page count, how long it has been there, and the chunks and
