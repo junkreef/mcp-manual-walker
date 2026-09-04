@@ -1160,8 +1160,14 @@ def build(
                     )
                     futures[future] = (pdf_path, manual_id, rel_path_str)
 
-            for future in as_completed(futures):
-                pdf_path, manual_id, rel_path_str = futures[future]
+            # as_completed takes its own snapshot, so removing entries here is
+            # safe -- and necessary. A Future holds on to its result, so every
+            # part's document, figure PNGs and parsed pages would stay resident
+            # in the parent for the whole build: measured at +4.4 GB after five
+            # documents (3942 pages), which is 1.1 MB per page and matches the
+            # parsed pages exactly. Over 172k pages that is not survivable.
+            for future in as_completed(list(futures)):
+                pdf_path, manual_id, rel_path_str = futures.pop(future)
                 state = pending[manual_id]
                 try:
                     start_page, part_doc, part_figures, parsed = future.result()
@@ -1210,6 +1216,11 @@ def build(
                         # so the dump carries no image files.
                         _save_markdown(doc, rel_path_str, pdf_path)
                 pending.pop(manual_id, None)
+
+                # Nothing below needs the raw parts, and holding them across
+                # the embedding step doubles what the parent carries.
+                state["parts"] = []
+                state["parsed_pages"] = {}
 
                 progress.emit_file(
                     pdf_path, progress.STAGE_INGESTING, figures=len(figures)

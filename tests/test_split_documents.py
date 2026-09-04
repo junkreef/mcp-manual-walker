@@ -178,3 +178,71 @@ def test_reading_an_outline_never_raises(monkeypatch, tmp_path):
         ),
     )
     assert builder._read_outline(tmp_path / "nope.pdf") is None
+
+
+# -- the parent must not accumulate finished work ----------------------------
+
+
+def test_a_completed_future_is_released():
+    """A Future holds its result until dropped.
+
+    Keeping every part's Future for the length of the build kept every part's
+    document, figure PNGs and parsed pages resident in the parent: measured at
+    +4.4 GB after five documents, 1.1 MB per page, which over a 172k-page
+    corpus is not survivable.
+    """
+    import gc
+    import weakref
+    from concurrent.futures import Future, as_completed
+
+    class Result:
+        pass
+
+    futures = {}
+    refs = []
+    for i in range(3):
+        fut = Future()
+        result = Result()
+        refs.append(weakref.ref(result))
+        fut.set_result(result)
+        futures[fut] = i
+        del result
+
+    # The loop as the builder runs it.
+    for fut in as_completed(list(futures)):
+        futures.pop(fut)
+        value = fut.result()  # noqa: F841 - held only for this iteration
+        del value
+    del fut
+    gc.collect()
+
+    assert [r() for r in refs] == [None, None, None], (
+        "a finished part's result outlived the iteration that consumed it"
+    )
+
+
+def test_holding_the_futures_dict_is_what_leaks():
+    """The same loop, without the pop: this is the shape that leaked."""
+    import gc
+    import weakref
+    from concurrent.futures import Future, as_completed
+
+    class Result:
+        pass
+
+    futures = {}
+    refs = []
+    for i in range(3):
+        fut = Future()
+        result = Result()
+        refs.append(weakref.ref(result))
+        fut.set_result(result)
+        futures[fut] = i
+        del result
+
+    for fut in as_completed(list(futures)):
+        pass
+    del fut
+    gc.collect()
+
+    assert all(r() is not None for r in refs)
