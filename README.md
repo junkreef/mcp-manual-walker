@@ -120,8 +120,30 @@ The `builder` extra pulls in Docling, `sentence-transformers`, and PyTorch's CUD
 Then run the builder:
 
 ```sh
-uv run db_manager build --pdf_dir ./data/pdfs [--reset] [--save-markdown]
+uv run db_manager build --pdf_dir ./data/pdfs [--reset] [--save-markdown] [--include GLOB]
 ```
+
+`--include` converts only the PDFs whose path *relative to `--pdf_dir`* matches
+the glob, which is how a large corpus gets built a product or a release at a
+time:
+
+```sh
+uv run db_manager build --pdf_dir ./data/pdfs --include 'zOS/V3R1/*'
+```
+
+The flag is repeatable and a file matching any pattern is kept. These are
+`fnmatch` patterns, so `*` also matches `/` — `zOS/V3R1/*` takes that directory
+and everything nested below it.
+
+Leave `--pdf_dir` pointing at the corpus root and narrow with `--include`,
+rather than pointing `--pdf_dir` at the subdirectory. `--pdf_dir` is also the
+anchor every stored `relative_path` is computed from, so moving it renames the
+manuals: the same file becomes `bpxbd00_v3r1.pdf` instead of
+`zOS/V3R1/bpxbd00_v3r1.pdf`, which collides with the identically named file in
+another release and no longer resolves against `PDF_ROOT_DIR` when the server
+opens the PDF. Narrowing with `--include` keeps the anchor put, so subsets
+built one at a time add up to exactly the database a single whole-corpus build
+would have produced.
 
 The build pipeline is designed to keep the GPU busy instead of processing one PDF at a time. The main process scans the PDF directory (largest files first), runs a fast metadata pass (hashing + bookmark extraction), and syncs the results to SQLite. It then submits each new or changed PDF to a pool of Docling worker processes for conversion; as each conversion finishes, the main process chunks the text, computes embeddings on the GPU, and writes the result into ChromaDB, so embedding of one file overlaps with Docling converting the next ones. Files whose SHA256 hash hasn't changed are skipped entirely, and rebuilding a manual first removes its old chunks from ChromaDB before adding the new ones.
 

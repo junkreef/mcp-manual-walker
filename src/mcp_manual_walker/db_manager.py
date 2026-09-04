@@ -55,8 +55,11 @@ def command_build(args):
         logger.error(f"PDF directory not found: {pdf_dir}")
         sys.exit(1)
 
-    logger.info(f"Starting build from {pdf_dir}...")
-    build(pdf_dir, args.reset, args.save_markdown)
+    if args.include:
+        logger.info(f"Starting build from {pdf_dir} (include={args.include})...")
+    else:
+        logger.info(f"Starting build from {pdf_dir}...")
+    build(pdf_dir, args.reset, args.save_markdown, args.include)
 
 
 def command_list(args):
@@ -579,6 +582,18 @@ def main():
     )
     parser_build.add_argument(
         "--reset", action="store_true", help="Reset database before building"
+    )
+    parser_build.add_argument(
+        "--include",
+        action="append",
+        metavar="GLOB",
+        help=(
+            "Only build PDFs whose path relative to --pdf_dir matches this glob. "
+            "Repeatable; a file matching any pattern is kept. These are fnmatch "
+            "patterns, so '*' also matches '/': --include 'zOS/V3R1/*' takes that "
+            "directory and everything below it. Keep --pdf_dir at the corpus root "
+            "so stored paths stay consistent across subset builds."
+        ),
     )
     parser_build.set_defaults(func=command_build)
 
