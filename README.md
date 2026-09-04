@@ -339,6 +339,39 @@ error per request and leaves that figure's description empty, and the
 builder additionally logs a warning naming the manual and how many figures
 got no description, as a hint to check whether the vision server is up.
 
+### 🧠 Batching the embeddings
+
+`SentenceTransformer.encode` pads a batch to its longest member, so a batch of
+32 costs `32 × longest`, not the sum of its lengths. On this corpus that is not
+a rounding error: of 562 chunks from one manual, 561 averaged 298 tokens and
+**one** — the OCR'd labels of a dense form, 6943 characters at 1.8 characters
+per token — came to 3836. Every batch that chunk landed in was padded out to
+it, and the builder died with `torch.OutOfMemoryError` while a single Docling
+worker held 5 GB.
+
+| batching | peak VRAM | wall clock |
+| --- | --- | --- |
+| rows, 32 per batch | 18.55 GB | 27.1 s |
+| token budget, 24576 | **4.39 GB** | **11.9 s** |
+
+Four times less memory *and* twice as fast, because the padding was pure
+waste. `EMBEDDING_TOKEN_BUDGET` caps `len(batch) × longest`, so a batch of long
+texts is small and a batch of short ones is large. A single text over the
+budget still gets its own batch; truncation at `EMBEDDING_MAX_SEQ_LENGTH`
+remains the model's business.
+
+Vectors are not bit-identical between batchings, but neither are two runs of
+the same batching: the largest cosine difference measured across those 562
+chunks was 7.4e-3 between two identical row-batched runs and 7.0e-3 between row
+and budget batching — the model's own non-determinism on the GPU, not the
+batching.
+
+Figure chunks longer than `CHUNK_SIZE` are split, for the same reason and for
+one more: at 3836 tokens against an `EMBEDDING_MAX_SEQ_LENGTH` of 4096, a
+slightly larger figure would have been truncated with no warning at all. Every
+piece keeps the same `picture_index`, so they all resolve to a single figure
+row.
+
 ### 🧠 Embedding Model
 
 Both the builder and the server embed text with [Sentence Transformers](https://www.sbert.net/) using [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (Apache-2.0). It was chosen for:
@@ -364,7 +397,8 @@ uv run db_manager build --pdf_dir ./data/pdfs --reset
 | `EMBEDDING_QUERY_PREFIX` | *(model default)* | Text prepended to search queries before embedding. Unset (`None`) uses the prompt the model ships under the name `query` (for Qwen3-Embedding: the "Instruct: ... \nQuery:" instruction). Set it explicitly only when switching to a model without stored prompts (e5-style models use `query: ` / `passage: `). |
 | `EMBEDDING_DOCUMENT_PREFIX` | *(model default)* | Text prepended to every chunk at build time. Unset (`None`) uses the prompt the model ships under the name `document` (for Qwen3-Embedding: nothing). |
 | `EMBEDDING_MAX_SEQ_LENGTH` | `4096` | Token cap per text passed to the model. Raise for very long chunks, at the cost of VRAM/RAM. |
-| `EMBEDDING_BATCH_SIZE` | `32` | Encode batch size used by the builder. |
+| `EMBEDDING_BATCH_SIZE` | `32` | Upper bound on the rows in one encode batch. |
+| `EMBEDDING_TOKEN_BUDGET` | `24576` | Upper bound on the padded tokens in one encode batch (`len(batch) × the longest text in it`). A batch is padded to its longest member, so budgeting rows alone prices every batch at its worst one. `0` falls back to plain row batching — see [Batching the embeddings](#-batching-the-embeddings). |
 
 ## 🗺️ Roadmap
 

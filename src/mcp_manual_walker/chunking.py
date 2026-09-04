@@ -42,6 +42,19 @@ _TITLE_PUNCTUATION = " \t.,:;!?-–—_()[]{}<>\"'`*#|/\\、。，．：；・"
 _MIN_CONTAINMENT_LEN = 3
 
 
+def _split_if_long(content: str, splitter: Any) -> List[str]:
+    """Splits ``content`` only when it exceeds CHUNK_SIZE.
+
+    Returning the text untouched below the limit matters: the splitter is
+    allowed to re-join and re-wrap, so running everything through it would
+    change chunks that were already the right size.
+    """
+    if len(content) <= settings.CHUNK_SIZE:
+        return [content]
+    parts = splitter.split_text(content)
+    return parts or [content]
+
+
 def _label_value(item: Any) -> str:
     """Returns the item label as a plain string (DocItemLabel or str)."""
     label = getattr(item, "label", "")
@@ -361,21 +374,31 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
                 content = f"Figure on page {page_no}"
             index = _picture_index(item, picture_count)
             picture_count += 1
-            # A figure chunk is small and self-contained: never split it.
-            chunks.append(
-                {
-                    "text": content,
-                    "metadata": make_metadata(
-                        current_bookmark,
-                        "figure",
-                        page=page_no,
-                        picture_index=index,
-                        figure_caption=caption,
-                        figure_labels=", ".join(labels),
-                        figure_description=description,
-                    ),
-                }
-            )
+            # A figure chunk is usually small and self-contained, so it is kept
+            # whole -- but "usually" is not "always": the OCR'd labels of a
+            # dense form ran to 6943 characters on one real manual, three and a
+            # half times CHUNK_SIZE. Left whole that becomes a 3836-token chunk
+            # against an EMBEDDING_MAX_SEQ_LENGTH of 4096, so a slightly bigger
+            # figure would be truncated with no warning at all, and it drags
+            # every batch it is embedded in up to its own length. Split only
+            # the ones that are actually too long; the common case is
+            # unaffected, and every piece keeps the same picture_index so they
+            # all resolve to one figure row.
+            for part in _split_if_long(content, splitter):
+                chunks.append(
+                    {
+                        "text": part,
+                        "metadata": make_metadata(
+                            current_bookmark,
+                            "figure",
+                            page=page_no,
+                            picture_index=index,
+                            figure_caption=caption,
+                            figure_labels=", ".join(labels),
+                            figure_description=description,
+                        ),
+                    }
+                )
             continue
 
         if kind == CAPTION_LABEL and _caption_belongs_to_figure(item, doc):

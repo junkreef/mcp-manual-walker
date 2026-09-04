@@ -58,12 +58,14 @@ class SentenceTransformerEmbedder:
         max_seq_length: int,
         batch_size: int,
         dtype: str = "auto",
+        token_budget: int = 0,
     ):
         # Imported here so this module stays importable without torch installed.
         from sentence_transformers import SentenceTransformer
 
         self._model_name = model_name
         self._batch_size = batch_size
+        self._token_budget = token_budget
 
         # The dtype is always stated rather than left to the library default:
         # transformers 4.x resolved an unset dtype to float32 and 5.x resolves
@@ -115,17 +117,77 @@ class SentenceTransformerEmbedder:
     def dimension(self) -> int:
         return self.model.get_sentence_embedding_dimension()
 
+    def _token_length(self, text: str) -> int:
+        return len(self.model.tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def plan_batches(self, lengths: list[int]) -> list[list[int]]:
+        """Groups text indices into batches under a token budget.
+
+        A batch is padded to its longest member, so its cost is
+        ``len(batch) x longest``, not the sum of its lengths. Batching by row
+        count therefore prices every batch at its worst member: measured on
+        562 real chunks, a single 3836-token figure caption among 561 chunks
+        averaging 298 tokens took the peak from 6.7 GB to 18.6 GB, because
+        every batch it landed in was padded out to it.
+
+        Budgeting tokens instead lets a batch of long texts be small and a
+        batch of short ones be large. Inputs are visited longest-first so a
+        long text starts a batch rather than joining one and forcing the rest
+        to pad up to it; the returned batches are in that order, and callers
+        put the results back in the original order themselves.
+        """
+        order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+        batches: list[list[int]] = []
+        current: list[int] = []
+        longest = 0
+        for index in order:
+            length = max(1, lengths[index])
+            candidate = max(longest, length)
+            # A single text over budget still gets its own batch: truncation to
+            # max_seq_length is the model's business, not this function's.
+            if current and (
+                (len(current) + 1) * candidate > self._token_budget
+                or len(current) >= self._batch_size
+            ):
+                batches.append(current)
+                current, longest = [], 0
+                candidate = length
+            current.append(index)
+            longest = candidate
+        if current:
+            batches.append(current)
+        return batches
+
     def _encode(self, texts: list[str], prompt: str) -> list[list[float]]:
+        if not texts:
+            return []
         # An empty prefix is passed as None: Sentence Transformers would otherwise
         # tokenize "" to derive a prompt length, which is pointless at best.
-        vectors = self.model.encode(
-            texts,
-            prompt=prompt or None,
-            batch_size=self._batch_size,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        )
-        return vectors.tolist()
+        prompt = prompt or None
+        if self._token_budget <= 0:
+            vectors = self.model.encode(
+                texts,
+                prompt=prompt,
+                batch_size=self._batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )
+            return vectors.tolist()
+
+        lengths = [self._token_length(text) for text in texts]
+        results: list[Optional[list[float]]] = [None] * len(texts)
+        for batch in self.plan_batches(lengths):
+            vectors = self.model.encode(
+                [texts[i] for i in batch],
+                prompt=prompt,
+                # Already grouped; one call per batch, so no further splitting.
+                batch_size=len(batch),
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )
+            for index, vector in zip(batch, vectors.tolist()):
+                results[index] = vector
+        return results  # type: ignore[return-value]
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embeds passages for storage (no instruction prefix)."""
@@ -160,6 +222,7 @@ def get_embedder() -> Optional[SentenceTransformerEmbedder]:
             document_prefix=settings.EMBEDDING_DOCUMENT_PREFIX,
             max_seq_length=settings.EMBEDDING_MAX_SEQ_LENGTH,
             batch_size=settings.EMBEDDING_BATCH_SIZE,
+            token_budget=settings.EMBEDDING_TOKEN_BUDGET,
             dtype=settings.EMBEDDING_DTYPE,
         )
     except ImportError:
