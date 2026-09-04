@@ -821,3 +821,47 @@ def test_builder_continues_after_conversion_failure(
 
     assert builder_env.mock_inst.convert.call_count == 2
     assert builder_env.mock_coll.add.call_count == 1
+
+
+def test_chunks_sharing_a_picture_store_one_figure_row(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    """A split figure caption produces several chunks for one picture.
+
+    Creating the Figure row inside the per-chunk loop stored the PNG once per
+    chunk and handed each chunk a different figure_id.
+    """
+    builder_env.mock_chunk.return_value = [
+        {
+            "text": f"part {n}",
+            "metadata": {
+                "manual_id": "id",
+                "bookmark_id": None,
+                "type": "figure",
+                "page": 2,
+                "picture_index": 0,
+                "figure_caption": "Figure 1",
+                "figure_labels": "",
+                "figure_description": "",
+            },
+        }
+        for n in range(3)
+    ]
+    builder_env.builder.build(pdf_dir, reset=True)
+
+    session = database.SessionLocal()
+    try:
+        figures = session.query(Figure).all()
+        # Two PDFs, one picture each, three chunks pointing at it.
+        assert len(figures) == 2
+    finally:
+        session.close()
+
+    ids = {
+        meta.get("figure_id")
+        for call in builder_env.mock_coll.add.call_args_list
+        for meta in call.kwargs["metadatas"]
+    }
+    assert None not in ids
+    # Three chunks of one picture resolve to one figure id per document.
+    assert len(ids) == 2

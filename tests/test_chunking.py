@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mcp_manual_walker.config import settings
 from mcp_manual_walker.chunking import (
     _match_bookmark_by_title,
     _normalize_title,
@@ -407,3 +408,41 @@ def test_picture_without_caption_labels_or_description(manual):
     assert chunks[0]["metadata"]["figure_caption"] == ""
     assert chunks[0]["metadata"]["figure_labels"] == ""
     assert chunks[0]["metadata"]["figure_description"] == ""
+
+
+def test_a_short_figure_chunk_is_left_exactly_as_it_was(monkeypatch):
+    """The common case must not go through the splitter at all.
+
+    The splitter is free to re-join and re-wrap, so running every figure
+    through it would change chunks that were already the right size.
+    """
+    from mcp_manual_walker.chunking import _split_if_long
+
+    splitter = SimpleNamespace(split_text=lambda text: ["NEVER CALLED"])
+    content = "Figure 1. Small\n\nLabels: a, b"
+    assert _split_if_long(content, splitter) == [content]
+
+
+def test_a_long_figure_chunk_is_split():
+    from mcp_manual_walker.chunking import _split_if_long
+
+    content = "x" * (settings.CHUNK_SIZE * 3)
+    splitter = SimpleNamespace(split_text=lambda text: ["a", "b", "c"])
+    assert _split_if_long(content, splitter) == ["a", "b", "c"]
+
+
+def test_a_splitter_that_returns_nothing_does_not_lose_the_content():
+    from mcp_manual_walker.chunking import _split_if_long
+
+    content = "x" * (settings.CHUNK_SIZE * 3)
+    splitter = SimpleNamespace(split_text=lambda text: [])
+    assert _split_if_long(content, splitter) == [content]
+
+
+def test_the_boundary_is_inclusive():
+    from mcp_manual_walker.chunking import _split_if_long
+
+    splitter = SimpleNamespace(split_text=lambda text: ["split"])
+    at_limit = "x" * settings.CHUNK_SIZE
+    assert _split_if_long(at_limit, splitter) == [at_limit]
+    assert _split_if_long(at_limit + "x", splitter) == ["split"]

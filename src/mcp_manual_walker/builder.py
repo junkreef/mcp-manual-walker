@@ -751,6 +751,11 @@ def _ingest_document(
         return 0
 
     figures_by_index = {f["picture_index"]: f for f in figures}
+    # One row per picture, whatever the chunking does. A long figure caption is
+    # split across several chunks, and every one of them carries the same
+    # picture_index: creating the row inside the loop would store the PNG once
+    # per chunk and hand each of them a different figure_id.
+    figure_rows: dict[int, Figure] = {}
 
     ids = [f"{manual.id}_{i}" for i in range(len(chunks))]
     documents = [c["text"] for c in chunks]
@@ -777,7 +782,10 @@ def _ingest_document(
         if chunk_meta.get("type") == "figure":
             index = chunk_meta.get("picture_index")
             record = figures_by_index.get(index)
-            if record is None:
+            existing = figure_rows.get(index)
+            if existing is not None:
+                meta["figure_id"] = existing.id
+            elif record is None:
                 logger.warning(
                     f"No rendered image for picture {index} of {rel_path}: "
                     "the chunk is stored without a figure reference."
@@ -804,6 +812,7 @@ def _ingest_document(
                 )
                 session.add(figure)
                 stored_figures += 1
+                figure_rows[index] = figure
                 meta["figure_id"] = figure.id
 
         metadatas.append(meta)

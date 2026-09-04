@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     # Tokens per input; Qwen3 supports 32k but VRAM/RAM grows with the window
     EMBEDDING_MAX_SEQ_LENGTH: int = 4096
     EMBEDDING_BATCH_SIZE: int = 32
+    # Upper bound on the padded tokens in one encode call, i.e.
+    # len(batch) x the longest text in it. A batch is padded to its longest
+    # member, so budgeting rows alone prices every batch at its worst one: on
+    # 562 real chunks, one 3836-token figure caption among texts averaging 298
+    # tokens took the peak from 6.7 GB to 18.6 GB of VRAM. Measured at roughly
+    # 0.15 MB of VRAM per padded token on an L4 with Qwen3-Embedding-0.6B, so
+    # 24576 tokens is about 3.7 GB of activations, leaving the GPU to the
+    # Docling workers. 0 falls back to plain row batching.
+    EMBEDDING_TOKEN_BUDGET: int = 24576
 
     # Figure descriptions (optional)
     # Ask a local OpenAI-compatible vision model to describe every detected
