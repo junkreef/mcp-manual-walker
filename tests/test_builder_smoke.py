@@ -581,6 +581,124 @@ def test_the_progress_log_reports_pages_as_they_convert(
     assert STAGE_CONVERTED in stages
 
 
+@pytest.fixture
+def split_support(builder_env):
+    """Makes the mocked builder believe Docling can merge documents."""
+    concatenated = []
+
+    def concatenate(docs):
+        concatenated.append(list(docs))
+        return docs[0]
+
+    heading_model = MagicMock()
+    builder_env.builder._SPLIT_SUPPORT = types.SimpleNamespace(
+        concatenate=concatenate,
+        heading_model_cls=heading_model,
+        read_outline=lambda path: ["outline"],
+    )
+    try:
+        yield types.SimpleNamespace(
+            concatenated=concatenated, heading_model=heading_model
+        )
+    finally:
+        builder_env.builder._SPLIT_SUPPORT = None
+
+
+def test_a_long_document_is_converted_as_parts_and_ingested_once(
+    pdf_dir, tmp_path, mock_settings, builder_env, split_support
+):
+    log = tmp_path / "progress.jsonl"
+    builder_env.mock_meta.return_value = {
+        "document_title": "Long",
+        "page_count": 600,
+        "bookmarks": [],
+    }
+    with patch.object(settings, "DOCLING_SPLIT_PAGES", 250):
+        builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+
+    # Two PDFs of 600 pages: three parts each.
+    assert builder_env.mock_inst.convert.call_count == 6
+    ranges = sorted(
+        call.kwargs["page_range"]
+        for call in builder_env.mock_inst.convert.call_args_list
+    )
+    assert ranges == [(1, 200), (1, 200), (201, 400), (201, 400), (401, 600), (401, 600)]
+
+    # ...but each document is levelled, merged and stored exactly once.
+    assert len(split_support.concatenated) == 2
+    assert split_support.heading_model.return_value.assign_heading_levels.call_count == 2
+    assert builder_env.mock_coll.add.call_count == 2
+
+    run = read_progress(log)
+    assert run.summary["converted"] == 2
+    assert all(f.stage == STAGE_DONE for f in run.files.values())
+
+
+def test_a_short_document_is_still_converted_in_one_go(
+    pdf_dir, tmp_path, mock_settings, builder_env, split_support
+):
+    # The common path must stay exactly what it was: no page range, no merge,
+    # and the worker levels the headings itself.
+    log = tmp_path / "progress.jsonl"
+    with patch.object(settings, "DOCLING_SPLIT_PAGES", 250):
+        builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+
+    assert builder_env.mock_inst.convert.call_count == 2
+    for call in builder_env.mock_inst.convert.call_args_list:
+        assert "page_range" not in call.kwargs
+    assert split_support.concatenated == []
+    assert read_progress(log).summary["converted"] == 2
+
+
+def test_one_bad_part_fails_its_document_once(
+    pdf_dir, tmp_path, mock_settings, builder_env, split_support
+):
+    log = tmp_path / "progress.jsonl"
+    builder_env.mock_meta.return_value = {
+        "document_title": "Long",
+        "page_count": 600,
+        "bookmarks": [],
+    }
+
+    calls = {"n": 0}
+    ok = builder_env.mock_res
+
+    def flaky(path, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("part exploded")
+        return ok
+
+    builder_env.mock_inst.convert.side_effect = flaky
+    with patch.object(settings, "DOCLING_SPLIT_PAGES", 250):
+        builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+
+    run = read_progress(log)
+    # One document lost a part and is failed; the other is unaffected.
+    assert run.summary["failed"] == 1
+    assert run.summary["converted"] == 1
+    assert sorted(f.stage for f in run.files.values()) == [STAGE_DONE, STAGE_FAILED]
+
+
+def test_splitting_is_skipped_when_docling_cannot_merge(
+    pdf_dir, tmp_path, mock_settings, builder_env
+):
+    # _SPLIT_SUPPORT is None here (the fixture is not requested), which is what
+    # a Docling upgrade that moved the internals would look like.
+    log = tmp_path / "progress.jsonl"
+    builder_env.builder._SPLIT_SUPPORT = None
+    builder_env.mock_meta.return_value = {
+        "document_title": "Long",
+        "page_count": 600,
+        "bookmarks": [],
+    }
+    with patch.object(settings, "DOCLING_SPLIT_PAGES", 250):
+        builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
+
+    assert builder_env.mock_inst.convert.call_count == 2
+    assert read_progress(log).summary["converted"] == 2
+
+
 def test_builder_skips_unchanged(pdf_dir, mock_settings, builder_env):
     """A second build with identical hashes must not re-convert anything."""
     builder_env.builder.build(pdf_dir, reset=True, save_markdown=False)
@@ -678,10 +796,10 @@ def test_count_missing_descriptions_warns_when_empty(builder_env, caplog):
         doc.save_as_markdown = lambda *a, **k: None
         with caplog.at_level("WARNING", logger="builder"):
             builder_env.builder._converter = SimpleNamespace(
-                convert=lambda path: SimpleNamespace(document=doc)
+                convert=lambda path, **kw: SimpleNamespace(document=doc, pages=[])
             )
-            builder_env.builder._convert_pdf_task(
-                Path("dummy.pdf"), "dummy.pdf", save_markdown=False
+            builder_env.builder._convert_part_task(
+                Path("dummy.pdf"), "dummy.pdf", None, save_markdown=False
             )
     assert "1 of 2 figure(s)" in caplog.text
     assert "got no description" in caplog.text

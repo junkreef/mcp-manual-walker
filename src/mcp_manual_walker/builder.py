@@ -3,6 +3,7 @@ import ctypes
 import fnmatch
 import io
 import logging
+import math
 import multiprocessing as mp
 import os
 import shutil
@@ -14,6 +15,7 @@ from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 # Imports for dependencies
 from sqlalchemy import select
@@ -258,10 +260,32 @@ def _create_converter(num_threads: int):
     # effectively than the page count suggests.
     pipeline_options.queue_max_size = settings.DOCLING_QUEUE_MAX_SIZE
 
-    # Derive section-header levels from PDF bookmarks / numbering / font style
-    pipeline_options.heading_hierarchy_options = HeadingHierarchyOptions(enabled=True)
+    # Derive section-header levels from PDF bookmarks / numbering / font style.
+    #
+    # The pipeline stage itself is switched off whenever this build can do the
+    # assignment itself, because a page range must not be levelled on its own:
+    # the numbering and style signals rank a heading against the rest of the
+    # document. Instead every conversion -- split or not -- is levelled once
+    # over the finished document, by `assign_heading_levels`. The options
+    # object still carries the settings that pass uses.
+    #
+    # It cannot be toggled per call: the converter caches pipelines by an
+    # options hash, so flipping `enabled` would build a second pipeline and
+    # load a second copy of the models into VRAM.
+    pipeline_options.heading_hierarchy_options = HeadingHierarchyOptions(
+        enabled=_SPLIT_SUPPORT is None
+    )
     # The font-style signal reads the parsed PDF cells, which the pipeline
     # discards unless they are explicitly kept.
+    #
+    # Keeping them is the single largest contributor to a worker's resident
+    # memory (~1.09 MB per page of the document being converted), and nothing
+    # in this repository reads `SectionHeaderItem.level`: chunking matches on
+    # the heading *label* only. Do not conclude from that grep that the levels
+    # are dead weight. They set the "#" depth of the headings inside every
+    # exported chunk body, and the RAG that reads those chunks depends on that
+    # structure to summarise them. Turning either option off is an output
+    # change, not an optimisation.
     pipeline_options.generate_parsed_pages = True
 
     # Render the detected pictures: the crops are persisted as PNG blobs in the
@@ -309,13 +333,15 @@ _PAGE_REPORT_STEP = 10
 # callback runs on the pipeline's assemble thread, hence the lock.
 _page_lock = threading.Lock()
 _current_document: str | None = None
+_current_part = 0
 _pages_converted = 0
 
 
-def _begin_document(rel_path: str) -> None:
-    global _current_document, _pages_converted
+def _begin_document(rel_path: str, part: int = 1) -> None:
+    global _current_document, _current_part, _pages_converted
     with _page_lock:
         _current_document = rel_path
+        _current_part = part
         _pages_converted = 0
 
 
@@ -332,8 +358,11 @@ def _report_page() -> None:
         _pages_converted += 1
         count = _pages_converted
         document = _current_document
+        part = _current_part
     if document and (count == 1 or count % _PAGE_REPORT_STEP == 0):
-        progress.emit("page", path=document, pages_done=count)
+        # The part is part of the key: several parts of one document report
+        # concurrently, and the reader sums them rather than taking a maximum.
+        progress.emit("page", path=document, part=part, pages_done=count)
 
 
 def _make_reporting_pipeline_cls():
@@ -360,6 +389,86 @@ def _make_reporting_pipeline_cls():
             _report_page()
 
     return ProgressReportingPdfPipeline
+
+
+def _load_split_support():
+    """The Docling internals a split conversion needs, or None if unavailable.
+
+    Splitting a document means converting page ranges separately and putting
+    them back together, which needs three things Docling does not expose as a
+    single supported entry point:
+
+    * ``DoclingDocument.concatenate`` to merge the parts. It renumbers pages,
+      re-indexes every ``self_ref`` and rewrites caption/reference/footnote
+      links, so picture indices come out globally consistent.
+    * ``HeadingHierarchyModel.assign_heading_levels``, documented as reusable
+      outside the pipeline, to assign heading levels once over the merged
+      document. Doing it per part instead is not equivalent: the numbering and
+      font-style signals rank a heading against the rest of the document, and
+      on a page range they see a different population. Measured on a 280-page
+      manual: per-part inference reproduced 1131 of 2460 levels, and the merged
+      pass reproduces all 2460.
+    * ``extract_outline_from_pdfium`` to read the bookmarks. The pipeline only
+      reads them when heading inference is enabled, which it no longer is here.
+
+    All three are internal API. If a Docling upgrade moves them this returns
+    None, the builder converts every document whole with Docling's own heading
+    stage, and the only thing lost is the splitting.
+    """
+    try:
+        import pypdfium2
+        from docling.models.stages.heading_hierarchy.heading_hierarchy_model import (
+            HeadingHierarchyModel,
+        )
+        from docling.utils.pdf_outline import extract_outline_from_pdfium
+        from docling_core.types.doc.document import DoclingDocument
+
+        if not hasattr(DoclingDocument, "concatenate"):
+            raise ImportError("DoclingDocument.concatenate is gone")
+        if not hasattr(HeadingHierarchyModel, "assign_heading_levels"):
+            raise ImportError("HeadingHierarchyModel.assign_heading_levels is gone")
+    except ImportError as e:
+        logger.warning(
+            f"Docling does not expose what a split conversion needs ({e}); "
+            "documents will be converted whole."
+        )
+        return None
+
+    return SimpleNamespace(
+        concatenate=DoclingDocument.concatenate,
+        heading_model_cls=HeadingHierarchyModel,
+        read_outline=lambda path: extract_outline_from_pdfium(
+            pypdfium2.PdfDocument(str(path))
+        ),
+    )
+
+
+_SPLIT_SUPPORT = _load_split_support()
+
+
+def plan_parts(page_count: int, split_pages: int) -> list[tuple[int, int]]:
+    """Page ranges to convert a document in, as inclusive 1-based bounds.
+
+    A single range means "convert it whole" and is the path a short document
+    takes. Longer documents are cut into equal parts rather than into
+    ``split_pages``-sized ones with a short remainder, so no worker is left
+    holding a sliver while the others carry full parts.
+    """
+    pages = max(1, page_count)
+    if split_pages <= 0 or pages <= split_pages:
+        return [(1, pages)]
+    count = math.ceil(pages / split_pages)
+    # Spread the remainder one page at a time rather than letting it pile up in
+    # the last part: ceil(2900/12) = 242 would leave a 238-page tail, and the
+    # worker holding it finishes early while the others carry full parts.
+    base, remainder = divmod(pages, count)
+    ranges: list[tuple[int, int]] = []
+    start = 1
+    for index in range(count):
+        size = base + (1 if index < remainder else 0)
+        ranges.append((start, start + size - 1))
+        start += size
+    return ranges
 
 
 def _init_docling_worker(num_threads: int):
@@ -451,54 +560,107 @@ def _trim_heap() -> None:
         pass
 
 
-def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
-    """
-    Converts a single PDF with the worker-local converter.
+def assign_heading_levels(doc, parsed_pages: dict, outline) -> None:
+    """Assigns SectionHeaderItem.level over a finished document.
 
-    Returns ``(document, figures)``: the DoclingDocument stripped of its picture
-    images, plus those images as plain PNG records. Both are pickled back to the
-    parent process, which is far cheaper than re-running Docling there.
+    Runs once per document, whether it was converted whole or as parts, so the
+    numbering and font-style signals always rank a heading against the whole
+    document's headings. Never raises: a document with unlevelled headings is
+    worth more than no document.
+    """
+    if _SPLIT_SUPPORT is None:
+        return
+    try:
+        model = _SPLIT_SUPPORT.heading_model_cls(
+            HeadingHierarchyOptions(enabled=True)
+        )
+        model.assign_heading_levels(doc, parsed_pages=parsed_pages, outline=outline)
+    except Exception as e:  # noqa: BLE001 - levels are an enrichment
+        logger.error(f"Could not assign heading levels: {e}", exc_info=True)
+
+
+def _save_markdown(doc, rel_path: str, pdf_path: Path) -> None:
+    """Writes the markdown dump. A convenience artifact, never fatal."""
+    try:
+        md_path = settings.MARKDOWN_OUTPUT_DIR / Path(rel_path).with_suffix(".md")
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        # A relative artifacts_dir makes Docling write relative image links, so
+        # the dump stays valid when the tree is moved; the directory itself is
+        # still created next to the markdown file.
+        doc.save_as_markdown(
+            md_path,
+            artifacts_dir=Path(f"{md_path.stem}_artifacts"),
+            image_mode=ImageRefMode.REFERENCED,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Failed to save markdown for {pdf_path}: {e}")
+
+
+def _convert_part_task(
+    pdf_path: Path,
+    rel_path: str,
+    page_range: tuple[int, int] | None,
+    save_markdown: bool,
+):
+    """
+    Converts one document, or one page range of it, with the worker's converter.
+
+    Returns ``(start_page, document, figures, parsed_pages)``. The document is
+    stripped of its picture images and those come back as PNG records instead:
+    a PIL image travelling inside the pickled DoclingDocument blows the
+    worker-to-parent transfer up.
+
+    ``page_range`` is None for a document short enough to convert in one go. In
+    that case the worker also assigns the heading levels itself and returns no
+    parsed pages, so nothing extra crosses the process boundary and the parent
+    has nothing left to do. A page range instead returns its parsed pages, which
+    the parent needs to level the merged document; measured at 0.17 MB per page
+    once pickled, against 1.09 MB per page resident.
+
     Conversion errors are left to propagate through the future.
     """
-    logger.info(f"[Docling-{os.getpid()}] Converting {pdf_path.name}...")
-    progress.emit_file(
-        pdf_path, progress.STAGE_CONVERTING, worker=os.getpid()
+    start_page = page_range[0] if page_range else 1
+    label = f"{pdf_path.name}" + (
+        f" pages {page_range[0]}-{page_range[1]}" if page_range else ""
     )
-    _begin_document(progress.relative_path(pdf_path))
+    logger.info(f"[Docling-{os.getpid()}] Converting {label}...")
+    progress.emit_file(
+        pdf_path, progress.STAGE_CONVERTING, worker=os.getpid(), part=start_page
+    )
+    _begin_document(progress.relative_path(pdf_path), part=start_page)
     try:
-        result = _converter.convert(str(pdf_path))
+        kwargs = {"page_range": page_range} if page_range else {}
+        result = _converter.convert(str(pdf_path), **kwargs)
     finally:
         _end_document()
     doc = result.document
 
-    if save_markdown:
-        # A markdown dump is a convenience artifact; never fail the conversion
-        # because it could not be written. It is written before the images are
-        # stripped, so the PNG files next to it can actually be exported.
-        try:
-            md_path = settings.MARKDOWN_OUTPUT_DIR / Path(rel_path).with_suffix(".md")
-            md_path.parent.mkdir(parents=True, exist_ok=True)
-            # A relative artifacts_dir makes Docling write relative image
-            # links, so the dump stays valid when the tree is moved; the
-            # directory itself is still created next to the markdown file.
-            doc.save_as_markdown(
-                md_path,
-                artifacts_dir=Path(f"{md_path.stem}_artifacts"),
-                image_mode=ImageRefMode.REFERENCED,
-            )
-        except Exception as e:
-            logger.error(f"Failed to save markdown for {pdf_path}: {e}")
+    parsed_pages = {
+        page.page_no: page.parsed_page
+        for page in result.pages
+        if page.parsed_page is not None
+    }
+
+    if page_range is None:
+        # Nothing to merge, so level it here and keep the parsed pages local.
+        assign_heading_levels(doc, parsed_pages, _read_outline(pdf_path))
+        parsed_pages = {}
+        if save_markdown:
+            # Written before the images are stripped, so the PNG files next to
+            # it can actually be exported. A split document's dump is written
+            # by the parent instead, from the merged document.
+            _save_markdown(doc, rel_path, pdf_path)
 
     if settings.PICTURE_DESCRIPTION_URL:
         missing, total = _count_missing_descriptions(doc)
         if missing:
             logger.warning(
-                f"{missing} of {total} figure(s) in {rel_path} got no "
+                f"{missing} of {total} figure(s) in {label} got no "
                 "description (is the vision API at "
                 f"{settings.PICTURE_DESCRIPTION_URL} running?)"
             )
         else:
-            logger.info(f"{total} figure(s) in {rel_path} got a description.")
+            logger.info(f"{total} figure(s) in {label} got a description.")
 
     figures = _extract_figures(doc)
 
@@ -509,8 +671,43 @@ def _convert_pdf_task(pdf_path: Path, rel_path: str, save_markdown: bool):
     del result
     _trim_heap()
 
-    progress.emit_file(pdf_path, progress.STAGE_CONVERTED, figures=len(figures))
-    return doc, figures
+    progress.emit_file(
+        pdf_path, progress.STAGE_CONVERTED, figures=len(figures), part=start_page
+    )
+    return start_page, doc, figures, parsed_pages
+
+
+def _read_outline(pdf_path: Path):
+    """The PDF's bookmarks, or None. Never raises: they are one signal of three."""
+    if _SPLIT_SUPPORT is None:
+        return None
+    try:
+        return _SPLIT_SUPPORT.read_outline(pdf_path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not read the outline of {pdf_path}: {e}")
+        return None
+
+
+def merge_parts(parts: list[tuple[int, object, list[dict]]]):
+    """Merges converted page ranges back into one document and its figures.
+
+    ``parts`` is ``(start_page, document, figures)`` in any order. Figure
+    indices are part-local, and ``concatenate`` re-indexes pictures across the
+    merged document in part order, so each part's figures are shifted by the
+    number of pictures in the parts before it.
+    """
+    ordered = sorted(parts, key=lambda part: part[0])
+    merged = _SPLIT_SUPPORT.concatenate([doc for _, doc, _ in ordered])
+
+    figures: list[dict] = []
+    offset = 0
+    for _, doc, part_figures in ordered:
+        for figure in part_figures:
+            shifted = dict(figure)
+            shifted["picture_index"] = figure["picture_index"] + offset
+            figures.append(shifted)
+        offset += len(doc.pictures)
+    return merged, figures
 
 
 def _ingest_document(
@@ -783,7 +980,7 @@ def build(
             results = list(executor.map(extract_pdf_fingerprint, pdf_files))
 
     # Phase 2: relational DB sync (main process only, SQLite has one writer)
-    tasks: list[tuple[Path, str, str]] = []
+    tasks: list[tuple[Path, str, str, int]] = []
     stale_manual_ids: list[str] = []
     skipped = 0
     failed = 0
@@ -857,7 +1054,9 @@ def build(
             progress.emit_file(
                 pdf_path, progress.STAGE_QUEUED, pages=manual.page_count
             )
-            tasks.append((pdf_path, str(manual.id), rel_path_str))
+            tasks.append(
+                (pdf_path, str(manual.id), rel_path_str, manual.page_count or 0)
+            )
 
             # A manual that already existed still holds whatever chunks a
             # previous run wrote; they must be dropped before re-inserting.
@@ -916,34 +1115,92 @@ def build(
             initializer=_init_docling_worker,
             initargs=(threads_per_worker,),
         ) as executor:
-            futures: dict[Future, tuple[Path, str]] = {}
-            for pdf_path, manual_id, rel_path_str in tasks:
-                future = executor.submit(
-                    _convert_pdf_task, pdf_path, rel_path_str, save_markdown
+            # A document is submitted as one task per page range. Every part
+            # is the same size, so a worker's peak memory follows
+            # DOCLING_SPLIT_PAGES rather than the longest document in the
+            # corpus -- and a 2900-page manual no longer occupies one worker
+            # while the rest of the pool waits for it.
+            split_pages = settings.DOCLING_SPLIT_PAGES if _SPLIT_SUPPORT else 0
+            futures: dict[Future, tuple[Path, str, str]] = {}
+            pending: dict[str, dict] = {}
+            for pdf_path, manual_id, rel_path_str, page_count in tasks:
+                ranges = plan_parts(page_count, split_pages)
+                single = len(ranges) == 1
+                pending[manual_id] = {
+                    "pdf_path": pdf_path,
+                    "expected": len(ranges),
+                    "parts": [],
+                    "parsed_pages": {},
+                    "failed": False,
+                }
+                if not single:
+                    logger.info(
+                        f"{rel_path_str}: {page_count} pages, converting as "
+                        f"{len(ranges)} parts of ~{ranges[0][1]} pages."
+                    )
+                progress.emit_file(
+                    pdf_path, progress.STAGE_QUEUED, parts=len(ranges)
                 )
-                futures[future] = (pdf_path, manual_id)
+                for page_range in ranges:
+                    future = executor.submit(
+                        _convert_part_task,
+                        pdf_path,
+                        rel_path_str,
+                        None if single else page_range,
+                        save_markdown,
+                    )
+                    futures[future] = (pdf_path, manual_id, rel_path_str)
 
             for future in as_completed(futures):
-                pdf_path, manual_id = futures[future]
+                pdf_path, manual_id, rel_path_str = futures[future]
+                state = pending[manual_id]
                 try:
-                    doc, figures = future.result()
+                    start_page, part_doc, part_figures, parsed = future.result()
                 except BrokenProcessPool as e:
                     logger.error(
                         "A Docling worker process died (out of memory / CUDA "
-                        "error?) - lower DOCLING_WORKERS and retry."
+                        "error?) - lower DOCLING_WORKERS or DOCLING_SPLIT_PAGES "
+                        "and retry."
                     )
                     raise RuntimeError("Docling worker process pool broke") from e
                 except Exception as e:
                     logger.error(
                         f"Failed to convert {pdf_path}: {e}", exc_info=True
                     )
-                    progress.emit_file(
-                        pdf_path,
-                        progress.STAGE_FAILED,
-                        error=f"{type(e).__name__}: {e}",
-                    )
-                    failed += 1
+                    if not state["failed"]:
+                        # One bad part fails the document once, not once per
+                        # part, and the parts already in hand are dropped.
+                        state["failed"] = True
+                        state["parts"] = []
+                        state["parsed_pages"] = {}
+                        progress.emit_file(
+                            pdf_path,
+                            progress.STAGE_FAILED,
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                        failed += 1
                     continue
+
+                if state["failed"]:
+                    continue
+                state["parts"].append((start_page, part_doc, part_figures))
+                state["parsed_pages"].update(parsed)
+                if len(state["parts"]) < state["expected"]:
+                    continue
+
+                if state["expected"] == 1:
+                    _, doc, figures = state["parts"][0]
+                else:
+                    doc, figures = merge_parts(state["parts"])
+                    assign_heading_levels(
+                        doc, state["parsed_pages"], _read_outline(pdf_path)
+                    )
+                    if save_markdown:
+                        # The parts were dumped as nothing; the merged document
+                        # is the useful artifact. Its pictures live in SQLite,
+                        # so the dump carries no image files.
+                        _save_markdown(doc, rel_path_str, pdf_path)
+                pending.pop(manual_id, None)
 
                 progress.emit_file(
                     pdf_path, progress.STAGE_INGESTING, figures=len(figures)

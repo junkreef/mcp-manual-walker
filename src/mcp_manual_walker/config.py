@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     # on a 600-page manual: 100 -> 8.2 GB peak, 16 -> 5.0 GB, with no change to the
     # output and none to the wall time.
     DOCLING_QUEUE_MAX_SIZE: int = 16
+    # Pages per conversion unit. A document longer than this is converted as
+    # several page ranges, in parallel across the worker pool, and merged in
+    # the parent. This is what makes a worker's peak memory a function of a
+    # number you choose rather than of the longest document in the corpus, and
+    # it stops one 2900-page manual from occupying a single worker while the
+    # rest of the GPU idles. Measured on a 1246-page manual: 403 s / 5.93 GB
+    # converted whole, 286 s / 3.94 GB peak worker as 250-page parts across 3
+    # workers, with byte-identical output. 0 disables splitting.
+    DOCLING_SPLIT_PAGES: int = 250
     # Render scale for the figure crops persisted to SQLite (1.0 = 72 dpi,
     # 2.0 = 144 dpi). Higher values give sharper PNGs and a bigger database.
     DOCLING_IMAGES_SCALE: float = 2.0
