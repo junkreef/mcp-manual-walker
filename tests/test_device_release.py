@@ -87,3 +87,53 @@ def test_repeated_use_returns_the_device_every_time():
             pass
     assert moves(e) == ["cuda", "cpu"] * 3
     assert e._empty_cache.call_count == 3
+
+
+# -- the worker side of the same problem --------------------------------------
+
+
+def test_a_worker_releases_its_device_cache(monkeypatch):
+    """DOCLING_GPU_SLOTS rations who may use the device, not who may hold it.
+
+    Three Docling workers sat at 6104 / 5588 / 4810 MB for twenty minutes
+    without moving, rising when a heavier part arrived and never falling, until
+    the parent's embedding had nowhere to go.
+    """
+    import mcp_manual_walker.builder as builder
+
+    calls = []
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True, empty_cache=lambda: calls.append("emptied")
+        )
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    builder._release_device_cache()
+    assert calls == ["emptied"]
+
+
+def test_a_worker_without_cuda_releases_nothing(monkeypatch):
+    import mcp_manual_walker.builder as builder
+
+    calls = []
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: False, empty_cache=lambda: calls.append("emptied")
+        )
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    builder._release_device_cache()
+    assert calls == []
+
+
+def test_a_worker_release_failure_does_not_fail_the_part(monkeypatch):
+    import mcp_manual_walker.builder as builder
+
+    def explode():
+        raise RuntimeError("driver fell over")
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True, empty_cache=explode)
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    builder._release_device_cache()  # a converted part is still a converted part
