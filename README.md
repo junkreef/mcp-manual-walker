@@ -337,6 +337,59 @@ disconnected session — is resumed by re-running the same command without
 `--reset`. The 199 finished manuals are skipped and the rest are converted.
 Re-running is also how you retry the failures from a previous pass.
 
+### 📦 Moving a built database
+
+`db_manager export --target <prefix> --output <file>.zip` packs everything a
+built corpus consists of into one archive, and `db_manager import --input
+<file>.zip` merges it into another machine's database. A manual already
+present by id is skipped, so importing twice is harmless and two archives can
+be merged into one database.
+
+The archive is a zip holding four things:
+
+| Member | What it is | How it is stored |
+| --- | --- | --- |
+| `manifest.json` | Counts, target, and the embedding model | deflate |
+| `sqlite.json` | Manual, bookmark and figure rows | deflate |
+| `chunks.jsonl.zst` | One JSON chunk per line — id, vector, metadata, text | zstd, stored |
+| `figures/<id>.png` | The figure image bytes | stored |
+
+The chunk stream is almost the whole archive — 10.1 GB of the 12.3 GB in a
+zOS/V3R1 export, nearly all of it vector text — so how it is compressed is the
+only decision that matters here. It is a zstd frame written into a *stored*
+zip member rather than a deflated one, for two reasons:
+
+*   **zstd is parallel; deflate is not.** Python's `zipfile` compresses on one
+    core, and that is where the previous export spent roughly 25 minutes. Over
+    the whole corpus, deflate produced 1,942 MB and zstd level 6 produced
+    1,517 MB — faster *and* smaller. Level 9 would save a further 60 MB for
+    about 37 s more; level 12 is worse than 9 on both axes, and long-distance
+    matching gains nothing because embedding text has no long-range repeats.
+*   **Neither side has to stage it.** Chroma is read, serialized, compressed
+    and written into the archive in one pass, and an import decompresses
+    straight out of the open zip. Nothing lands on disk uncompressed, so
+    exporting no longer needs 10 GB of scratch space beside the archive and
+    importing no longer needs room for the archive *and* its contents.
+
+The figure PNGs are stored rather than deflated because they are already
+compressed: deflating 2,140 MB of them saved 140 MB and cost roughly a third
+of the export's runtime. Giving that back is why the whole archive only fell
+from 3.96 GB to 3.68 GB while the chunk stream lost 425 MB — but the export
+went from around 30 minutes to 8 and a half, and stopped needing scratch space
+at all.
+
+One warning if you ever re-tune the level: this corpus is not uniform. Its
+first 20,000 chunks compress at 8.83x under zstd against 6.37x in the middle,
+so a sample taken from the head understates the finished archive by a third.
+Deflate barely varies over the same slices (5.33x / 5.10x / 5.13x), so
+sanity-checking such a sample against deflate does not catch it.
+
+`manifest.json` records the `EMBEDDING_MODEL` that produced the vectors, and
+an import into a database configured for a different model is refused —
+vectors are only meaningful in the space they were built in. `format_version`
+tracks the layout; archives written by earlier versions (`chroma.json`, or a
+plain `chunks.jsonl`) still import.
+
 ### 🖼️ Figures
 
 Every picture Docling detects is rendered (at `DOCLING_IMAGES_SCALE`) and stored
@@ -350,10 +403,9 @@ duplicated into the vector store.
 Consequences worth knowing:
 
 *   `db_manager export` writes each figure as a separate `figures/<id>.png`
-    member of the archive (`format_version: 2` in `manifest.json`) and
-    `db_manager import` restores the rows with their bytes; older archives
-    without figures still import unchanged. Deleting a manual deletes its
-    figures with it.
+    member of the archive and `db_manager import` restores the rows with their
+    bytes; older archives without figures still import unchanged. Deleting a
+    manual deletes its figures with it.
 *   `--save-markdown` additionally writes the PNGs next to the markdown dump,
     in a `<name>_artifacts/` directory referenced by the markdown image links.
     That copy is a viewing convenience; the database stays the source of truth.

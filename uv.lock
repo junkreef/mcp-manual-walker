@@ -2084,6 +2084,7 @@ dependencies = [
     { name = "rich" },
     { name = "sentence-transformers" },
     { name = "sqlalchemy" },
+    { name = "zstandard" },
 ]
 
 [package.optional-dependencies]
@@ -2145,6 +2146,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'cpu'", specifier = ">=0.15.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "mcp-manual-walker", extra = "cpu" } },
     { name = "torchvision", marker = "extra == 'cu130'", specifier = ">=0.15.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "mcp-manual-walker", extra = "cu130" } },
     { name = "uv", marker = "extra == 'dev'" },
+    { name = "zstandard" },
 ]
 provides-extras = ["cpu", "cu130", "builder", "dev"]
 

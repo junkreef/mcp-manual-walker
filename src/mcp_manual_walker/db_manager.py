@@ -1,13 +1,14 @@
 import argparse
+import contextlib
+import io
 import json
 import logging
-import shutil
 import sys
-import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
 
+import zstandard
 from sqlalchemy import select
 
 from mcp_manual_walker.config import settings
@@ -49,10 +50,44 @@ logger = logging.getLogger("db_manager")
 # chroma.json with chunks.jsonl -- one chunk per line, so neither side has to
 # hold the whole corpus. A 504,346-chunk export was killed by the OOM killer
 # building the single JSON string: 3.8 GB of Python float lists plus roughly
-# 5.8 GB of JSON text for the vectors alone. Version 2 archives still import.
-EXPORT_FORMAT_VERSION = 3
+# 5.8 GB of JSON text for the vectors alone. 4 compresses that line stream
+# with zstd instead of deflate and stores the PNGs uncompressed, which is what
+# lets both sides stream it straight in and out of the archive: no side now
+# writes a multi-gigabyte temporary file. Versions 2 and 3 still import.
+EXPORT_FORMAT_VERSION = 4
 CHUNKS_FILE_NAME = "chunks.jsonl"
+CHUNKS_ZST_FILE_NAME = "chunks.jsonl.zst"
 CHROMA_FILE_NAME = "chroma.json"
+
+# The chunk stream is the archive: 10.1 GB of the 12.3 GB in a zOS/V3R1
+# export, almost all of it vector text. Both of these are the whole corpus,
+# not a projection:
+#
+#     deflate-6 (version 3)   1,942 MB   one core, roughly 25 minutes
+#     zstd-6    (version 4)   1,517 MB   every core, inside an 8:32 export
+#
+# threads=-1 uses every core; deflate could only ever use one, which is what
+# made version 3 slow. On a representative 383 MB slice, 8 threads:
+#
+#     level 6     1.63 s   6.37x    <- this
+#     level 9     3.03 s   6.62x    +37 s over the corpus to save 60 MB
+#     level 12    7.57 s   6.46x    worse than 9 on both axes
+#
+# Long-distance matching (window_log 27) was measured too and gains nothing:
+# embedding text has no long-range repeats to find.
+#
+# Beware of sampling this corpus to re-tune the level. Its first 20,000 chunks
+# compress at 8.83x under zstd but 6.37x in the middle, so a head sample
+# understates the finished archive by a third. Deflate barely varies over the
+# same slices (5.33x / 5.10x / 5.13x), which is why checking such a sample
+# against deflate does not catch it.
+CHUNK_COMPRESS_LEVEL = 6
+
+# The figure PNGs are the other 2.1 GB, and they are already compressed:
+# deflating 2,140 MB of them saved 140 MB for roughly a third of the export's
+# runtime. They go in stored -- which is why the archive only shrank from
+# 3.96 GB to 3.68 GB even though the chunk stream lost 425 MB.
+FIGURE_COMPRESS_TYPE = zipfile.ZIP_STORED
 
 # Chunks handed to Chroma in one add() on import.
 CHUNK_IMPORT_BATCH = 2000
@@ -198,8 +233,11 @@ def bookmark_to_dict(bookmark):
     }
 
 
-def _write_chunks(collection, manual_ids: list[str], path: Path) -> int:
-    """Writes every chunk of the given manuals to a JSONL file, one per line.
+def _write_chunks(collection, manual_ids: list[str], out) -> int:
+    """Writes every chunk of the given manuals to `out`, one JSON line each.
+
+    `out` is any text stream; the export points it at a zstd compressor
+    feeding a zip member, so the corpus never lands on disk uncompressed.
 
     One manual is read at a time and written out before the next is read, so
     the peak is one manual's chunks rather than the corpus.
@@ -215,56 +253,71 @@ def _write_chunks(collection, manual_ids: list[str], path: Path) -> int:
     knows what to do about it.
     """
     written = 0
-    with open(path, "w", encoding="utf-8") as out:
-        for index, manual_id in enumerate(manual_ids, start=1):
-            got = collection.get(
-                where={"manual_id": manual_id},
-                include=["embeddings", "metadatas", "documents"],
+    for index, manual_id in enumerate(manual_ids, start=1):
+        got = collection.get(
+            where={"manual_id": manual_id},
+            include=["embeddings", "metadatas", "documents"],
+        )
+        embeddings = got.get("embeddings")
+        for i, chunk_id in enumerate(got["ids"]):
+            emb = None
+            if embeddings is not None and i < len(embeddings):
+                emb = embeddings[i]
+                if hasattr(emb, "tolist"):
+                    emb = emb.tolist()
+            out.write(
+                json.dumps(
+                    {
+                        "id": chunk_id,
+                        "embedding": emb,
+                        "metadata": got["metadatas"][i],
+                        "document": got["documents"][i],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
-            embeddings = got.get("embeddings")
-            for i, chunk_id in enumerate(got["ids"]):
-                emb = None
-                if embeddings is not None and i < len(embeddings):
-                    emb = embeddings[i]
-                    if hasattr(emb, "tolist"):
-                        emb = emb.tolist()
-                out.write(
-                    json.dumps(
-                        {
-                            "id": chunk_id,
-                            "embedding": emb,
-                            "metadata": got["metadatas"][i],
-                            "document": got["documents"][i],
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-                written += 1
-            if index % 50 == 0 or index == len(manual_ids):
-                logger.info(
-                    f"Wrote {written:,} chunk(s) from {index}/{len(manual_ids)} manuals."
-                )
+            written += 1
+        if index % 50 == 0 or index == len(manual_ids):
+            logger.info(
+                f"Wrote {written:,} chunk(s) from {index}/{len(manual_ids)} manuals."
+            )
     return written
 
 
-def output_dir_for_chunks(input_path: Path) -> Path:
-    """Where an archive's chunk file is parked while it is streamed.
+def _read_chunks(lines):
+    """Yields one chunk per non-blank line of `lines`."""
+    for line in lines:
+        line = line.strip()
+        if line:
+            yield json.loads(line)
 
-    Beside the archive rather than in the extraction directory, because the
-    latter is deleted as soon as the zip is unpacked and the file can be
-    gigabytes.
+
+@contextlib.contextmanager
+def _chunk_source(zf: zipfile.ZipFile):
+    """Yields an iterator over an archive's chunks, whatever version wrote it.
+
+    Every branch reads straight out of the open archive. Version 3 unpacked
+    its 10 GB chunks.jsonl to a temporary file first, which meant an import
+    needed room for the archive *and* its contents; nothing here does.
     """
-    return input_path.with_suffix(".chunks.tmp")
-
-
-def _read_chunks(path: Path):
-    """Yields the chunks of a version-3 archive, one line at a time."""
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
+    names = set(zf.namelist())
+    if CHUNKS_ZST_FILE_NAME in names:
+        with zf.open(CHUNKS_ZST_FILE_NAME) as member:
+            decompressor = zstandard.ZstdDecompressor()
+            with decompressor.stream_reader(member) as raw:
+                yield _read_chunks(io.TextIOWrapper(raw, encoding="utf-8"))
+    elif CHUNKS_FILE_NAME in names:
+        with zf.open(CHUNKS_FILE_NAME) as member:
+            yield _read_chunks(io.TextIOWrapper(member, encoding="utf-8"))
+    elif CHROMA_FILE_NAME in names:
+        yield _chunks_from_legacy(json.loads(zf.read(CHROMA_FILE_NAME)))
+    else:
+        logger.error(
+            f"Archive contains none of {CHUNKS_ZST_FILE_NAME}, "
+            f"{CHUNKS_FILE_NAME} or {CHROMA_FILE_NAME}."
+        )
+        sys.exit(1)
 
 
 def _chunks_from_legacy(chroma_data: dict):
@@ -277,6 +330,37 @@ def _chunks_from_legacy(chroma_data: dict):
             "metadata": chroma_data["metadatas"][i],
             "document": chroma_data["documents"][i],
         }
+
+
+def _stored_info(name: str) -> zipfile.ZipInfo:
+    """A zip member written verbatim, for data that is already compressed."""
+    info = zipfile.ZipInfo(name, date_time=datetime.now().timetuple()[:6])
+    info.compress_type = FIGURE_COMPRESS_TYPE
+    return info
+
+
+def _write_chunk_member(zf: zipfile.ZipFile, collection, manual_ids) -> int:
+    """Streams every chunk into the archive as one zstd-compressed member.
+
+    The member itself is stored, because its bytes are already a zstd frame.
+    Chroma is read, serialized, compressed and written in one pass, so the
+    corpus is never held in memory nor spilled to a temporary file.
+    """
+    info = _stored_info(CHUNKS_ZST_FILE_NAME)
+    compressor = zstandard.ZstdCompressor(
+        level=CHUNK_COMPRESS_LEVEL, threads=-1
+    )
+    with zf.open(info, "w", force_zip64=True) as member:
+        with compressor.stream_writer(member, closefd=False) as raw:
+            text = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+            try:
+                count = _write_chunks(collection, manual_ids, text)
+                text.flush()
+            finally:
+                # Detach rather than close: closing the wrapper would close
+                # the compressor under it and end the frame twice.
+                text.detach()
+    return count
 
 
 def command_export(args):
@@ -303,89 +387,69 @@ def command_export(args):
         # Prepare SQLite data
         sqlite_data = [manual_to_dict(m) for m in manuals]
 
-        # Figure images are exported as separate zip members, one PNG per row.
-        figure_blobs = [(f.id, f.image) for m in manuals for f in m.figures]
+        figure_count = 0
 
-        # Written straight to disk rather than assembled in memory, and before
-        # the manifest so its count can go in there.
-        chunks_path = output_path.with_suffix(".chunks.tmp")
-        try:
-            chunk_count = _write_chunks(collection, manual_ids, chunks_path)
-        except Exception:
-            chunks_path.unlink(missing_ok=True)
-            raise
+        # Every member is written straight into the archive as it is produced.
+        # Nothing here is staged in a temporary directory: for this corpus that
+        # staging was 12.3 GB of writes for a 3.4 GB result.
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            chunk_count = _write_chunk_member(zf, collection, manual_ids)
 
-        manifest = {
-            "version": "1.0",
-            # 2 adds the "figures" records and the figures/ zip members.
-            "format_version": EXPORT_FORMAT_VERSION,
-            "created_at": datetime.now().isoformat(),
-            "target": target,
-            "manual_count": len(manuals),
-            "chunk_count": chunk_count,
-            "figure_count": len(figure_blobs),
-            # Vectors are only reusable by the model that produced them.
-            EMBEDDING_MODEL_METADATA_KEY: settings.EMBEDDING_MODEL,
-        }
+            for manual in manuals:
+                for figure in manual.figures:
+                    zf.writestr(
+                        _stored_info(f"{FIGURES_DIR_NAME}/{figure.id}.png"),
+                        figure.image,
+                    )
+                    figure_count += 1
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            with open(temp_path / "manifest.json", "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2)
-
-            with open(temp_path / "sqlite.json", "w", encoding="utf-8") as f:
-                json.dump(sqlite_data, f, indent=2)
-
-            figures_dir = temp_path / FIGURES_DIR_NAME
-            if figure_blobs:
-                figures_dir.mkdir(parents=True, exist_ok=True)
-                for figure_id, image in figure_blobs:
-                    with open(figures_dir / f"{figure_id}.png", "wb") as f:
-                        f.write(image)
-
-            # Create Zip
-            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for file_name in ["manifest.json", "sqlite.json"]:
-                    zf.write(temp_path / file_name, arcname=file_name)
-                zf.write(chunks_path, arcname=CHUNKS_FILE_NAME)
-
-                if figure_blobs:
-                    for png_path in sorted(figures_dir.iterdir()):
-                        zf.write(
-                            png_path,
-                            arcname=f"{FIGURES_DIR_NAME}/{png_path.name}",
-                        )
+            zf.writestr(
+                "sqlite.json", json.dumps(sqlite_data, indent=2)
+            )
+            # Last, because the chunk count is only known once they are
+            # written. A reader finds it through the central directory, which
+            # does not care what order the members came in.
+            zf.writestr(
+                "manifest.json",
+                json.dumps(
+                    {
+                        "version": "1.0",
+                        "format_version": EXPORT_FORMAT_VERSION,
+                        "created_at": datetime.now().isoformat(),
+                        "target": target,
+                        "manual_count": len(manuals),
+                        "chunk_count": chunk_count,
+                        "figure_count": figure_count,
+                        # Vectors are only reusable by the model that made them.
+                        EMBEDDING_MODEL_METADATA_KEY: settings.EMBEDDING_MODEL,
+                    },
+                    indent=2,
+                ),
+            )
 
         logger.info(
             f"Export completed: {output_path} "
-            f"({chunk_count:,} chunk(s), {len(figure_blobs)} figure image(s))"
+            f"({chunk_count:,} chunk(s), {figure_count} figure image(s))"
         )
 
     finally:
-        # The chunk file lives beside the archive rather than in the temporary
-        # directory: it can be gigabytes, and /tmp is not always where there is
-        # room for that.
-        if "chunks_path" in locals():
-            chunks_path.unlink(missing_ok=True)
         session.close()
 
 
-def _read_figure_images(temp_path: Path, sqlite_data) -> dict:
-    """Reads the exported figure PNGs out of the extracted archive by id."""
+def _read_figure_images(zf: zipfile.ZipFile, sqlite_data) -> dict:
+    """Reads the exported figure PNGs straight out of the archive, by id."""
+    names = set(zf.namelist())
     images = {}
     for manual_dict in sqlite_data:
         for fig_dict in manual_dict.get("figures", []):
             member = fig_dict.get("image_file")
-            image_path = temp_path / member if member else None
-            if image_path is None or not image_path.exists():
+            if not member or member not in names:
                 logger.warning(
                     f"Figure {fig_dict.get('id')} has no image member "
                     f"'{member}' in the archive. Skipping it."
                 )
                 continue
-            with open(image_path, "rb") as f:
-                images[fig_dict["id"]] = f.read()
+            images[fig_dict["id"]] = zf.read(member)
     return images
 
 
@@ -400,16 +464,12 @@ def command_import(args):
     session = SessionLocal()
     client = get_chroma_client()
 
-    # Bound before the try so the cleanup in `finally` can always see it.
-    chunks_file = None
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            with zipfile.ZipFile(input_path, "r") as zf:
-                zf.extractall(temp_path)
-
-            with open(temp_path / "manifest.json", "r", encoding="utf-8") as f:
-                manifest = json.load(f)
+        # The archive stays open for the whole import and every member is read
+        # out of it in place. Unpacking it first meant needing room for the
+        # archive and its contents at once -- 12.3 GB of /tmp for zOS/V3R1.
+        with zipfile.ZipFile(input_path, "r") as zf:
+            manifest = json.loads(zf.read("manifest.json"))
 
             # Archives written before figures existed carry no format_version.
             format_version = manifest.get("format_version", 1)
@@ -418,214 +478,191 @@ def command_import(args):
             )
             logger.info(f"Archive format version: {format_version}")
 
-            with open(temp_path / "sqlite.json", "r", encoding="utf-8") as f:
-                sqlite_data = json.load(f)
+            sqlite_data = json.loads(zf.read("sqlite.json"))
+            figure_images = _read_figure_images(zf, sqlite_data)
 
-            # The chunks are the one part that must not be read into memory
-            # whole, so instead of reading them here the file is moved out of
-            # the extraction directory and streamed later. A version-2 archive
-            # has no such file and is read the old way -- those predate the
-            # corpus that made this necessary and are small.
-            legacy_chunks = None
-            extracted = temp_path / CHUNKS_FILE_NAME
-            if extracted.exists():
-                chunks_file = output_dir_for_chunks(input_path)
-                shutil.move(str(extracted), chunks_file)
-            elif (temp_path / CHROMA_FILE_NAME).exists():
-                with open(temp_path / CHROMA_FILE_NAME, "r", encoding="utf-8") as f:
-                    legacy_chunks = json.load(f)
-            else:
+            # Imported vectors are only usable with the model that produced them.
+            exported_model = manifest.get(EMBEDDING_MODEL_METADATA_KEY)
+            if exported_model is None:
+                logger.warning(
+                    "The export does not record an embedding model. Its "
+                    "vectors may have been built with a model other than "
+                    f"{settings.EMBEDDING_MODEL}."
+                )
+            elif exported_model != settings.EMBEDDING_MODEL:
                 logger.error(
-                    f"Archive contains neither {CHUNKS_FILE_NAME} nor "
-                    f"{CHROMA_FILE_NAME}."
+                    f"The export was built with '{exported_model}', but "
+                    f"settings.EMBEDDING_MODEL is '{settings.EMBEDDING_MODEL}'. "
+                    "Import aborted: re-export the data with the current model."
                 )
-                sys.exit(1)
-
-            # The images are read here, while the extracted archive still exists.
-            figure_images = _read_figure_images(temp_path, sqlite_data)
-
-        # Imported vectors are only usable with the model that produced them.
-        exported_model = manifest.get(EMBEDDING_MODEL_METADATA_KEY)
-        if exported_model is None:
-            logger.warning(
-                "The export does not record an embedding model. Its vectors may "
-                f"have been built with a model other than {settings.EMBEDDING_MODEL}."
-            )
-        elif exported_model != settings.EMBEDDING_MODEL:
-            logger.error(
-                f"The export was built with '{exported_model}', but "
-                f"settings.EMBEDDING_MODEL is '{settings.EMBEDDING_MODEL}'. "
-                "Import aborted: re-export the data with the current model."
-            )
-            return
-
-        # Load the embedding model only to stamp the collection metadata; every
-        # vector comes from the archive, so Chroma never embeds anything here.
-        logger.info("Loading embedding model...")
-        embedder = get_embedder()
-
-        if embedder:
-            collection = client.get_or_create_collection(
-                name=COLLECTION_NAME,
-                embedding_function=None,
-                metadata=collection_metadata(embedder),
-            )
-        else:
-            # Without the model we cannot stamp the model name on a freshly
-            # created collection; an existing one keeps its own metadata.
-            logger.warning(
-                "Embedding model unavailable: a newly created collection will "
-                "not record which model built its vectors."
-            )
-            collection = client.get_or_create_collection(
-                name=COLLECTION_NAME,
-                embedding_function=None,
-            )
-
-        # Import SQLite Data
-        imported_count = 0
-        skipped_count = 0
-        imported_figures = 0
-        accepted_manual_ids = set()
-
-        for manual_dict in sqlite_data:
-            # Check existence
-            existing = session.scalars(select(Manual).where(Manual.id == manual_dict["id"])).first()
-            if existing:
-                logger.warning(
-                    f"Manual {manual_dict['relative_path']} (ID: {manual_dict['id']}) already exists. Skipping."
-                )
-                skipped_count += 1
-                continue
-
-            manual = Manual(
-                id=manual_dict["id"],
-                file_name=manual_dict["file_name"],
-                document_title=manual_dict["document_title"],
-                relative_path=manual_dict["relative_path"],
-                file_hash=manual_dict["file_hash"],
-                page_count=manual_dict["page_count"],
-                updated_at=datetime.fromisoformat(manual_dict["updated_at"])
-                if manual_dict["updated_at"]
-                else None,
-            )
-            session.add(manual)
-            accepted_manual_ids.add(manual.id)
-
-            for fig_dict in manual_dict.get("figures", []):
-                image = figure_images.get(fig_dict["id"])
-                if image is None:
-                    # Already reported by _read_figure_images.
-                    continue
-                session.add(
-                    Figure(
-                        id=fig_dict["id"],
-                        manual_id=fig_dict["manual_id"],
-                        bookmark_id=fig_dict.get("bookmark_id"),
-                        picture_index=fig_dict["picture_index"],
-                        page=fig_dict["page"],
-                        bbox_l=fig_dict["bbox_l"],
-                        bbox_b=fig_dict["bbox_b"],
-                        bbox_r=fig_dict["bbox_r"],
-                        bbox_t=fig_dict["bbox_t"],
-                        caption=fig_dict.get("caption"),
-                        labels=fig_dict.get("labels"),
-                        description=fig_dict.get("description"),
-                        mime_type=fig_dict.get("mime_type", "image/png"),
-                        width=fig_dict.get("width"),
-                        height=fig_dict.get("height"),
-                        created_at=datetime.fromisoformat(fig_dict["created_at"])
-                        if fig_dict.get("created_at")
-                        else None,
-                        image=image,
-                    )
-                )
-                imported_figures += 1
-
-            for bm_dict in manual_dict["bookmarks"]:
-                bm = Bookmark(
-                    id=bm_dict["id"],
-                    manual_id=bm_dict["manual_id"],
-                    ordering=bm_dict["ordering"],
-                    title=bm_dict["title"],
-                    level=bm_dict["level"],
-                    page_num=bm_dict["page_num"],
-                    page_top=bm_dict["page_top"],
-                    parent_id=bm_dict["parent_id"],
-                )
-                session.add(bm)
-
-            imported_count += 1
-
-        session.commit()
-        logger.info(
-            f"SQLite Import: {imported_count} imported, {skipped_count} skipped, "
-            f"{imported_figures} figure(s) restored."
-        )
-
-        # Import Chroma Data, a batch at a time. An archive of this corpus
-        # holds half a million chunks; accumulating them before the first
-        # add() is the same mistake that made the export side run out of
-        # memory.
-        added, skipped_chunks = 0, 0
-        pending: dict[str, list] = {
-            "ids": [],
-            "embeddings": [],
-            "metadatas": [],
-            "documents": [],
-        }
-
-        def flush_chunks():
-            nonlocal added, pending
-            if not pending["ids"]:
                 return
-            collection.add(
-                ids=pending["ids"],
-                embeddings=pending["embeddings"],
-                metadatas=pending["metadatas"],
-                documents=pending["documents"],
-            )
-            added += len(pending["ids"])
-            # Fresh lists rather than clear(): the ones just handed to add()
-            # belong to the caller now.
-            pending = {"ids": [], "embeddings": [], "metadatas": [], "documents": []}
 
-        source = (
-            _read_chunks(chunks_file)
-            if chunks_file is not None
-            else _chunks_from_legacy(legacy_chunks or {})
-        )
-        for chunk in source:
-            meta = chunk["metadata"]
-            # Only chunks whose manual was imported: an archive can overlap a
-            # database that already holds part of it.
-            if meta.get("manual_id") not in accepted_manual_ids:
-                continue
-            if not chunk.get("embedding"):
-                logger.warning(
-                    f"Skipping import of chunk {chunk['id']}: missing embedding."
+            # Load the embedding model only to stamp the collection metadata; every
+            # vector comes from the archive, so Chroma never embeds anything here.
+            logger.info("Loading embedding model...")
+            embedder = get_embedder()
+
+            if embedder:
+                collection = client.get_or_create_collection(
+                    name=COLLECTION_NAME,
+                    embedding_function=None,
+                    metadata=collection_metadata(embedder),
                 )
-                skipped_chunks += 1
-                continue
-            pending["ids"].append(chunk["id"])
-            pending["embeddings"].append(chunk["embedding"])
-            pending["metadatas"].append(meta)
-            pending["documents"].append(chunk["document"])
-            if len(pending["ids"]) >= CHUNK_IMPORT_BATCH:
+            else:
+                # Without the model we cannot stamp the model name on a freshly
+                # created collection; an existing one keeps its own metadata.
+                logger.warning(
+                    "Embedding model unavailable: a newly created collection will "
+                    "not record which model built its vectors."
+                )
+                collection = client.get_or_create_collection(
+                    name=COLLECTION_NAME,
+                    embedding_function=None,
+                )
+
+            # Import SQLite Data
+            imported_count = 0
+            skipped_count = 0
+            imported_figures = 0
+            accepted_manual_ids = set()
+
+            for manual_dict in sqlite_data:
+                # Check existence
+                existing = session.scalars(select(Manual).where(Manual.id == manual_dict["id"])).first()
+                if existing:
+                    logger.warning(
+                        f"Manual {manual_dict['relative_path']} (ID: {manual_dict['id']}) already exists. Skipping."
+                    )
+                    skipped_count += 1
+                    continue
+
+                manual = Manual(
+                    id=manual_dict["id"],
+                    file_name=manual_dict["file_name"],
+                    document_title=manual_dict["document_title"],
+                    relative_path=manual_dict["relative_path"],
+                    file_hash=manual_dict["file_hash"],
+                    page_count=manual_dict["page_count"],
+                    updated_at=datetime.fromisoformat(manual_dict["updated_at"])
+                    if manual_dict["updated_at"]
+                    else None,
+                )
+                session.add(manual)
+                accepted_manual_ids.add(manual.id)
+
+                for fig_dict in manual_dict.get("figures", []):
+                    image = figure_images.get(fig_dict["id"])
+                    if image is None:
+                        # Already reported by _read_figure_images.
+                        continue
+                    session.add(
+                        Figure(
+                            id=fig_dict["id"],
+                            manual_id=fig_dict["manual_id"],
+                            bookmark_id=fig_dict.get("bookmark_id"),
+                            picture_index=fig_dict["picture_index"],
+                            page=fig_dict["page"],
+                            bbox_l=fig_dict["bbox_l"],
+                            bbox_b=fig_dict["bbox_b"],
+                            bbox_r=fig_dict["bbox_r"],
+                            bbox_t=fig_dict["bbox_t"],
+                            caption=fig_dict.get("caption"),
+                            labels=fig_dict.get("labels"),
+                            description=fig_dict.get("description"),
+                            mime_type=fig_dict.get("mime_type", "image/png"),
+                            width=fig_dict.get("width"),
+                            height=fig_dict.get("height"),
+                            created_at=datetime.fromisoformat(fig_dict["created_at"])
+                            if fig_dict.get("created_at")
+                            else None,
+                            image=image,
+                        )
+                    )
+                    imported_figures += 1
+
+                for bm_dict in manual_dict["bookmarks"]:
+                    bm = Bookmark(
+                        id=bm_dict["id"],
+                        manual_id=bm_dict["manual_id"],
+                        ordering=bm_dict["ordering"],
+                        title=bm_dict["title"],
+                        level=bm_dict["level"],
+                        page_num=bm_dict["page_num"],
+                        page_top=bm_dict["page_top"],
+                        parent_id=bm_dict["parent_id"],
+                    )
+                    session.add(bm)
+
+                imported_count += 1
+
+            session.commit()
+            logger.info(
+                f"SQLite Import: {imported_count} imported, {skipped_count} skipped, "
+                f"{imported_figures} figure(s) restored."
+            )
+
+            # Import Chroma Data, a batch at a time. An archive of this corpus
+            # holds half a million chunks; accumulating them before the first
+            # add() is the same mistake that made the export side run out of
+            # memory.
+            added, skipped_chunks = 0, 0
+            pending: dict[str, list] = {
+                "ids": [],
+                "embeddings": [],
+                "metadatas": [],
+                "documents": [],
+            }
+
+            def flush_chunks():
+                nonlocal added, pending
+                if not pending["ids"]:
+                    return
+                collection.add(
+                    ids=pending["ids"],
+                    embeddings=pending["embeddings"],
+                    metadatas=pending["metadatas"],
+                    documents=pending["documents"],
+                )
+                added += len(pending["ids"])
+                # Fresh lists rather than clear(): the ones just handed to add()
+                # belong to the caller now.
+                pending = {
+                    "ids": [],
+                    "embeddings": [],
+                    "metadatas": [],
+                    "documents": [],
+                }
+
+            with _chunk_source(zf) as source:
+                for chunk in source:
+                    meta = chunk["metadata"]
+                    # Only chunks whose manual was imported: an archive can overlap
+                    # a database that already holds part of it.
+                    if meta.get("manual_id") not in accepted_manual_ids:
+                        continue
+                    if not chunk.get("embedding"):
+                        logger.warning(
+                            f"Skipping import of chunk {chunk['id']}: "
+                            "missing embedding."
+                        )
+                        skipped_chunks += 1
+                        continue
+                    pending["ids"].append(chunk["id"])
+                    pending["embeddings"].append(chunk["embedding"])
+                    pending["metadatas"].append(meta)
+                    pending["documents"].append(chunk["document"])
+                    if len(pending["ids"]) >= CHUNK_IMPORT_BATCH:
+                        flush_chunks()
                 flush_chunks()
-        flush_chunks()
 
-        if added:
-            logger.info(f"ChromaDB Import: Added {added:,} chunks.")
-        else:
-            logger.info("ChromaDB Import: No chunks to add (all skipped or empty).")
-        if skipped_chunks:
-            logger.warning(f"{skipped_chunks:,} chunk(s) had no embedding.")
-
+            if added:
+                logger.info(f"ChromaDB Import: Added {added:,} chunks.")
+            else:
+                logger.info("ChromaDB Import: No chunks to add (all skipped or empty).")
+            if skipped_chunks:
+                logger.warning(f"{skipped_chunks:,} chunk(s) had no embedding.")
 
     finally:
-        if chunks_file is not None:
-            chunks_file.unlink(missing_ok=True)
         session.close()
 
 
