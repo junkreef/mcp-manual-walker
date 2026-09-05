@@ -100,6 +100,9 @@ def test_relative_paths_stay_anchored_at_pdf_dir(corpus):
     assert selected.relative_to(corpus).as_posix() == "loose.pdf"
 
 
+# `build` is imported inside command_build (the builder costs 936 MB at
+# import time), so it is patched where it is defined rather than where it
+# is used -- the builder is imported lazily.
 def build_args(tmp_path, **overrides):
     args = dict(
         pdf_dir=str(tmp_path),
@@ -117,7 +120,7 @@ def build_args(tmp_path, **overrides):
 
 def test_cli_forwards_include_to_build(tmp_path):
     args = build_args(tmp_path, include=["zOS/V3R1/*"])
-    with patch("mcp_manual_walker.db_manager.build") as mock_build:
+    with patch("mcp_manual_walker.builder.build") as mock_build:
         command_build(args)
     mock_build.assert_called_once_with(
         Path(tmp_path), False, False, ["zOS/V3R1/*"], None,
@@ -127,7 +130,7 @@ def test_cli_forwards_include_to_build(tmp_path):
 
 def test_cli_passes_none_when_the_flag_is_absent(tmp_path):
     args = build_args(tmp_path)
-    with patch("mcp_manual_walker.db_manager.build") as mock_build:
+    with patch("mcp_manual_walker.builder.build") as mock_build:
         command_build(args)
     mock_build.assert_called_once_with(
         Path(tmp_path), False, False, None, None, min_pages=None, max_pages=None
@@ -136,6 +139,6 @@ def test_cli_passes_none_when_the_flag_is_absent(tmp_path):
 
 def test_cli_passes_the_progress_file_through(tmp_path):
     args = build_args(tmp_path, no_progress=False)
-    with patch("mcp_manual_walker.db_manager.build") as mock_build:
+    with patch("mcp_manual_walker.builder.build") as mock_build:
         command_build(args)
     assert mock_build.call_args.args[4] == tmp_path / "progress.jsonl"

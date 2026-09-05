@@ -9,7 +9,6 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from mcp_manual_walker.builder import build
 from mcp_manual_walker.config import settings
 from mcp_manual_walker.database import SessionLocal, init_db
 from mcp_manual_walker.embeddings import (
@@ -22,10 +21,20 @@ from mcp_manual_walker.embeddings import (
 from mcp_manual_walker.models import Bookmark, Figure, Manual
 from mcp_manual_walker.tui import watch
 
-try:
-    import chromadb
-except ImportError:
-    chromadb = None
+# chromadb is imported where it is used, for the same reason as the builder:
+# `watch` needs neither.
+chromadb = None
+
+
+def _load_chromadb():
+    global chromadb
+    if chromadb is None:
+        try:
+            import chromadb as _chromadb
+        except ImportError:
+            return None
+        chromadb = _chromadb
+    return chromadb
 
 # Configure logging
 logging.basicConfig(
@@ -41,10 +50,11 @@ FIGURES_DIR_NAME = "figures"
 
 
 def get_chroma_client():
-    if chromadb is None:
+    module = _load_chromadb()
+    if module is None:
         logger.error("chromadb is not installed.")
         sys.exit(1)
-    return chromadb.PersistentClient(path=str(settings.CHROMADB_PATH))
+    return module.PersistentClient(path=str(settings.CHROMADB_PATH))
 
 
 def command_build(args):
@@ -55,6 +65,14 @@ def command_build(args):
     if not pdf_dir.exists():
         logger.error(f"PDF directory not found: {pdf_dir}")
         sys.exit(1)
+
+    # Imported here, not at module scope: the builder pulls in Docling, torch,
+    # transformers and PIL, which is 936 MB of resident memory. Every other
+    # subcommand -- `watch` above all, which reads a text file and draws it --
+    # was paying that. `watch` runs alongside a build that is already close to
+    # the host's memory ceiling, so the cost lands exactly where there is none
+    # to spare.
+    from mcp_manual_walker.builder import build
 
     progress_file = None if args.no_progress else Path(args.progress_file)
     if args.include:
