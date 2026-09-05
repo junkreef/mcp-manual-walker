@@ -189,3 +189,15 @@ def test_fusion_does_not_let_the_lexical_tail_swamp_the_dense_head():
 def test_fusion_of_an_empty_lexical_list_is_the_dense_order():
     dense = [f"d{i}" for i in range(1, 21)]
     assert fuse_dense_and_lexical(dense, []) == dense
+
+
+def test_the_rarity_gate_survives_a_small_collection(conn):
+    """A fraction of a small corpus rounds to nothing.
+
+    At the production ratio anything under 2,000 chunks would admit only terms
+    appearing in exactly one chunk, switching the lexical half off without
+    saying so -- which is what made a 1,558-chunk single-manual database look
+    like a regression when it was simply running dense-only.
+    """
+    assert discriminating_terms(conn, "IEF450I", max_df_ratio=0.0005) == ["IEF450I"]
+    assert search(conn, "IEF450I", max_df_ratio=0.0005) == ["c1"]

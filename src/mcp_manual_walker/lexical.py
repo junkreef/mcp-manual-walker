@@ -89,6 +89,13 @@ LEXICAL_CANDIDATES = 20
 # never sees are bit-for-bit unchanged.
 MAX_TERM_DOCUMENT_FREQUENCY_RATIO = 0.0005
 
+# Floor under the ratio, because a fraction of a small collection rounds to
+# nothing: at 0.0005 anything below 2,000 chunks would admit only terms
+# appearing in a single chunk, which switches the lexical half off without
+# saying so. Found on a 1,558-chunk single-manual database, where it made a
+# dense-only run look like a regression against a hybrid one.
+MIN_TERM_DOCUMENT_FREQUENCY = 25
+
 # Query terms, split the way unicode61 splits the documents: runs of letters
 # and digits, nothing else. Matching the tokenizer matters because terms are
 # looked up in the FTS vocabulary -- keeping the underscore would ask it for
@@ -225,7 +232,7 @@ def discriminating_terms(
     total = _corpus_size(conn)
     if not total:
         return []
-    ceiling = max(1, int(total * max_df_ratio))
+    ceiling = max(MIN_TERM_DOCUMENT_FREQUENCY, int(total * max_df_ratio))
     kept = []
     for term in dict.fromkeys(_TERM.findall(text)):
         df = _document_frequency(conn, term)
