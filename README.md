@@ -488,6 +488,63 @@ slightly larger figure would have been truncated with no warning at all. Every
 piece keeps the same `picture_index`, so they all resolve to a single figure
 row.
 
+### 🔍 The vector index
+
+Chunks live in one Chroma collection with an HNSW index, and the graph
+parameters are pinned in `collection_metadata()` rather than left to Chroma's
+defaults. The defaults (`max_neighbors` 16, `ef_construction` 100) are sized
+for smaller collections, and at half a million vectors they leave the graph
+fragile enough that the **order the vectors arrive in** decides how good it is.
+
+Measured on this corpus — 504,346 chunks, 50 real questions in Japanese and
+English, recall@5 against an exact full scan:
+
+| how the database was made | recall@5 | ja | en |
+| --- | --- | --- | --- |
+| built incrementally, Chroma defaults | 89.2% | 85.0% | 92.0% |
+| imported from an archive, Chroma defaults | 60.4% / 67.6% | 56.0% / 64.0% | 63.3% / 70.0% |
+| imported from an archive, `M=32`, `ef_construction=200` | **96.8%** | 97.0% | 96.7% |
+
+The two import rows are the same code on the same data: HNSW draws node levels
+at random, so two builds differ by several points on their own. What they share
+is arriving **grouped by manual**, which is how an archive hands chunks over,
+and that costs roughly 25 points at the default settings. A build that
+interleaves documents — which is what the builder does, three workers finishing
+different manuals at different times — happens to produce a better graph.
+
+Raising the two parameters removes the dependence on order rather than papering
+over it. The 96.8% run was inserted in that same worst-case order and still beat
+the incremental build. Shuffling on import would only help within one archive;
+a database fed several archives gets each one as a clustered block anyway.
+
+Japanese queries gain the most (56.0% → 97.0%). A sparse graph strands them in a
+local minimum more often — the greedy descent stops as soon as nothing in its
+candidate list beats the current worst, and a query further from the document
+cluster it wants has more chances to settle early.
+
+The cost is small: an import of this corpus goes from 17:59 to 20:47, the index
+grows about 1%, and a query goes from 2.2 ms to 2.7 ms. `ef_search` was measured
+too and is not worth raising — it moved recall by 0–4 points while adding 75% to
+query latency.
+
+**These parameters are only read when a collection is created.** An existing
+database keeps whatever it was built with; check with:
+
+```sh
+uv run python -c "import chromadb; \
+  print(chromadb.PersistentClient(path='./data/db/chroma_db') \
+        .get_collection('manual_chunks').configuration_json['hnsw'])"
+```
+
+To adopt them without re-converting anything, export the corpus and import it
+into a fresh database — that is 21 minutes, against hours for a rebuild.
+
+> **Recall@5 here means agreement with an exact vector scan, not answer
+> quality.** Search is dense-only: there is no BM25 or lexical matching, so an
+> exact scan itself returns nothing containing `IEF450I` for the query "what
+> does message IEF450I mean", even though 13 chunks contain that string. Index
+> tuning closes the gap to exact search; it cannot close that one.
+
 ### 🧠 Embedding Model
 
 Both the builder and the server embed text with [Sentence Transformers](https://www.sbert.net/) using [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (Apache-2.0). It was chosen for:
