@@ -2,6 +2,7 @@ import io
 import json
 import zipfile
 from argparse import Namespace
+from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -210,34 +211,36 @@ def test_command_import(mock_session, mock_chroma):
         "documents": ["chunk"],
     }
 
-    args = Namespace(input="in.zip")
+    # A real archive on disk rather than a stack of patched json.load calls:
+    # the importer now chooses its path by which member the archive holds, so
+    # mocking the reads out hid which layout was being exercised.
+    import tempfile as _tempfile
 
-    with (
-        patch("zipfile.ZipFile"),
-        patch("tempfile.TemporaryDirectory"),
-        patch("builtins.open", mock_open()),
-        patch("json.load") as mock_json_load,
-        patch("mcp_manual_walker.db_manager.Path") as MockPath,
-        patch("mcp_manual_walker.db_manager.get_embedder"),
-    ):
-        # Setup mocks
-        mock_path_inst = MockPath.return_value
-        mock_path_inst.exists.return_value = True
+    with _tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "in.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest_data))
+            zf.writestr("sqlite.json", json.dumps(sqlite_data))
+            zf.writestr(
+                "chunks.jsonl",
+                json.dumps(
+                    {
+                        "id": "c1",
+                        "embedding": [0.1],
+                        "metadata": {"manual_id": "uuid-imp"},
+                        "document": "chunk",
+                    }
+                ),
+            )
 
-        mock_json_load.side_effect = [manifest_data, sqlite_data, chroma_data]
+        with patch("mcp_manual_walker.db_manager.get_embedder"):
+            mock_session.scalars.return_value.first.return_value = None
+            command_import(Namespace(input=str(archive)))
 
-        # FIX: Ensure query returns None so it doesn't skip
-        mock_session.scalars.return_value.first.return_value = None
-
-        # Act
-        command_import(args)
-
-        # Assert
-        assert mock_session.add.call_count >= 1
-
-        collection.add.assert_called()
-        call_args = collection.add.call_args
-        assert call_args.kwargs["ids"] == ["c1"]
+    assert mock_session.add.call_count >= 1
+    collection.add.assert_called()
+    assert collection.add.call_args.kwargs["ids"] == ["c1"]
+    assert collection.add.call_args.kwargs["documents"] == ["chunk"]
 
 
 def test_command_import_rejects_other_embedding_model(mock_session, mock_chroma):
@@ -269,29 +272,33 @@ def test_command_import_rejects_other_embedding_model(mock_session, mock_chroma)
         "documents": ["chunk"],
     }
 
-    args = Namespace(input="in.zip")
+    # A real archive: the importer picks its path from what the zip holds.
+    import tempfile as _tempfile
 
-    with (
-        patch("zipfile.ZipFile"),
-        patch("tempfile.TemporaryDirectory"),
-        patch("builtins.open", mock_open()),
-        patch("json.load") as mock_json_load,
-        patch("mcp_manual_walker.db_manager.Path") as MockPath,
-        patch("mcp_manual_walker.db_manager.get_embedder") as mock_get_embedder,
-    ):
-        mock_path_inst = MockPath.return_value
-        mock_path_inst.exists.return_value = True
+    with _tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "in.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest_data))
+            zf.writestr("sqlite.json", json.dumps(sqlite_data))
+            zf.writestr(
+                "chunks.jsonl",
+                json.dumps(
+                    {
+                        "id": "c1",
+                        "embedding": [0.1],
+                        "metadata": {"manual_id": "uuid-imp"},
+                        "document": "chunk",
+                    }
+                ),
+            )
 
-        mock_json_load.side_effect = [manifest_data, sqlite_data, chroma_data]
-        mock_session.scalars.return_value.first.return_value = None
+        with patch("mcp_manual_walker.db_manager.get_embedder") as mock_get_embedder:
+            mock_session.scalars.return_value.first.return_value = None
+            # Refused by returning, not by raising: the CLI logs and stops.
+            command_import(Namespace(input=str(archive)))
 
-        command_import(args)
-
-        # Nothing is written: neither the relational rows nor the vectors.
-        collection.add.assert_not_called()
-        mock_session.add.assert_not_called()
-        mock_get_embedder.assert_not_called()
-
+    collection.add.assert_not_called()
+    mock_get_embedder.assert_not_called()
 
 def test_export_import_round_trip_with_figures(tmp_path, mock_chroma):
     """A manual with a figure survives export and import byte for byte."""
@@ -349,12 +356,17 @@ def test_export_import_round_trip_with_figures(tmp_path, mock_chroma):
         command_export(Namespace(target="fig.pdf", output=str(archive)))
 
     with zipfile.ZipFile(archive) as zf:
-        assert "figures/figure-1.png" in zf.namelist()
+        names = zf.namelist()
+        assert "figures/figure-1.png" in names
         assert zf.read("figures/figure-1.png") == image
         manifest = json.loads(zf.read("manifest.json"))
         exported = json.loads(zf.read("sqlite.json"))
 
-    assert manifest["format_version"] == 2
+    assert manifest["format_version"] == 3
+    # The chunks travel one JSON object per line, not as one object: see
+    # EXPORT_FORMAT_VERSION. A corpus-sized archive cannot be built any other
+    # way on this host.
+    assert "chunks.jsonl" in names
     assert manifest["figure_count"] == 1
     assert exported[0]["figures"][0]["image_file"] == "figures/figure-1.png"
     # The bytes travel as a zip member, never inside the JSON.
