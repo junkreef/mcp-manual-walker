@@ -97,6 +97,44 @@ sudo env "PATH=$PATH" uvx py-spy dump --pid $(pgrep -f "bin/db_manager build" | 
 That last one found the quadratic table export that a whole afternoon of
 guesswork had attributed to the conversion stage.
 
+## Watching an export
+
+`db_manager export` is a single process and logs every 50 manuals, which on
+this corpus is nowhere near every 50th of the work — the first 50 manuals hold
+a third of all chunks, so the first log line arrives minutes in. Watch the
+archive grow instead:
+
+```sh
+watch -n 10 'ls -la data/*.zip; tail -2 export.log'
+```
+
+Two things to get right. **Find the real pid**: the process tree is
+`bash -> /usr/bin/time -> python`, and `uv run` adds another wrapper, so
+`pgrep -f "db_manager export" | head -1` returns a wrapper sitting at 0.0% CPU
+and 2 MB — which reads exactly like a stalled export. Match the interpreter:
+
+```sh
+ps -eo pid,etime,pcpu,rss,args --no-headers | grep "[.]venv/bin/db_manager export"
+```
+
+**Make the watcher say something when the process dies.** An export that the
+OOM killer takes leaves a log that simply stops, which is indistinguishable
+from one still running. A watcher that only greps for `Export completed` stays
+silent through it:
+
+```sh
+while true; do
+  grep -q "Export completed" export.log && { tail -1 export.log; exit 0; }
+  grep -qiE "Traceback|Error|Killed" export.log && { tail -5 export.log; exit 1; }
+  pgrep -f "[.]venv/bin/db_manager export" >/dev/null \
+    || { echo "PROCESS GONE with no completion line"; exit 1; }
+  sleep 10
+done
+```
+
+That is not hypothetical: the first attempt at this export was killed building
+one JSON string out of 504,346 chunks.
+
 ## Numbers that lied
 
 Three measurements were confidently wrong before being caught. Each cost hours.
@@ -120,6 +158,22 @@ opposite.
 provenance and 100 pages, at which point the same comparison showed 51.9x. The
 shape of the input was the whole effect.
 
-The pattern in all three: a number that agreed with the current theory was not
+**Resource numbers from the wrong process.** `pgrep ... | head -1` returned the
+`uv run` wrapper rather than the interpreter, and it was reported as the
+export: 0.0% CPU, 0.03 GB resident. The real process was at 70.8% and 5.01 GB.
+The wrapper's numbers are a perfect description of a hung job, which is what
+they were taken to mean. Confirm a pid by its `args` before quoting anything
+measured from it.
+
+**A compression ratio from the head of the corpus.** Choosing zstd over deflate
+for the export was benchmarked on the first 20,000 chunks, which projected a
+1.11 GB chunk stream. The real one came out at 1.52 GB. Those first chunks
+compress at 8.83x under zstd and the middle of the corpus at 6.37x — and the
+sample *was* checked against a second codec, which is why it survived: deflate
+gets 5.33x / 5.10x / 5.13x on the same three slices, so it agreed. The second
+measurement has to be on different data, not just by a different method.
+
+The pattern in all five: a number that agreed with the current theory was not
 checked against a second, independent measurement. Measuring the same thing
-twice, by different means, is what broke each of them.
+twice, by different means, is what broke each of them — and the fifth is the
+reminder that "by different means" includes different input.
