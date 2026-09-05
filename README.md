@@ -595,14 +595,29 @@ query left with no such term never reaches the lexical index at all:
 
 | | dense | hybrid |
 | --- | --- | --- |
-| identifier present in top 5 (10 queries naming one) | 16/50 | **30/50** |
+| identifier present in top 5 (10 queries naming one) | 16/50 | **43/50** |
 | agreement with exact scan, 41 queries BM25 never saw | 200/205 | **200/205** |
-| agreement with exact scan, 9 queries it did | 39/45 | 22/45 |
-| added latency | — | 6.5 ms/query |
+| agreement with exact scan, 9 queries it did | 39/45 | 4/45 |
+| added latency | — | 6.7 ms/query |
 
 The middle row is the one that matters: **zero collateral damage.** The bottom
-row is the intended trade — those are the queries where a lexical hit
-deliberately replaces a semantic one.
+row is not damage but the trade itself — on a query the gate has judged
+lexical, a lexical hit deliberately replaces a semantic one, and dense is
+measurably useless there.
+
+#### Why the lexical list is weighted and steep
+
+The dense list is fused at the usual flat `k=60`; the lexical one at `k=5` and
+weight 0.3. Something has to give here and it is arithmetic, not taste: getting
+BM25's 4th hit into an overall top 5 leaves room for at most one dense hit
+above it, so BM25's first four come too. **No setting surfaces a message
+definition and also keeps the dense ranking.**
+
+What the shape buys is a bounded tail. At `k=5`, weight 0.3, the 20th lexical
+hit scores 0.012 against the best dense hit's 0.016, so a long lexical list
+cannot swamp the dense one. A flat curve at higher weight (`k=60`, weight 1.5)
+scores identically on every measure here while putting the 20th lexical hit
+*above* the 1st dense one — at which point it is not fusion, it is a switch.
 
 > The corpus size is recorded in the index rather than counted per query.
 > `SELECT count(*)` on an FTS5 table is a full scan: 340 ms here, against 6.5 ms
@@ -610,20 +625,30 @@ deliberately replaces a semantic one.
 
 #### What this still does not solve
 
-For "what does message IEF450I mean" the *authoritative* chunk — the one
-reading `IEF450I Explanation A job step abnormally ended` — is at BM25 rank 13
-and fused rank 26. It does not reach the top 5. Dense never finds it at all.
-BM25 ranks it below seven console-log fragments that mention `IEF450I` in
-passing, because its length normalization works against long reference prose.
+Searched across the whole corpus, "what does message IEF450I mean" still does
+not put the *authoritative* chunk — the one reading `IEF450I Explanation A job
+step abnormally ended` — in the top 5. It is at rank 13, below console-log
+fragments from other manuals that genuinely do contain `IEF450I`.
 
-Bookmarks do not rescue it either: `BPX1MNT` has two bookmarks naming it, but
-`IEF450I`, `IEC141I` and `S0C4` have none — the System Messages volumes carry no
-per-message outline entries.
+**Narrowing the search to the manual that documents the message fixes it.**
+Scoped to *MVS System Messages, Vol 8 (IEF-IGD)*, the same query puts the
+definition at rank 4:
 
-Closing that gap needs a reranker over the fused candidates, not another
-retriever. What is here now moves identifier queries from returning nothing
-relevant to returning something relevant; it does not yet return the *right*
-thing first.
+| | BM25 rank | fused rank | in top 5 |
+| --- | --- | --- | --- |
+| whole corpus | 13 | 13 | no |
+| scoped to Vol 8 | 4 | **4** | **yes** |
+
+which is what `search_manual`'s `manual_id` is for. Dense retrieval does not
+find that chunk either way — not even within the 1,437 chunks of the volume
+holding it.
+
+Bookmarks are no help as a third signal: `BPX1MNT` has two bookmarks naming it,
+but `IEF450I`, `IEC141I` and `S0C4` have none, because the System Messages
+volumes carry no per-message outline entries.
+
+So the remaining gap is unscoped search over the whole library. Closing that
+needs a reranker over the fused candidates, not another retriever.
 
 ### 🧠 Embedding Model
 

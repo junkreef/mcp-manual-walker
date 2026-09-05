@@ -42,9 +42,27 @@ VOCAB_TABLE = "chunks_vocab"
 # needs the figure on every query, so it is stored rather than recomputed.
 STATS_TABLE = "chunks_fts_stats"
 
-# Reciprocal Rank Fusion constant. The usual value; it damps the difference
-# between the top ranks so one list cannot dominate on its first hit alone.
+# Reciprocal Rank Fusion constants, one pair per retriever. The dense list gets
+# the usual flat curve; the lexical list gets a steep one at a fraction of the
+# weight, which is what makes this a fusion rather than a switch.
+#
+# Something has to give here, and it is arithmetic rather than taste. Getting
+# BM25's 4th hit into an overall top 5 leaves room for at most one dense hit
+# above it, so BM25's first four come too. There is no setting that surfaces a
+# message definition and also keeps the dense ranking; the choice is which to
+# trust on a query the gate has already judged lexical. Dense is measurably
+# useless on those -- for "what does message IEF450I mean" it does not find the
+# definition chunk even when the search is narrowed to the 1,437 chunks of the
+# volume that contains it.
+#
+# What the shape does buy is a bounded tail. At LEXICAL_K=5 and weight 0.3 the
+# 20th lexical hit scores 0.012, below the best dense hit at 0.016, so a long
+# lexical list cannot swamp the dense one. A flat curve at higher weight
+# (k=60, w=1.5) scores the same on every measure here while putting the 20th
+# lexical hit above the 1st dense one, which stops being fusion at all.
 RRF_K = 60
+LEXICAL_K = 5
+LEXICAL_WEIGHT = 0.3
 
 # Candidates taken from each retriever before fusion.
 DENSE_CANDIDATES = 20
@@ -253,7 +271,12 @@ def search(
         return []
 
 
-def rrf_fuse(*ranked_lists: list[str], k: int = RRF_K) -> list[str]:
+def rrf_fuse(
+    *ranked_lists: list[str],
+    k: int = RRF_K,
+    weights: Optional[list[float]] = None,
+    ks: Optional[list[int]] = None,
+) -> list[str]:
     """Reciprocal Rank Fusion over any number of ranked id lists.
 
     Fusing by rank rather than by score is what makes this safe here: a cosine
@@ -261,14 +284,28 @@ def rrf_fuse(*ranked_lists: list[str], k: int = RRF_K) -> list[str]:
     returns nothing at all for a query with no indexable term. Ranks are always
     comparable, and a list that is empty simply contributes nothing.
     """
+    if weights is None:
+        weights = [1.0] * len(ranked_lists)
+    if ks is None:
+        ks = [k] * len(ranked_lists)
     scores: dict[str, float] = {}
     first_seen: dict[str, int] = {}
     order = 0
-    for ranked in ranked_lists:
+    for weight, own_k, ranked in zip(weights, ks, ranked_lists):
         for rank, item in enumerate(ranked, start=1):
-            scores[item] = scores.get(item, 0.0) + 1.0 / (k + rank)
+            scores[item] = scores.get(item, 0.0) + weight / (own_k + rank)
             if item not in first_seen:
                 first_seen[item] = order
                 order += 1
     # Ties broken by first appearance, so the result is deterministic.
     return sorted(scores, key=lambda i: (-scores[i], first_seen[i]))
+
+
+def fuse_dense_and_lexical(dense: list[str], lexical_hits: list[str]) -> list[str]:
+    """The retrieval order the server uses: dense flat, lexical steep and light."""
+    return rrf_fuse(
+        dense,
+        lexical_hits,
+        weights=[1.0, LEXICAL_WEIGHT],
+        ks=[RRF_K, LEXICAL_K],
+    )

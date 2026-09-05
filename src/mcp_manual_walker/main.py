@@ -587,7 +587,7 @@ def search_manual(
             )
             lexical_ids = [i for i in lexical_ids if i in allowed]
 
-        ordered = lexical.rrf_fuse(dense_ids, lexical_ids)[:5]
+        ordered = lexical.fuse_dense_and_lexical(dense_ids, lexical_ids)[:5]
 
         # One fetch for whatever the fusion chose, in that order.
         results = _fetch_in_order(collection, ordered)

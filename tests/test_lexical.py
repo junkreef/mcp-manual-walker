@@ -10,6 +10,7 @@ from mcp_manual_walker.lexical import (
     build_match_query,
     create_table,
     discriminating_terms,
+    fuse_dense_and_lexical,
     optimize,
     rrf_fuse,
     search,
@@ -162,3 +163,29 @@ def test_the_rare_term_survives_among_common_ones(conn):
         conn, "what does message IEF450I mean", max_df_ratio=0.05
     ) == ["IEF450I"]
     assert search(conn, "what does message IEF450I mean", max_df_ratio=0.05) == ["c1"]
+
+
+def test_fusion_lets_a_good_lexical_hit_outrank_the_dense_head():
+    """The point of the weighted, steep lexical curve.
+
+    An identifier's definition sits at BM25 rank 4 once the search is narrowed
+    to the right manual, and has to clear the dense top few to be seen at all.
+    """
+    dense = [f"d{i}" for i in range(1, 21)]
+    lex = ["x1", "x2", "x3", "defn"] + [f"y{i}" for i in range(5, 21)]
+    top5 = fuse_dense_and_lexical(dense, lex)[:5]
+    assert "defn" in top5
+
+
+def test_fusion_does_not_let_the_lexical_tail_swamp_the_dense_head():
+    """A flat curve at higher weight scores the same on the corpus and puts the
+    20th lexical hit above the 1st dense one, which is no longer fusion."""
+    dense = [f"d{i}" for i in range(1, 21)]
+    lex = [f"y{i}" for i in range(1, 21)]
+    order = fuse_dense_and_lexical(dense, lex)
+    assert order.index("d1") < order.index("y20")
+
+
+def test_fusion_of_an_empty_lexical_list_is_the_dense_order():
+    dense = [f"d{i}" for i in range(1, 21)]
+    assert fuse_dense_and_lexical(dense, []) == dense
