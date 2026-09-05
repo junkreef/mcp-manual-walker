@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from mcp_manual_walker import progress
+from mcp_manual_walker import lexical, progress
 
 # Suppress warnings from libraries
 warnings.filterwarnings("ignore")
@@ -934,6 +934,16 @@ def _ingest_document(
 
     logger.info(f"Added {len(chunks)} chunks to ChromaDB for {pdf_path.name}")
 
+    # The lexical half of retrieval. Written here rather than in a pass at the
+    # end so an interrupted build leaves the two indexes describing the same
+    # documents -- both are committed with the manual's converted_at stamp.
+    lexical_conn = lexical.sqlite_connection(session)
+    lexical.create_table(lexical_conn)
+    lexical.add_chunks(
+        lexical_conn,
+        ((ids[i], manual.id, documents[i]) for i in range(len(ids))),
+    )
+
     # Only now is the manual really in the database. Until this commit lands,
     # its row is just the metadata pass's promise that the file exists.
     manual.converted_at = datetime.now(UTC)
@@ -1381,6 +1391,19 @@ def build(
             deferred=deferred,
             chunks=total_chunks,
         )
+
+    # Merge the lexical index once, now that nothing more is being written to
+    # it, and record the chunk count the rarity gate reads on every query --
+    # counting FTS5 rows is a full scan, 340 ms on a corpus this size.
+    if total_chunks:
+        finishing = SessionLocal()
+        try:
+            conn = lexical.sqlite_connection(finishing)
+            if lexical.table_exists(conn):
+                logger.info(f"Lexical index: {lexical.optimize(conn):,} chunk(s).")
+                finishing.commit()
+        finally:
+            finishing.close()
 
     logger.info(
         f"Summary: {len(pdf_files)} file(s) found, {skipped} unchanged, "

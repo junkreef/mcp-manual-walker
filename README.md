@@ -545,6 +545,86 @@ into a fresh database — that is 21 minutes, against hours for a rebuild.
 > does message IEF450I mean", even though 13 chunks contain that string. Index
 > tuning closes the gap to exact search; it cannot close that one.
 
+### 🔤 Lexical retrieval alongside the vectors
+
+Dense retrieval cannot find an identifier. Measured against an **exact** scan of
+all 504,346 vectors — no approximation involved — the top 5 for "what does
+message IEF450I mean" contained no chunk with that string in it, though 13
+chunks do. Same for `IEC141I` (14 chunks), `S0C4` (20) and `S806` (3).
+Embeddings place `IEF450I` and `IEF451I` almost on top of each other and give a
+rare token no extra weight. BM25 does the opposite.
+
+So `search_manual` asks both and fuses by rank:
+
+```
+dense top 20  +  BM25 top 20  ->  Reciprocal Rank Fusion (k=60)  ->  top 5
+```
+
+The lexical index is an FTS5 table in the manuals database. It is **derived
+data and never travels in an export archive** — rebuilding it takes 90 seconds
+against the 21 minutes an import costs, so an archive stays free of a search
+implementation detail. `db_manager reindex-lexical` builds it for a database
+that predates the feature.
+
+`unicode61` tokenizes it, which does not segment Japanese and does not need to:
+the corpus is **0.00% Japanese** (67 CJK characters in 3.16 million sampled).
+A Japanese analyzer would have nothing to match against. What Japanese queries
+carry is identifiers — 12 of the 20 in the evaluation set, including every one
+dense retrieval failed — because "メッセージ IEF450I の意味" still spells
+IEF450I. Morphological analysis would be the right call for a corpus with
+Japanese body text; this one has none.
+
+#### Only rare terms are asked of BM25
+
+This is the part that took measuring. Fusing every query with BM25 improved
+identifier lookups and **wrecked everything else**: agreement with an exact
+vector scan fell from 95.6% to 59.2%.
+
+The cause is not BM25, which ranks correctly — asked for "what does message
+IEF450I mean" it puts chunks containing IEF450I at ranks 2 and 3, inverse
+document frequency working as designed. The cause is the other kind of query.
+"how do I mount a zFS file system" has no rare term at all (its rarest, `zFS`,
+is in 1,972 chunks) and its terms together match 150,279 chunks, 30% of the
+corpus. BM25 returns a ranked 20 of them chosen by how densely they repeat
+ordinary words, and RRF cannot tell that list from a confident one: it sees
+ranks, never scores. Those 20 displace dense hits that were right.
+
+So a term is only sent to BM25 if it appears in at most
+`MAX_TERM_DOCUMENT_FREQUENCY_RATIO` of the chunks (0.0005, i.e. 252 here), and a
+query left with no such term never reaches the lexical index at all:
+
+| | dense | hybrid |
+| --- | --- | --- |
+| identifier present in top 5 (10 queries naming one) | 16/50 | **30/50** |
+| agreement with exact scan, 41 queries BM25 never saw | 200/205 | **200/205** |
+| agreement with exact scan, 9 queries it did | 39/45 | 22/45 |
+| added latency | — | 6.5 ms/query |
+
+The middle row is the one that matters: **zero collateral damage.** The bottom
+row is the intended trade — those are the queries where a lexical hit
+deliberately replaces a semantic one.
+
+> The corpus size is recorded in the index rather than counted per query.
+> `SELECT count(*)` on an FTS5 table is a full scan: 340 ms here, against 6.5 ms
+> for the whole lexical path once it is stored.
+
+#### What this still does not solve
+
+For "what does message IEF450I mean" the *authoritative* chunk — the one
+reading `IEF450I Explanation A job step abnormally ended` — is at BM25 rank 13
+and fused rank 26. It does not reach the top 5. Dense never finds it at all.
+BM25 ranks it below seven console-log fragments that mention `IEF450I` in
+passing, because its length normalization works against long reference prose.
+
+Bookmarks do not rescue it either: `BPX1MNT` has two bookmarks naming it, but
+`IEF450I`, `IEC141I` and `S0C4` have none — the System Messages volumes carry no
+per-message outline entries.
+
+Closing that gap needs a reranker over the fused candidates, not another
+retriever. What is here now moves identifier queries from returning nothing
+relevant to returning something relevant; it does not yet return the *right*
+thing first.
+
 ### 🧠 Embedding Model
 
 Both the builder and the server embed text with [Sentence Transformers](https://www.sbert.net/) using [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (Apache-2.0). It was chosen for:

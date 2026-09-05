@@ -11,6 +11,7 @@ from pydantic import Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from . import lexical
 from .config import settings
 from .database import SessionLocal, init_db
 from .embeddings import COLLECTION_NAME, check_collection_model, get_embedder
@@ -283,6 +284,41 @@ def _get_descendant_bookmark_ids(
     return descendant_ids
 
 
+def _chunk_ids_in_bookmarks(collection, manual_id: str, bookmark_ids: list[str]) -> set:
+    """Chunk ids under a bookmark subtree, for filtering lexical hits.
+
+    The FTS index stores the manual but not the bookmark, so a search narrowed
+    to a section has to intersect its results with the chunks Chroma says are
+    in it.
+    """
+    if not bookmark_ids:
+        return set()
+    got = collection.get(
+        where={
+            "$and": [
+                {"manual_id": manual_id},
+                {"bookmark_id": {"$in": list(bookmark_ids)}},
+            ]
+        },
+        include=[],
+    )
+    return set(got["ids"])
+
+
+def _fetch_in_order(collection, ids: list[str]) -> dict:
+    """Reads chunks by id and returns them shaped like a `query()` result."""
+    if not ids:
+        return {"ids": [[]], "documents": [[]], "metadatas": [[]]}
+    got = collection.get(ids=ids, include=["documents", "metadatas"])
+    at = {cid: n for n, cid in enumerate(got["ids"])}
+    keep = [i for i in ids if i in at]
+    return {
+        "ids": [keep],
+        "documents": [[got["documents"][at[i]] for i in keep]],
+        "metadatas": [[got["metadatas"][at[i]] for i in keep]],
+    }
+
+
 @app.tool(
     name="get_markdown_content",
     description="""Fetches the Markdown content for a specific bookmark (section) within
@@ -519,11 +555,42 @@ def search_manual(
                 "$and": [{"manual_id": manual_id}, {"bookmark_id": {"$in": target_ids}}]
             }
 
-        # Query ChromaDB with manual embedding
+        # Dense and lexical retrieval, fused by rank.
+        #
+        # Dense alone cannot find an identifier: measured against an *exact*
+        # scan of the vectors, the top 5 for "what does message IEF450I mean"
+        # held no chunk containing that string, though 13 chunks do. BM25 finds
+        # them, and finds nothing at all for a question with no indexable term
+        # -- a purely Japanese one against this English corpus -- which is why
+        # the two are fused by rank rather than by score. An empty lexical list
+        # simply leaves the dense ranking untouched.
         query_vec = [embedder.embed_query(query)]
-        results = collection.query(
-            query_embeddings=query_vec, n_results=5, where=where_clause
+        dense = collection.query(
+            query_embeddings=query_vec,
+            n_results=lexical.DENSE_CANDIDATES,
+            where=where_clause,
         )
+        dense_ids = dense["ids"][0] if dense["ids"] else []
+
+        lexical_ids = lexical.search(
+            lexical.sqlite_connection(db),
+            query,
+            limit=lexical.LEXICAL_CANDIDATES,
+            manual_id=manual_id,
+        )
+        if bookmark_id:
+            # The dense side got this through `where`; the lexical index does
+            # not carry the bookmark, so it is filtered against the same set.
+            allowed = set(dense_ids)
+            allowed.update(
+                _chunk_ids_in_bookmarks(collection, manual_id, target_ids)
+            )
+            lexical_ids = [i for i in lexical_ids if i in allowed]
+
+        ordered = lexical.rrf_fuse(dense_ids, lexical_ids)[:5]
+
+        # One fetch for whatever the fusion chose, in that order.
+        results = _fetch_in_order(collection, ordered)
 
         # results is a dict with lists of lists (for documents, metadatas, etc.)
         # Structure: {'ids': [['id1', ...]], 'metadatas': [[{...}, ...]], 'documents': [['text', ...]]}

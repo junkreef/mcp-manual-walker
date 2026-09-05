@@ -11,6 +11,7 @@ from pathlib import Path
 import zstandard
 from sqlalchemy import select
 
+from mcp_manual_walker import lexical
 from mcp_manual_walker.config import settings
 from mcp_manual_walker.database import SessionLocal, init_db
 from mcp_manual_walker.embeddings import (
@@ -91,6 +92,9 @@ FIGURE_COMPRESS_TYPE = zipfile.ZIP_STORED
 
 # Chunks handed to Chroma in one add() on import.
 CHUNK_IMPORT_BATCH = 2000
+
+# Chunks read back from Chroma in one page when rebuilding the lexical index.
+LEXICAL_REINDEX_BATCH = 5000
 FIGURES_DIR_NAME = "figures"
 
 
@@ -613,6 +617,14 @@ def command_import(args):
                 "documents": [],
             }
 
+            # The lexical index is derived data and is never carried in an
+            # archive: rebuilding it here costs seconds against the tens of
+            # minutes the import already takes, and it keeps the archive
+            # format free of anything that is only a search implementation
+            # detail.
+            lexical_conn = lexical.sqlite_connection(session)
+            lexical.create_table(lexical_conn)
+
             def flush_chunks():
                 nonlocal added, pending
                 if not pending["ids"]:
@@ -622,6 +634,15 @@ def command_import(args):
                     embeddings=pending["embeddings"],
                     metadatas=pending["metadatas"],
                     documents=pending["documents"],
+                )
+                lexical.add_chunks(
+                    lexical_conn,
+                    (
+                        (cid, meta.get("manual_id") or "", doc or "")
+                        for cid, meta, doc in zip(
+                            pending["ids"], pending["metadatas"], pending["documents"]
+                        )
+                    ),
                 )
                 added += len(pending["ids"])
                 # Fresh lists rather than clear(): the ones just handed to add()
@@ -662,6 +683,57 @@ def command_import(args):
             if skipped_chunks:
                 logger.warning(f"{skipped_chunks:,} chunk(s) had no embedding.")
 
+            if added:
+                lexical.optimize(lexical_conn)
+                session.commit()
+                logger.info(f"Lexical index: {added:,} chunk(s) indexed.")
+
+    finally:
+        session.close()
+
+
+def command_reindex_lexical(args):
+    """Rebuilds the BM25 index from the chunks already in ChromaDB.
+
+    The lexical index is derived data, so it is not in an export archive and a
+    database made before it existed simply has none. Rebuilding it from Chroma
+    takes a couple of minutes against the twenty an import costs, so this is
+    the way to add it to a database that is otherwise fine.
+    """
+    session = SessionLocal()
+    client = get_chroma_client()
+    try:
+        collection = client.get_collection(name=COLLECTION_NAME)
+        conn = lexical.sqlite_connection(session)
+        lexical.drop_table(conn)
+        lexical.create_table(conn)
+
+        total = collection.count()
+        logger.info(f"Rebuilding the lexical index over {total:,} chunk(s)...")
+        written = offset = 0
+        while True:
+            got = collection.get(
+                limit=LEXICAL_REINDEX_BATCH,
+                offset=offset,
+                include=["documents", "metadatas"],
+            )
+            if not got["ids"]:
+                break
+            written += lexical.add_chunks(
+                conn,
+                (
+                    (cid, (meta or {}).get("manual_id") or "", doc or "")
+                    for cid, meta, doc in zip(
+                        got["ids"], got["metadatas"], got["documents"]
+                    )
+                ),
+            )
+            offset += len(got["ids"])
+            if offset % (LEXICAL_REINDEX_BATCH * 10) == 0:
+                logger.info(f"  {offset:,}/{total:,}")
+        lexical.optimize(conn)
+        session.commit()
+        logger.info(f"Lexical index rebuilt: {written:,} chunk(s).")
     finally:
         session.close()
 
@@ -883,6 +955,13 @@ def main():
         help="Target file or directory path relative to PDF root",
     )
     parser_delete.set_defaults(func=command_delete)
+
+    # Lexical reindex Command
+    parser_lex = subparsers.add_parser(
+        "reindex-lexical",
+        help="Rebuild the BM25 index from the chunks already in ChromaDB",
+    )
+    parser_lex.set_defaults(func=command_reindex_lexical)
 
     # Search Command
     parser_search = subparsers.add_parser("search", help="Search the database")
