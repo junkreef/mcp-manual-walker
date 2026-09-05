@@ -286,12 +286,42 @@ def get_embedder() -> Optional[SentenceTransformerEmbedder]:
         return None
 
 
+# HNSW graph parameters. Chroma's defaults (max_neighbors 16,
+# ef_construction 100) are built for smaller collections and leave a
+# half-million-vector index fragile enough that the *order* the vectors arrive
+# in decides how good it is. Measured on this corpus -- 504,346 chunks, 50 real
+# questions, recall@5 against an exact full scan:
+#
+#     built incrementally, Chroma defaults          89.2%
+#     imported from an archive, Chroma defaults     60.4%  and  67.6%
+#     imported from an archive, the values below    96.8%
+#
+# The two import runs are the same code and the same data; HNSW draws node
+# levels at random, so builds differ by several points on their own. What they
+# have in common is arriving grouped by manual, which is how an archive hands
+# them over, and that costs roughly 25 points at the default settings. Raising
+# the two parameters removes the dependence on order entirely -- the 96.8% run
+# was inserted in that same worst-case order and still beat the incremental
+# build. Japanese queries gain most (56.0% -> 97.0%): a sparse graph strands
+# them in a local minimum more often than English ones.
+#
+# The cost is small: an import goes from 17:59 to 20:47, the index grows about
+# 1%, and a query goes from 2.2 ms to 2.7 ms.
+#
+# These apply only when a collection is *created*. An existing database keeps
+# the parameters it was built with; re-import the archive into a fresh one.
+HNSW_MAX_NEIGHBORS = 32
+HNSW_EF_CONSTRUCTION = 200
+
+
 def collection_metadata(embedder: SentenceTransformerEmbedder) -> dict[str, Any]:
     """Metadata stored on the Chroma collection when it is first created."""
     return {
         EMBEDDING_MODEL_METADATA_KEY: embedder.model_name,
         "embedding_dim": embedder.dimension,
         "hnsw:space": "cosine",
+        "hnsw:M": HNSW_MAX_NEIGHBORS,
+        "hnsw:construction_ef": HNSW_EF_CONSTRUCTION,
         "description": "Chunks from PDF manuals",
     }
 

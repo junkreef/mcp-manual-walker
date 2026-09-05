@@ -8,9 +8,12 @@ import pytest
 from mcp_manual_walker.config import settings
 from mcp_manual_walker.embeddings import (
     EMBEDDING_MODEL_METADATA_KEY,
+    HNSW_EF_CONSTRUCTION,
+    HNSW_MAX_NEIGHBORS,
     SentenceTransformerEmbedder,
     _resolve_device,
     check_collection_model,
+    collection_metadata,
     get_embedder,
 )
 
@@ -268,3 +271,29 @@ def test_a_query_does_not_draw_a_progress_bar():
     e.model.encode.reset_mock()
     e.embed_documents(["a", "b"])
     assert e.model.encode.call_args.kwargs["show_progress_bar"] is True
+
+
+def test_collection_metadata_pins_the_hnsw_graph_parameters():
+    """Left to Chroma's defaults, the index depends on insertion order.
+
+    Measured on 504,346 chunks with 50 real questions, recall@5 against an
+    exact scan: a database built incrementally reached 89.2%, the same data
+    imported from an archive -- which arrives grouped by manual -- reached
+    60.4% and 67.6% on two runs, and these parameters took that same import to
+    96.8%. They are only read when a collection is created, so this is the one
+    place that can set them.
+    """
+    embedder = SimpleNamespace(model_name="a-model", dimension=1024)
+    meta = collection_metadata(embedder)
+
+    assert meta["hnsw:M"] == HNSW_MAX_NEIGHBORS
+    assert meta["hnsw:construction_ef"] == HNSW_EF_CONSTRUCTION
+    assert meta["hnsw:space"] == "cosine"
+    assert meta[EMBEDDING_MODEL_METADATA_KEY] == "a-model"
+    assert meta["embedding_dim"] == 1024
+
+
+def test_the_hnsw_parameters_are_above_chroma_defaults():
+    """A regression here is silent: the index still builds, only worse."""
+    assert HNSW_MAX_NEIGHBORS > 16
+    assert HNSW_EF_CONSTRUCTION > 100
