@@ -96,6 +96,7 @@ def test_embed_documents(mock_sentence_transformers):
         batch_size=8,
         normalize_embeddings=True,
         convert_to_numpy=True,
+        show_progress_bar=True,
     )
     assert isinstance(result, list)
     assert isinstance(result[0], list)
@@ -138,6 +139,9 @@ def test_embed_query_uses_the_instruction_prefix(mock_sentence_transformers):
         batch_size=8,
         normalize_embeddings=True,
         convert_to_numpy=True,
+        # A single query is a single batch: the bar would say nothing, and the
+        # search server would draw one per request.
+        show_progress_bar=False,
     )
     assert result == pytest.approx([0.1, 0.2, 0.3])
 
@@ -186,6 +190,9 @@ def test_prefix_defaults_to_model_prompt_when_model_has_none(
         batch_size=8,
         normalize_embeddings=True,
         convert_to_numpy=True,
+        # A single query is a single batch: the bar would say nothing, and the
+        # search server would draw one per request.
+        show_progress_bar=False,
     )
 
 
@@ -235,3 +242,29 @@ def test_check_collection_model_missing_key():
         check_collection_model(collection, settings.EMBEDDING_MODEL)
 
     assert "predates" in str(excinfo.value)
+
+
+def test_a_query_does_not_draw_a_progress_bar():
+    """One query is one batch: the bar says nothing and the server would draw
+    one per request. The builder keeps its bar, where thousands of chunks make
+    it worth reading."""
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    from mcp_manual_walker.embeddings import SentenceTransformerEmbedder
+
+    e = SentenceTransformerEmbedder.__new__(SentenceTransformerEmbedder)
+    e._token_budget = 0
+    e._batch_size = 32
+    e._query_prefix = "Q: "
+    e._document_prefix = ""
+    e.model = MagicMock()
+    e.model.encode.return_value = np.array([[0.1, 0.2]])
+
+    e.embed_query("anything")
+    assert e.model.encode.call_args.kwargs["show_progress_bar"] is False
+
+    e.model.encode.reset_mock()
+    e.embed_documents(["a", "b"])
+    assert e.model.encode.call_args.kwargs["show_progress_bar"] is True

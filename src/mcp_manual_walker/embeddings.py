@@ -163,7 +163,9 @@ class SentenceTransformerEmbedder:
             batches.append(current)
         return batches
 
-    def _encode(self, texts: list[str], prompt: str) -> list[list[float]]:
+    def _encode(
+        self, texts: list[str], prompt: str, show_progress: bool = True
+    ) -> list[list[float]]:
         if not texts:
             return []
         # An empty prefix is passed as None: Sentence Transformers would otherwise
@@ -176,6 +178,7 @@ class SentenceTransformerEmbedder:
                 batch_size=self._batch_size,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
+                show_progress_bar=show_progress,
             )
             return vectors.tolist()
 
@@ -189,6 +192,7 @@ class SentenceTransformerEmbedder:
                 batch_size=len(batch),
                 normalize_embeddings=True,
                 convert_to_numpy=True,
+                show_progress_bar=show_progress,
             )
             for index, vector in zip(batch, vectors.tolist()):
                 results[index] = vector
@@ -241,8 +245,13 @@ class SentenceTransformerEmbedder:
         return self._encode(list(texts), self._document_prefix)
 
     def embed_query(self, text: str) -> list[float]:
-        """Embeds a single search query (instruction prefix applied)."""
-        return self._encode([text], self._query_prefix)[0]
+        """Embeds a single search query (instruction prefix applied).
+
+        No progress bar: one query is one batch, so the bar says nothing, and
+        the search server would draw one per request. The builder keeps its
+        bar, where thousands of chunks make it worth reading.
+        """
+        return self._encode([text], self._query_prefix, show_progress=False)[0]
 
     def __call__(self, input: list[str]) -> list[list[float]]:
         """Alias for embed_documents, for callers expecting a Chroma-style callable."""
