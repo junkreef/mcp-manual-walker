@@ -1,6 +1,7 @@
 import contextlib
 import logging
-from typing import Any, Optional
+import time
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from mcp_manual_walker.config import settings
 
@@ -16,6 +17,44 @@ EMBEDDING_MODEL_METADATA_KEY = "embedding_model"
 _INSTALL_HINT = (
     "install with `uv sync --extra cpu` (server) or `--extra builder` (GPU build)"
 )
+
+# Prompts a remote endpoint cannot tell us about.
+#
+# With SentenceTransformers the prefixes come from the model's own
+# config_sentence_transformers.json. An OpenAI-compatible endpoint exposes no
+# such thing -- llama.cpp embeds exactly the string it is sent -- so a remote
+# backend has to carry them itself, and getting this wrong is invisible: the
+# vectors are still 1024 well-formed numbers, they simply answer a slightly
+# different question than the stored ones do.
+_KNOWN_PROMPTS: dict[str, dict[str, str]] = {
+    "Qwen/Qwen3-Embedding-0.6B": {
+        "query": (
+            "Instruct: Given a web search query, retrieve relevant passages "
+            "that answer the query\nQuery:"
+        ),
+        "document": "",
+    },
+}
+_KNOWN_PROMPTS["Qwen/Qwen3-Embedding-4B"] = _KNOWN_PROMPTS["Qwen/Qwen3-Embedding-0.6B"]
+_KNOWN_PROMPTS["Qwen/Qwen3-Embedding-8B"] = _KNOWN_PROMPTS["Qwen/Qwen3-Embedding-0.6B"]
+
+
+@runtime_checkable
+class Embedder(Protocol):
+    """What the builder and the search server need from an embedding backend."""
+
+    @property
+    def model_name(self) -> str:
+        """The name stamped on the vector collection, not the endpoint's id."""
+
+    @property
+    def dimension(self) -> int: ...
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+
+    def embed_query(self, text: str) -> list[float]: ...
+
+    def on_device(self) -> Any: ...
 
 
 def _resolve_device(preferred: str) -> str:
@@ -258,13 +297,210 @@ class SentenceTransformerEmbedder:
         return self.embed_documents(input)
 
 
-def get_embedder() -> Optional[SentenceTransformerEmbedder]:
+class OpenAICompatibleEmbedder:
+    """Embeds through an OpenAI-compatible ``/v1/embeddings`` endpoint.
+
+    Interchangeable with SentenceTransformerEmbedder for both callers, with two
+    differences that are the whole reason it exists and the whole reason it is
+    not the default:
+
+    * It needs no torch and no resident model, so the search server -- which
+      embeds exactly one short query per request -- stops paying for a 0.6B
+      model it uses for a few milliseconds at a time.
+    * It is an HTTP round trip per batch, so embedding a whole corpus through
+      it is far slower than the builder's GPU. The builder stays on "local".
+
+    ``model_name`` deliberately reports ``settings.EMBEDDING_MODEL`` rather than
+    the id the endpoint was called with. The collection records which *vector
+    space* it holds; whether today's vectors came from a local checkpoint or
+    from a GGUF of the same model behind a server is a deployment detail, and
+    making it part of the recorded identity would reject a database that is in
+    fact perfectly readable.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        api_base: str,
+        api_model: str,
+        api_key: str,
+        query_prefix: Optional[str],
+        document_prefix: Optional[str],
+        batch_size: int,
+        timeout: float,
+        max_retries: int,
+    ):
+        if not api_base:
+            raise ValueError(
+                "EMBEDDING_BACKEND is 'openai' but EMBEDDING_API_BASE is empty."
+            )
+
+        self._model_name = model_name
+        self._url = api_base.rstrip("/") + "/embeddings"
+        self._api_model = api_model or model_name
+        self._api_key = api_key
+        self._batch_size = max(1, batch_size)
+        self._timeout = timeout
+        self._max_retries = max(1, max_retries)
+        self._dimension: Optional[int] = None
+
+        prompts = _KNOWN_PROMPTS.get(model_name)
+        if prompts is None and (query_prefix is None or document_prefix is None):
+            logger.warning(
+                "No stored prompts are known for '%s' and the remote backend "
+                "cannot read them from the model. Falling back to no prefix; "
+                "set EMBEDDING_QUERY_PREFIX and EMBEDDING_DOCUMENT_PREFIX "
+                "explicitly if the model expects one, or queries will search a "
+                "different space than the stored vectors occupy.",
+                model_name,
+            )
+        prompts = prompts or {}
+        self._query_prefix = (
+            query_prefix if query_prefix is not None else prompts.get("query", "")
+        )
+        self._document_prefix = (
+            document_prefix
+            if document_prefix is not None
+            else prompts.get("document", "")
+        )
+        logger.info("Resolved embedding query prefix: %r", self._query_prefix)
+        logger.info("Resolved embedding document prefix: %r", self._document_prefix)
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def query_prefix(self) -> str:
+        return self._query_prefix
+
+    @property
+    def document_prefix(self) -> str:
+        return self._document_prefix
+
+    @property
+    def dimension(self) -> int:
+        """Asks the endpoint, once, by embedding a probe string."""
+        if self._dimension is None:
+            self._dimension = len(self._post([""])[0])
+        return self._dimension
+
+    def _post(self, texts: list[str]) -> list[list[float]]:
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        payload = {"model": self._api_model, "input": texts}
+
+        last_error: Optional[Exception] = None
+        for attempt in range(self._max_retries):
+            try:
+                response = httpx.post(
+                    self._url, json=payload, headers=headers, timeout=self._timeout
+                )
+                response.raise_for_status()
+                body = response.json()
+            except Exception as e:  # noqa: BLE001 - retried below, re-raised after
+                last_error = e
+                if attempt + 1 < self._max_retries:
+                    delay = 2.0**attempt
+                    logger.warning(
+                        "Embedding request failed (%s); retrying in %.0fs "
+                        "(attempt %d/%d).",
+                        e, delay, attempt + 1, self._max_retries,
+                    )
+                    time.sleep(delay)
+                continue
+
+            # The response is not promised to come back in request order.
+            data = sorted(body["data"], key=lambda item: item.get("index", 0))
+            if len(data) != len(texts):
+                raise RuntimeError(
+                    f"Embedding endpoint returned {len(data)} vectors for "
+                    f"{len(texts)} inputs."
+                )
+            return [item["embedding"] for item in data]
+
+        raise RuntimeError(
+            f"Embedding endpoint {self._url} failed after "
+            f"{self._max_retries} attempts: {last_error}"
+        ) from last_error
+
+    def _encode(self, texts: list[str], prefix: str) -> list[list[float]]:
+        if not texts:
+            return []
+        prefixed = [prefix + text for text in texts] if prefix else list(texts)
+        vectors: list[list[float]] = []
+        for start in range(0, len(prefixed), self._batch_size):
+            vectors.extend(self._post(prefixed[start : start + self._batch_size]))
+
+        # The application's collections use cosine, and the local backend
+        # normalises. An endpoint is not obliged to, and an unnormalised vector
+        # would not fail -- it would just rank badly -- so it is done here.
+        return [_normalize(vector) for vector in vectors]
+
+    @contextlib.contextmanager
+    def on_device(self):
+        """No-op: the model is somebody else's process."""
+        yield
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._encode(list(texts), self._document_prefix)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._encode([text], self._query_prefix)[0]
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        return self.embed_documents(input)
+
+
+def _normalize(vector: list[float]) -> list[float]:
+    norm = sum(value * value for value in vector) ** 0.5
+    if norm == 0.0:
+        return vector
+    return [value / norm for value in vector]
+
+
+def get_embedder() -> Optional[Embedder]:
     """
     Builds the embedder from the application settings.
 
-    Returns None (after logging an actionable error) when sentence-transformers
-    or its torch backend are not installed.
+    Returns None (after logging an actionable error) when the selected backend
+    is unusable: sentence-transformers or torch not installed for "local", or a
+    missing/unreachable endpoint for "openai".
     """
+    backend = settings.EMBEDDING_BACKEND.strip().lower()
+
+    if backend == "openai":
+        logger.info(
+            f"Embedding via {settings.EMBEDDING_API_BASE} as "
+            f"'{settings.EMBEDDING_API_MODEL or settings.EMBEDDING_MODEL}' "
+            f"(recorded as {settings.EMBEDDING_MODEL})"
+        )
+        try:
+            return OpenAICompatibleEmbedder(
+                model_name=settings.EMBEDDING_MODEL,
+                api_base=settings.EMBEDDING_API_BASE,
+                api_model=settings.EMBEDDING_API_MODEL,
+                api_key=settings.EMBEDDING_API_KEY,
+                query_prefix=settings.EMBEDDING_QUERY_PREFIX,
+                document_prefix=settings.EMBEDDING_DOCUMENT_PREFIX,
+                batch_size=settings.EMBEDDING_API_BATCH_SIZE,
+                timeout=settings.EMBEDDING_API_TIMEOUT,
+                max_retries=settings.EMBEDDING_API_MAX_RETRIES,
+            )
+        except (ImportError, ValueError) as e:
+            logger.error(f"Remote embedding backend is unusable: {e}")
+            return None
+
+    if backend != "local":
+        logger.error(
+            f"EMBEDDING_BACKEND is '{settings.EMBEDDING_BACKEND}'; "
+            "expected 'local' or 'openai'."
+        )
+        return None
+
     device = _resolve_device(settings.EMBEDDING_DEVICE)
     logger.info(
         f"Loading embedding model {settings.EMBEDDING_MODEL} on device: {device} "
@@ -314,7 +550,7 @@ HNSW_MAX_NEIGHBORS = 32
 HNSW_EF_CONSTRUCTION = 200
 
 
-def collection_metadata(embedder: SentenceTransformerEmbedder) -> dict[str, Any]:
+def collection_metadata(embedder: Embedder) -> dict[str, Any]:
     """Metadata stored on the Chroma collection when it is first created."""
     return {
         EMBEDDING_MODEL_METADATA_KEY: embedder.model_name,
