@@ -756,6 +756,8 @@ def command_delete(args):
             logger.warning(f"No manuals found matching target: {target}")
             return
 
+        manual_ids = [manual.id for manual in manuals]
+
         for manual in manuals:
             logger.info(f"Deleting manual: {manual.relative_path} (ID: {manual.id})")
 
@@ -769,6 +771,15 @@ def command_delete(args):
             # Delete from SQLite (cascades to bookmarks and figures)
             session.delete(manual)
             logger.info("  - Deleted from SQLite (bookmarks and figures included)")
+
+        # And from the BM25 index, in the same transaction as the rows above.
+        # It is derived data, but leaving it behind is not merely stale: the
+        # ids it keeps returning no longer resolve in Chroma, so those hits
+        # drop out of the results after the ranks have already been fused.
+        # One statement for all of them -- manual_id is UNINDEXED, so this is
+        # a scan of the index and it should only be paid once.
+        removed = lexical.delete_manuals(lexical.sqlite_connection(session), manual_ids)
+        logger.info(f"Deleted {removed:,} row(s) from the lexical index.")
 
         session.commit()
         logger.info("Deletion complete.")

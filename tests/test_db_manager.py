@@ -1,5 +1,6 @@
 import io
 import json
+import sqlite3
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -10,6 +11,7 @@ from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from mcp_manual_walker import lexical
 from mcp_manual_walker.config import settings
 from mcp_manual_walker.db_manager import (
     CHUNKS_ZST_FILE_NAME,
@@ -125,6 +127,16 @@ def test_command_delete(mock_session, mock_chroma):
     )
     mock_session.execute.return_value.scalars.return_value.all.return_value = [manual]
 
+    # A real FTS index behind the mocked session: the third store the delete
+    # has to reach, and a MagicMock would report success without touching it.
+    fts = sqlite3.connect(":memory:")
+    lexical.create_table(fts)
+    lexical.add_chunks(
+        fts, [("c1", "uuid-del", "alpha"), ("c2", "uuid-keep", "beta")]
+    )
+    lexical.optimize(fts)
+    mock_session.connection.return_value.connection.driver_connection = fts
+
     # Act
     args = Namespace(target="del.pdf")
     command_delete(args)
@@ -136,6 +148,10 @@ def test_command_delete(mock_session, mock_chroma):
 
     # Check Chroma delete
     collection.delete.assert_called_with(where={"manual_id": "uuid-del"})
+
+    # Check the BM25 index, and that only the named manual left it
+    assert [r[0] for r in fts.execute("SELECT chunk_id FROM chunks_fts")] == ["c2"]
+    assert fts.execute("SELECT total FROM chunks_fts_stats").fetchone()[0] == 1
 
 
 def test_command_export(tmp_path, mock_session, mock_chroma):
