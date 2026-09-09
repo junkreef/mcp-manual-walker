@@ -146,3 +146,12 @@ cache/
 
 # Data
 data/
+
+# Local operational scripts: one-off build/export/recovery runs for a specific
+# corpus and host, not part of the package.
+run_*.sh
+reembed_*.py
+
+# Backups of .env are still .env: the pattern above only covers the exact name.
+.env.bak*
+.env.*.bak

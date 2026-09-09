@@ -26,17 +26,18 @@ class Label:
 
 
 class BBox:
-    def __init__(self, top: float):
+    def __init__(self, top: float, size=(100.0, 10.0)):
+        width, height = size
         self.t = top
-        self.b = top - 10.0
+        self.b = top - height
         self.l = 0.0  # noqa: E741 - mirrors the docling attribute name
-        self.r = 100.0
+        self.r = width
 
 
 class Prov:
-    def __init__(self, page_no: int, top: float):
+    def __init__(self, page_no: int, top: float, size=(100.0, 10.0)):
         self.page_no = page_no
-        self.bbox = BBox(top)
+        self.bbox = BBox(top, size)
 
 
 class Ref:
@@ -73,9 +74,11 @@ class TableItem:
 
 
 class PictureItem:
-    def __init__(self, page, top, index, caption="", description=None):
+    def __init__(
+        self, page, top, index, caption="", description=None, size=(100.0, 10.0)
+    ):
         self.label = Label("picture")
-        self.prov = [Prov(page, top)]
+        self.prov = [Prov(page, top, size)]
         self.self_ref = f"#/pictures/{index}"
         self.children = []
         self._caption = caption
@@ -446,3 +449,127 @@ def test_the_boundary_is_inclusive():
     at_limit = "x" * settings.CHUNK_SIZE
     assert _split_if_long(at_limit, splitter) == [at_limit]
     assert _split_if_long(at_limit + "x", splitter) == ["split"]
+
+
+# --- inline markers -------------------------------------------------------
+#
+# A version badge, a "GUPI"/"PSPI" boundary or a "Note" icon is a picture, but
+# it is not a figure: it qualifies the text it sits in. Emitting one as its own
+# chunk both strips the qualifier off the paragraph and cuts the paragraph in
+# two at the badge.
+
+MARKER_SIZE = (14.0, 8.0)  # 112pt, well under INLINE_MARKER_MAX_AREA
+
+
+def make_marker(page, top, index, text="6.2", size=MARKER_SIZE):
+    """A small picture whose only child is the text drawn inside it."""
+    picture = PictureItem(page=page, top=top, index=index, size=size)
+    picture.children = [Ref(TextItem(text, page=page, top=top))]
+    return picture
+
+
+def test_a_small_repeated_picture_does_not_become_a_figure(manual):
+    markers = [make_marker(1, 700.0 - i, i) for i in range(10)]
+    doc = FakeDoc([TextItem("Body text", page=1, top=800.0)] + markers)
+
+    chunks = chunk_document(doc, manual)
+
+    assert [c for c in chunks if c["metadata"]["type"] == "figure"] == []
+
+
+def test_a_marker_joins_the_paragraph_it_qualifies(manual):
+    """The badge precedes the passage it applies to, and must stay with it."""
+    markers = [make_marker(1, 700.0 - i, i) for i in range(9)]
+    doc = FakeDoc(
+        [
+            TextItem("Before the badge.", page=1, top=800.0),
+            make_marker(1, 780.0, 9),
+            TextItem("This applies to 6.2 only.", page=1, top=760.0),
+        ]
+        + markers
+    )
+
+    chunks = chunk_document(doc, manual)
+
+    text = [c for c in chunks if c["metadata"]["type"] == "text"]
+    assert len(text) == 1, "the marker must not cut the paragraph in two"
+    assert "[6.2] This applies to 6.2 only." in text[0]["text"]
+    assert "Before the badge." in text[0]["text"]
+
+
+def test_a_small_picture_that_does_not_repeat_enough_is_still_a_figure(manual):
+    """One short of the threshold: a rare small picture is real content."""
+    markers = [make_marker(1, 700.0 - i, i) for i in range(9)]
+    doc = FakeDoc([TextItem("Body text", page=1, top=800.0)] + markers)
+
+    chunks = chunk_document(doc, manual)
+
+    assert len([c for c in chunks if c["metadata"]["type"] == "figure"]) == 9
+
+
+def test_a_large_repeated_picture_is_still_a_figure(manual):
+    """Recurrence alone is not enough -- a repeated diagram stays a figure."""
+    pictures = [
+        make_marker(1, 700.0 - i, i, size=(200.0, 150.0)) for i in range(20)
+    ]
+    doc = FakeDoc([TextItem("Body text", page=1, top=800.0)] + pictures)
+
+    chunks = chunk_document(doc, manual)
+
+    assert len([c for c in chunks if c["metadata"]["type"] == "figure"]) == 20
+
+
+def test_a_marker_with_no_text_leaves_nothing_behind(manual):
+    """A bare icon has no label to inline; it must still not split the text."""
+    icons = [
+        PictureItem(page=1, top=700.0 - i, index=i, size=MARKER_SIZE)
+        for i in range(10)
+    ]
+    doc = FakeDoc(
+        [
+            TextItem("First half.", page=1, top=800.0),
+            icons[0],
+            TextItem("Second half.", page=1, top=790.0),
+        ]
+        + icons[1:]
+    )
+
+    chunks = chunk_document(doc, manual)
+
+    text = [c for c in chunks if c["metadata"]["type"] == "text"]
+    assert len(text) == 1
+    assert text[0]["text"] == "First half.\n\nSecond half."
+
+
+def test_a_trailing_marker_is_not_dropped(manual):
+    """A marker that no text follows still has to reach a chunk."""
+    markers = [make_marker(1, 700.0 - i, i) for i in range(9)]
+    doc = FakeDoc(
+        [TextItem("Body text", page=1, top=800.0)]
+        + markers
+        + [make_marker(1, 600.0, 9, text="6.3")]
+    )
+
+    chunks = chunk_document(doc, manual)
+
+    assert any("[6.3]" in c["text"] for c in chunks)
+
+
+def test_a_marker_keeps_a_caption_docling_attached_to_it(manual):
+    """Rare, but real: the caption of a badge was the abend code next to it."""
+    markers = [make_marker(1, 700.0 - i, i) for i in range(9)]
+    captioned = make_marker(1, 780.0, 9)
+    captioned._caption = "AEE3"
+    doc = FakeDoc(
+        [
+            captioned,
+            TextItem("Explanation follows.", page=1, top=760.0),
+        ]
+        + markers
+    )
+
+    chunks = chunk_document(doc, manual)
+
+    text = [c for c in chunks if c["metadata"]["type"] == "text"]
+    assert "AEE3" in text[0]["text"]
+    assert "[6.2]" in text[0]["text"]

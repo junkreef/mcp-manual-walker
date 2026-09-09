@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import logging
+import sqlite3
 import sys
 import zipfile
 from datetime import datetime
@@ -738,6 +739,63 @@ def command_reindex_lexical(args):
         session.close()
 
 
+def command_optimize_lexical(args):
+    """Merges the BM25 index's b-trees without rebuilding it.
+
+    Every write leaves the index as several segments, and a delete leaves
+    tombstones rather than reclaiming the space, so an index that has been
+    added to and deleted from is answering each query out of more segments
+    than it needs. FTS5's 'optimize' merges them into one in a single pass and
+    is a no-op on an index already in that state, so it is safe to run at any
+    time.
+
+    This is the cheap half of `reindex-lexical`. That command rereads every
+    chunk out of ChromaDB and is the right answer when the index is *wrong* or
+    missing; this one only compacts what is already there, and is the right
+    answer when it is merely untidy -- after a `delete`, most obviously.
+
+    FTS5's incremental 'merge' is deliberately not offered. It does bounded
+    work per call, which sounds like the kinder option for a large index, but
+    on SQLite 3.53.1 it never reports itself finished: 500 passes of
+    ('merge', 64) left the index less merged than a single 'optimize' did, and
+    `changes()` stayed non-zero throughout, so there is no condition to stop
+    on.
+    """
+    session = SessionLocal()
+    try:
+        conn = lexical.sqlite_connection(session)
+        if not lexical.table_exists(conn):
+            logger.warning(
+                "No lexical index in this database; run reindex-lexical first."
+            )
+            return
+        before = _lexical_segment_rows(conn)
+        total = lexical.optimize(conn)
+        session.commit()
+        after = _lexical_segment_rows(conn)
+        logger.info(
+            f"Lexical index optimized: {total:,} chunk(s), "
+            f"{before:,} -> {after:,} index page(s)."
+        )
+    finally:
+        session.close()
+
+
+def _lexical_segment_rows(conn) -> int:
+    """Rows in the FTS5 shadow table that holds the index itself.
+
+    Not a segment count -- FTS5 exposes none -- but it moves with one, which
+    is all this is for: showing that the merge did something.
+    """
+    try:
+        row = conn.execute(
+            f"SELECT count(*) FROM {lexical.FTS_TABLE}_data"
+        ).fetchone()
+        return int(row[0])
+    except sqlite3.OperationalError:
+        return 0
+
+
 def command_delete(args):
     target = args.target
     logger.info(f"Attempting to delete targets matching: {target}")
@@ -756,6 +814,8 @@ def command_delete(args):
             logger.warning(f"No manuals found matching target: {target}")
             return
 
+        manual_ids = [manual.id for manual in manuals]
+
         for manual in manuals:
             logger.info(f"Deleting manual: {manual.relative_path} (ID: {manual.id})")
 
@@ -769,6 +829,15 @@ def command_delete(args):
             # Delete from SQLite (cascades to bookmarks and figures)
             session.delete(manual)
             logger.info("  - Deleted from SQLite (bookmarks and figures included)")
+
+        # And from the BM25 index, in the same transaction as the rows above.
+        # It is derived data, but leaving it behind is not merely stale: the
+        # ids it keeps returning no longer resolve in Chroma, so those hits
+        # drop out of the results after the ranks have already been fused.
+        # One statement for all of them -- manual_id is UNINDEXED, so this is
+        # a scan of the index and it should only be paid once.
+        removed = lexical.delete_manuals(lexical.sqlite_connection(session), manual_ids)
+        logger.info(f"Deleted {removed:,} row(s) from the lexical index.")
 
         session.commit()
         logger.info("Deletion complete.")
@@ -962,6 +1031,13 @@ def main():
         help="Rebuild the BM25 index from the chunks already in ChromaDB",
     )
     parser_lex.set_defaults(func=command_reindex_lexical)
+
+    # Lexical optimize Command
+    parser_lexopt = subparsers.add_parser(
+        "optimize-lexical",
+        help="Merge the BM25 index's b-trees in place (no rebuild)",
+    )
+    parser_lexopt.set_defaults(func=command_optimize_lexical)
 
     # Search Command
     parser_search = subparsers.add_parser("search", help="Search the database")

@@ -9,6 +9,7 @@ from mcp_manual_walker.lexical import (
     add_chunks,
     build_match_query,
     create_table,
+    delete_manuals,
     discriminating_terms,
     fuse_dense_and_lexical,
     optimize,
@@ -201,3 +202,54 @@ def test_the_rarity_gate_survives_a_small_collection(conn):
     """
     assert discriminating_terms(conn, "IEF450I", max_df_ratio=0.0005) == ["IEF450I"]
     assert search(conn, "IEF450I", max_df_ratio=0.0005) == ["c1"]
+
+
+def test_deleting_a_manual_takes_its_chunks_out_of_the_index(conn):
+    """A manual dropped from SQLite and Chroma must leave nothing behind here.
+
+    The orphan is not a cosmetic problem: BM25 keeps ranking chunk ids that no
+    longer resolve, and the server drops them *after* fusion, so the query
+    returns fewer hits than the ranking promised.
+    """
+    assert search(conn, "IEF450I") == ["c1"]
+
+    assert delete_manuals(conn, ["m1"]) == 3
+
+    assert search(conn, "IEF450I") == []
+    remaining = {r[0] for r in conn.execute(f"SELECT chunk_id FROM {FTS_TABLE}")}
+    assert "c1" not in remaining and "c4" in remaining
+
+
+def test_deleting_a_manual_corrects_the_recorded_corpus_size(conn):
+    """The rarity gate reads the stored total; left too high, its ceiling rises
+    with it and terms it should have rejected get sent to BM25."""
+    before = _recorded_total(conn)
+    delete_manuals(conn, ["m3"])
+    assert _recorded_total(conn) == before - 60
+
+
+def test_deleting_several_manuals_at_once(conn):
+    assert delete_manuals(conn, ["m1", "m2"]) == 6
+    assert {r[0] for r in conn.execute(f"SELECT manual_id FROM {FTS_TABLE}")} == {"m3"}
+
+
+def test_deleting_a_manual_that_was_never_indexed_changes_nothing(conn):
+    assert delete_manuals(conn, ["nope"]) == 0
+    assert _recorded_total(conn) == 66
+
+
+def test_deleting_from_a_database_with_no_index_is_not_an_error():
+    """`delete` runs against databases built before the index existed."""
+    assert delete_manuals(sqlite3.connect(":memory:"), ["m1"]) == 0
+
+
+def test_deleting_more_manuals_than_sqlite_takes_parameters(conn):
+    """The ids are batched, so a delete cannot hit SQLITE_MAX_VARIABLE_NUMBER."""
+    add_chunks(conn, [(f"x{i}", f"many{i}", "alpha") for i in range(1200)])
+    optimize(conn)
+    assert delete_manuals(conn, [f"many{i}" for i in range(1200)]) == 1200
+    assert _recorded_total(conn) == 66
+
+
+def _recorded_total(conn):
+    return conn.execute("SELECT total FROM chunks_fts_stats").fetchone()[0]

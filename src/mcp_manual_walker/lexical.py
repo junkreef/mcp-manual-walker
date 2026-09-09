@@ -156,14 +156,56 @@ def add_chunks(conn: sqlite3.Connection, rows: Iterable[tuple[str, str, str]]) -
     return written
 
 
-def optimize(conn: sqlite3.Connection) -> int:
-    """Merges the FTS b-trees and records the chunk count. Call after a load."""
-    conn.execute(f"INSERT INTO {FTS_TABLE}({FTS_TABLE}) VALUES ('optimize')")
+def record_total(conn: sqlite3.Connection) -> int:
+    """Recounts the index and stores the figure the rarity gate reads.
+
+    The count is a full scan, so it is done once per write of the index rather
+    than per query -- which is the whole reason ``STATS_TABLE`` exists.
+    """
     conn.execute(f"CREATE TABLE IF NOT EXISTS {STATS_TABLE} (total INTEGER NOT NULL)")
     conn.execute(f"DELETE FROM {STATS_TABLE}")
     total = conn.execute(f"SELECT count(*) FROM {FTS_TABLE}").fetchone()[0]
     conn.execute(f"INSERT INTO {STATS_TABLE}(total) VALUES (?)", (int(total),))
     return int(total)
+
+
+def optimize(conn: sqlite3.Connection) -> int:
+    """Merges the FTS b-trees and records the chunk count. Call after a load."""
+    conn.execute(f"INSERT INTO {FTS_TABLE}({FTS_TABLE}) VALUES ('optimize')")
+    return record_total(conn)
+
+
+def delete_manuals(conn: sqlite3.Connection, manual_ids: Iterable[str]) -> int:
+    """Drops every indexed chunk of these manuals. Returns the rows removed.
+
+    A manual deleted from SQLite and ChromaDB but left in here is worse than a
+    stale row: BM25 goes on returning its chunk ids, the server looks them up
+    in Chroma, finds nothing, and the hit silently vanishes from the results --
+    so a lexical query returns fewer than it found, and the ranks the fusion
+    was given no longer mean what they said.
+
+    ``manual_id`` is UNINDEXED, so each pass is a scan of the index; the ids
+    are batched into one statement to keep it to a single scan. No ``optimize``
+    follows, because fts5vocab already reports the post-delete document
+    frequencies and the merge would cost far more than the delete.
+    """
+    if not table_exists(conn):
+        return 0
+    ids = [str(m) for m in manual_ids if m]
+    if not ids:
+        return 0
+    deleted = 0
+    # Comfortably under SQLITE_MAX_VARIABLE_NUMBER, which is 999 on builds
+    # predating SQLite 3.32.
+    for start in range(0, len(ids), 500):
+        batch = ids[start : start + 500]
+        placeholders = ",".join("?" * len(batch))
+        cursor = conn.execute(
+            f"DELETE FROM {FTS_TABLE} WHERE manual_id IN ({placeholders})", batch
+        )
+        deleted += max(cursor.rowcount, 0)
+    record_total(conn)
+    return deleted
 
 
 def table_exists(conn: sqlite3.Connection) -> bool:

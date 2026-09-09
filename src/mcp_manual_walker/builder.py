@@ -902,6 +902,36 @@ def _ingest_document(
 
         metadatas.append(meta)
 
+    # Pictures the chunker did not turn into a figure chunk still get a row.
+    # Most of them are inline markers (see chunking._inline_marker_shapes),
+    # whose text now travels inside the paragraph they qualify and so needs no
+    # chunk of its own -- but the image is kept regardless, so that judging one
+    # wrongly costs it its own chunk rather than the picture itself. The row
+    # carries no caption, labels or bookmark: those belong to a chunk, and
+    # there is none.
+    for index, record in sorted(figures_by_index.items()):
+        if index in figure_rows:
+            continue
+        bbox = record["bbox"]
+        figure = Figure(
+            id=str(uuid.uuid4()),
+            manual_id=str(manual.id),
+            bookmark_id=None,
+            picture_index=int(record["picture_index"]),
+            page=int(record["page"]),
+            bbox_l=float(bbox[0]),
+            bbox_b=float(bbox[1]),
+            bbox_r=float(bbox[2]),
+            bbox_t=float(bbox[3]),
+            mime_type="image/png",
+            width=record["width"],
+            height=record["height"],
+            image=record["png"],
+        )
+        session.add(figure)
+        stored_figures += 1
+        figure_rows[index] = figure
+
     # Commit the figures before touching Chroma: a figure row without its chunk
     # is harmless, a chunk pointing at a missing figure id is not.
     if stored_figures:

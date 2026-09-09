@@ -7,11 +7,14 @@ picture and the Docling description in its metadata, so the builder can persist
 them next to the image. Docling types are never imported here: item kinds are
 detected through their ``label`` value and duck-typed methods, so tests can use
 light fakes.
+
+Not every picture is a figure: see ``_inline_marker_shapes``.
 """
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from collections import Counter
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 
@@ -29,6 +32,13 @@ HEADING_LABELS = frozenset({"section_header", "title"})
 # A bookmark destination often sits a few points above its heading, so the
 # coordinate rule allows a small tolerance (PDF points, bottom-left origin).
 BOOKMARK_TOP_TOLERANCE = 10.0
+
+# Bounds of an inline marker: see _inline_marker_shapes. The area is in PDF
+# points rather than rendered pixels so that DOCLING_IMAGES_SCALE cannot move
+# it -- 675pt is a 26pt square, which at the default scale of 2.0 is the
+# 2,700px the thresholds below were measured against.
+INLINE_MARKER_MAX_AREA = 675.0
+INLINE_MARKER_MIN_REPEATS = 10
 
 # Leading section numbering to drop when comparing titles: "3", "2.1", "3-1",
 # "IV.", "A." (letters and roman numerals require trailing punctuation, so an
@@ -240,6 +250,55 @@ def _picture_description(item: Any) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
+def _bbox_size(prov: Any) -> Tuple[float, float]:
+    """Returns the (width, height) of a provenance bbox in PDF points."""
+    bbox = getattr(prov, "bbox", None)
+    if bbox is None:
+        return 0.0, 0.0
+    return abs(bbox.r - bbox.l), abs(bbox.t - bbox.b)
+
+
+def _bbox_shape(prov: Any) -> Tuple[int, int]:
+    """The bbox size rounded to whole points, as an inline-marker group key."""
+    width, height = _bbox_size(prov)
+    return round(width), round(height)
+
+
+def _inline_marker_shapes(doc: Any) -> Set[Tuple[int, int]]:
+    """Returns the bbox shapes, in points, of this document's inline markers.
+
+    An inline marker is a picture that is small and recurs through the
+    document: an applicability badge ("6.2" in CICS, "Multi" / "Windows" in
+    MQ), an interface boundary ("GUPI" / "PSPI" in Db2), a "Note" or warning
+    icon, a copyright sign. It is not a figure. Its meaning belongs to the
+    text it sits in, so giving it a chunk of its own does real damage twice
+    over: the paragraph loses the qualifier that applies to it, and ``flush()``
+    cuts the paragraph in two at the marker. Measured on CICS TS 6.2, a quarter
+    of all text chunks were under 50 characters against 3% for Db2 and MQ, and
+    the median text chunk was 545 characters against roughly 1,400.
+
+    Size alone cannot decide this: real figures run smaller than these markers
+    do (5th percentile 684px against the badges' 2,128px), so a plain size cut
+    takes content with it. Recurrence is what makes the rule safe -- a badge
+    repeats on page after page, a diagram does not.
+
+    Byte equality is *not* used to count the repeats: a badge is re-rendered
+    per page, so only about half of them are byte-identical, against 94% of
+    them sharing a bbox shape.
+    """
+    counts: Counter = Counter()
+    for picture in getattr(doc, "pictures", None) or []:
+        prov = _first_prov(picture)
+        if prov is None:
+            continue
+        width, height = _bbox_size(prov)
+        if 0 < width * height <= INLINE_MARKER_MAX_AREA:
+            counts[_bbox_shape(prov)] += 1
+    return {
+        shape for shape, n in counts.items() if n >= INLINE_MARKER_MIN_REPEATS
+    }
+
+
 def _picture_index(item: Any, fallback: int) -> int:
     """Parses the picture index out of a self_ref like "#/pictures/3"."""
     self_ref = str(getattr(item, "self_ref", "") or "")
@@ -350,9 +409,33 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
 
     current_bookmark: Optional[Bookmark] = None
     buffer: List[str] = []
+    # Markers seen since the last text item, waiting to be attached to the text
+    # they qualify. A badge is drawn before the passage it applies to, so it is
+    # carried forward rather than appended where it was found.
+    pending_markers: List[str] = []
+    marker_shapes = _inline_marker_shapes(doc)
+
+    def _marker_text() -> str:
+        return " ".join(f"[{marker}]" for marker in pending_markers)
+
+    def add_text(text: str) -> None:
+        """Buffers a text item, prefixed by any marker that qualifies it."""
+        nonlocal pending_markers
+        if pending_markers:
+            text = f"{_marker_text()} {text}"
+            pending_markers = []
+        buffer.append(text)
+
+    def drain_markers() -> None:
+        """Buffers markers that no text item followed, so none is dropped."""
+        nonlocal pending_markers
+        if pending_markers:
+            buffer.append(_marker_text())
+            pending_markers = []
 
     def flush() -> None:
         nonlocal buffer
+        drain_markers()
         if not buffer:
             return
         content = "\n\n".join(buffer)
@@ -369,7 +452,7 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
         if prov is None:
             # No coordinates: keep the text under the bookmark in effect.
             if text and text.strip():
-                buffer.append(text.strip())
+                add_text(text.strip())
             continue
 
         page_no = prov.page_no
@@ -408,10 +491,28 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
             continue
 
         if kind == PICTURE_LABEL:
-            flush()
             caption = _caption_of(item, doc)
             labels = _picture_labels(item, doc, caption)
             description = _picture_description(item)
+
+            if _bbox_shape(prov) in marker_shapes:
+                # An inline marker rather than a figure: hold its text back so
+                # it joins the passage it qualifies, and do not flush -- the
+                # paragraph must not be cut in two at the badge. The picture is
+                # still stored as a figure row by the builder, so misjudging
+                # one costs it its own chunk and nothing else.
+                # Everything Docling attached travels with the marker. A
+                # caption on one of these is rare -- 8 pictures in this corpus
+                # -- but it is real text when it happens ("AEE3", a message id,
+                # "Example 15: ..."), so it must not be dropped for losing a
+                # coin toss against the labels.
+                for part in (caption, ", ".join(labels), description):
+                    if part:
+                        pending_markers.append(part)
+                picture_count += 1
+                continue
+
+            flush()
             parts = [
                 caption,
                 "Labels: " + ", ".join(labels) if labels else "",
@@ -454,7 +555,7 @@ def chunk_document(doc, manual: Manual) -> List[Dict[str, Any]]:
             continue
 
         if text and text.strip():
-            buffer.append(text.strip())
+            add_text(text.strip())
 
     flush()
 
