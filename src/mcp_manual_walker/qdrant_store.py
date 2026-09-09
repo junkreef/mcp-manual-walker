@@ -5,9 +5,15 @@ graph in an anonymous hnswlib arena that has to stay resident; Qdrant keeps
 both in memory-mapped files (`storage_type: InRamMmap`) and lets the kernel
 decide what stays. On 684,398 chunks of 1024 dimensions that is the difference
 between roughly 2.9 GB the process must have and roughly 350 MB it must have
-plus 2.7 GB the operating system may reclaim -- measured by running the whole
-corpus in a container capped at 512 MB with swap disabled, where filtered
-search still answered in 2.58 ms and corpus-wide search in 5.02 ms.
+plus 2.7 GB the operating system may reclaim.
+
+Running that corpus in a container capped at 512 MB with swap disabled, a
+filtered search still answered in 2.58 ms and a corpus-wide one in 5.02 ms.
+That measures the process, not the machine: the host had memory to spare, so
+the mmapped pages stayed in the global page cache. Somewhere genuinely short
+of memory they would be evicted and re-read and the times would rise. What the
+cap does establish is that nothing has to be anonymous memory, so nothing is
+killed -- which is exactly what Chroma cannot say at this size.
 
 Three things this backend has to do that Chroma's does not:
 

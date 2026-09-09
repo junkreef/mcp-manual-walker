@@ -2122,7 +2122,6 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pypdf" },
     { name = "rich" },
-    { name = "sentence-transformers" },
     { name = "sqlalchemy" },
     { name = "zstandard" },
 ]
@@ -2131,6 +2130,7 @@ dependencies = [
 builder = [
     { name = "docling" },
     { name = "langchain-text-splitters" },
+    { name = "sentence-transformers", marker = "extra == 'extra-17-mcp-manual-walker-cu130'" },
     { name = "torch", version = "2.9.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-17-mcp-manual-walker-cu130'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'darwin' and extra != 'extra-17-mcp-manual-walker-cpu' and extra != 'extra-17-mcp-manual-walker-cu130') or (extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130')" },
     { name = "torch", version = "2.14.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-17-mcp-manual-walker-cpu') or (extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130')" },
@@ -2144,12 +2144,14 @@ builder = [
     { name = "torchvision", version = "0.29.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-17-mcp-manual-walker-cpu') or (extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130')" },
 ]
 cpu = [
+    { name = "sentence-transformers" },
     { name = "torch", version = "2.14.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-17-mcp-manual-walker-cpu') or (extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130')" },
     { name = "torch", version = "2.14.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-17-mcp-manual-walker-cpu') or (extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130')" },
     { name = "torchvision", version = "0.29.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-17-mcp-manual-walker-cpu') or (extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130')" },
     { name = "torchvision", version = "0.29.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-17-mcp-manual-walker-cpu') or (extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130')" },
 ]
 cu130 = [
+    { name = "sentence-transformers" },
     { name = "torch", version = "2.9.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" } },
     { name = "torchvision", version = "0.24.1", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-17-mcp-manual-walker-cu130') or (python_full_version >= '3.15' and extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130') or (platform_machine != 'aarch64' and extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130') or (platform_python_implementation != 'CPython' and extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130') or (sys_platform != 'linux' and extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130')" },
     { name = "torchvision", version = "0.24.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(python_full_version >= '3.15' and extra == 'extra-17-mcp-manual-walker-cu130') or (python_full_version < '3.15' and extra == 'extra-17-mcp-manual-walker-cpu' and extra == 'extra-17-mcp-manual-walker-cu130') or (platform_machine != 'aarch64' and extra == 'extra-17-mcp-manual-walker-cu130') or (platform_python_implementation != 'CPython' and extra == 'extra-17-mcp-manual-walker-cu130') or (sys_platform != 'linux' and extra == 'extra-17-mcp-manual-walker-cu130')" },
@@ -2162,7 +2164,11 @@ dev = [
     { name = "qdrant-client" },
     { name = "reportlab" },
     { name = "ruff" },
+    { name = "sentence-transformers" },
     { name = "uv" },
+]
+local-embeddings = [
+    { name = "sentence-transformers" },
 ]
 qdrant = [
     { name = "qdrant-client" },
@@ -2176,6 +2182,9 @@ requires-dist = [
     { name = "httpx" },
     { name = "langchain-text-splitters", marker = "extra == 'builder'" },
     { name = "mcp-manual-walker", extras = ["cu130"], marker = "extra == 'builder'" },
+    { name = "mcp-manual-walker", extras = ["local-embeddings"], marker = "extra == 'cpu'" },
+    { name = "mcp-manual-walker", extras = ["local-embeddings"], marker = "extra == 'cu130'" },
+    { name = "mcp-manual-walker", extras = ["local-embeddings"], marker = "extra == 'dev'" },
     { name = "mypy", marker = "extra == 'dev'" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -2188,7 +2197,7 @@ requires-dist = [
     { name = "reportlab", marker = "extra == 'dev'" },
     { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "sentence-transformers", specifier = ">=5.2.0" },
+    { name = "sentence-transformers", marker = "extra == 'local-embeddings'", specifier = ">=5.2.0" },
     { name = "sqlalchemy" },
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "mcp-manual-walker", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cu130'", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "mcp-manual-walker", extra = "cu130" } },
@@ -2197,7 +2206,7 @@ requires-dist = [
     { name = "uv", marker = "extra == 'dev'" },
     { name = "zstandard" },
 ]
-provides-extras = ["qdrant", "cpu", "cu130", "builder", "dev"]
+provides-extras = ["qdrant", "local-embeddings", "cpu", "cu130", "builder", "dev"]
 
 [[package]]
 name = "mdurl"

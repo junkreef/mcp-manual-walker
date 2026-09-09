@@ -14,7 +14,6 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "chromadb",
-    "sentence-transformers>=5.2.0",
     "rich",
     # The remote embedding backend talks to an OpenAI-compatible endpoint.
     # Already present as an mcp/fastmcp dependency, but embeddings imports it
@@ -32,13 +31,25 @@ dependencies = [
 qdrant = [
     "qdrant-client>=1.12",
 ]
+# Embedding in this process. Not a base dependency, because it is the largest
+# thing in the tree by far -- sentence-transformers drags in transformers and
+# torch, and the container image built with it measures 2.43 GB against 905 MB
+# without. A server running EMBEDDING_BACKEND=openai never loads a model, and
+# embeddings.py imports sentence_transformers inside the constructor precisely
+# so it can be absent. Included by `cpu` and `cu130`, which is what the builder
+# and a self-contained server already ask for.
+local-embeddings = [
+    "sentence-transformers>=5.2.0",
+]
 # The torch build is chosen by extra: CPU wheels for the search server,
 # CUDA 13.0 wheels for the builder. They are mutually exclusive.
 cpu = [
+    "mcp-manual-walker[local-embeddings]",
     "torch>=2.0.0",
     "torchvision>=0.15.0",
 ]
 cu130 = [
+    "mcp-manual-walker[local-embeddings]",
     "torch>=2.0.0",
     "torchvision>=0.15.0",
 ]
@@ -58,6 +69,10 @@ dev = [
     # The Qdrant backend's tests run against a mocked client, so they need the
     # models it builds requests out of even when no server is around.
     "qdrant-client>=1.12",
+    # The embedding tests inject a fake sentence_transformers module, so they
+    # do not need the real one -- but `uv sync --extra dev` on its own should
+    # still give a working local embedder.
+    "mcp-manual-walker[local-embeddings]",
 ]
 
 [tool.ruff]
