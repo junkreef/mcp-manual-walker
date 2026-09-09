@@ -3,7 +3,6 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, List, Optional
 
-import chromadb
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.types import Image
@@ -14,7 +13,7 @@ from sqlalchemy.orm import Session
 from . import lexical
 from .config import settings
 from .database import SessionLocal, init_db
-from .embeddings import COLLECTION_NAME, check_collection_model, get_embedder
+from .embeddings import check_embedding_model, get_embedder
 from .models import Bookmark, Figure, Manual
 from .schemas import (
     BookmarkNode,
@@ -26,17 +25,16 @@ from .schemas import (
     SearchResult,
     SearchResultItem,
 )
+from .vector_store import ChunkFilter, open_store
 
 # Configure logging
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# Global ChromaDB client and collection
 # Global AppState
 class AppState:
     def __init__(self):
-        self.chroma_client = None
-        self.collection = None
+        self.store = None
         self.embedder = None
         # Reason why the vector store could not be used, surfaced by the tools.
         self.init_error = None
@@ -53,44 +51,36 @@ def init_vector_store() -> None:
     server object). A failure is recorded instead of raised, so the server still
     starts and every tool can explain why the vector store is unusable.
     """
-    logger.info("Initializing ChromaDB...")
-    app_state.chroma_client = None
-    app_state.collection = None
+    logger.info(f"Initializing the {settings.VECTOR_BACKEND} vector store...")
+    app_state.store = None
     app_state.embedder = None
     app_state.init_error = None
 
     try:
-        chroma_client = chromadb.PersistentClient(
-            path=str(settings.CHROMADB_PATH.resolve())
-        )
+        store = open_store()
 
         # Load the embedding model (the same one the builder used)
         embedder = get_embedder()
 
-        # Get the collection without an embedding function: queries are embedded
-        # here and passed to Chroma explicitly.
-        collection = chroma_client.get_collection(name=COLLECTION_NAME)
-
         # Vectors built with another model are not comparable to ours.
-        check_collection_model(collection, settings.EMBEDDING_MODEL)
+        check_embedding_model(store.embedding_model, settings.EMBEDDING_MODEL)
 
-        app_state.chroma_client = chroma_client
         app_state.embedder = embedder
-        app_state.collection = collection
+        app_state.store = store
 
     except Exception as e:
-        logger.error(f"Failed to initialize ChromaDB: {e}")
+        logger.error(f"Failed to initialize the vector store: {e}")
         app_state.init_error = str(e)
 
 
-def _require_collection():
-    """Returns the collection, or raises a ToolError explaining why it is missing."""
-    if app_state.collection is None:
+def _require_store():
+    """Returns the vector store, or raises a ToolError explaining why it is gone."""
+    if app_state.store is None:
         message = "Vector database is not initialized."
         if app_state.init_error:
             message = f"{message} {app_state.init_error}"
         raise ToolError(message)
-    return app_state.collection
+    return app_state.store
 
 
 @asynccontextmanager
@@ -284,38 +274,21 @@ def _get_descendant_bookmark_ids(
     return descendant_ids
 
 
-def _chunk_ids_in_bookmarks(collection, manual_id: str, bookmark_ids: list[str]) -> set:
+def _chunk_ids_in_bookmarks(store, manual_id: str, bookmark_ids: list[str]) -> set:
     """Chunk ids under a bookmark subtree, for filtering lexical hits.
 
     The FTS index stores the manual but not the bookmark, so a search narrowed
-    to a section has to intersect its results with the chunks Chroma says are
-    in it.
+    to a section has to intersect its results with the chunks the vector store
+    says are in it.
     """
     if not bookmark_ids:
         return set()
-    got = collection.get(
-        where={
-            "$and": [
-                {"manual_id": manual_id},
-                {"bookmark_id": {"$in": list(bookmark_ids)}},
-            ]
-        },
-        include=[],
-    )
-    return set(got["ids"])
-
-
-def _fetch_in_order(collection, ids: list[str]) -> dict:
-    """Reads chunks by id and returns them shaped like a `query()` result."""
-    if not ids:
-        return {"ids": [[]], "documents": [[]], "metadatas": [[]]}
-    got = collection.get(ids=ids, include=["documents", "metadatas"])
-    at = {cid: n for n, cid in enumerate(got["ids"])}
-    keep = [i for i in ids if i in at]
     return {
-        "ids": [keep],
-        "documents": [[got["documents"][at[i]] for i in keep]],
-        "metadatas": [[got["metadatas"][at[i]] for i in keep]],
+        chunk.id
+        for chunk in store.scroll(
+            ChunkFilter(manual_id=manual_id, bookmark_ids=bookmark_ids),
+            with_document=False,
+        )
     }
 
 
@@ -348,7 +321,7 @@ def get_markdown_content(
     ],
 ) -> MarkdownContent:
     """Returns the Markdown content for a specific bookmark from the Vector DB."""
-    collection = _require_collection()
+    store = _require_store()
 
     db: Session = SessionLocal()
     try:
@@ -362,42 +335,31 @@ def get_markdown_content(
         # Get all relevant bookmark IDs (hierarchical)
         target_bookmark_ids = _get_descendant_bookmark_ids(manual_id, bookmark_id, db)
 
-        # Query ChromaDB
-        # We want chunks where manual_id matches AND bookmark_id is in our list
-
-        # Chroma where clause:
-        # {"$and": [{"manual_id": manual_id}, {"bookmark_id": {"$in": target_bookmark_ids}}]}
-
-        results = collection.get(
-            where={
-                "$and": [
-                    {"manual_id": manual_id},
-                    {"bookmark_id": {"$in": target_bookmark_ids}},
-                ]
-            },
-            include=["documents", "metadatas"],
+        # Every chunk of this manual that belongs to the section or one of its
+        # subsections.
+        chunks = list(
+            store.scroll(
+                ChunkFilter(manual_id=manual_id, bookmark_ids=target_bookmark_ids)
+            )
         )
 
-        # results['documents'] is a list of strings
-        # results['ids'] is a list of IDs.
-        # 'get' does not guarantee an order, so chunks are sorted by their
+        # The store does not promise an order, so chunks are sorted by their
         # chunk_index metadata, falling back to the trailing index of the
         # legacy "<manual_id>_<index>" chunk ids.
         combined = []
-        if results["ids"] and results["documents"] and results["metadatas"]:
-            for i, doc_id in enumerate(results["ids"]):
-                meta = results["metadatas"][i]
+        for chunk in chunks:
+            meta = chunk.metadata
 
-                idx = 0
-                if "chunk_index" in meta:
-                    idx = meta["chunk_index"]
-                else:
-                    # Legacy fallback
-                    parts = doc_id.rsplit("_", 1)
-                    if len(parts) == 2 and parts[1].isdigit():
-                        idx = int(parts[1])
+            idx = 0
+            if "chunk_index" in meta:
+                idx = meta["chunk_index"]
+            else:
+                # Legacy fallback
+                parts = chunk.id.rsplit("_", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    idx = int(parts[1])
 
-                combined.append((idx, results["documents"][i], meta))
+            combined.append((idx, chunk.document, meta))
 
         # Sort by index
         combined.sort(key=lambda x: x[0])
@@ -537,7 +499,7 @@ def search_manual(
     ] = None,
 ) -> SearchResult:
     """Searches for text in a manual and returns matches with context and hierarchy."""
-    collection = _require_collection()
+    store = _require_store()
 
     if app_state.embedder is None:
         raise ToolError("Embedding model is not initialized.")
@@ -546,14 +508,13 @@ def search_manual(
 
     db: Session = SessionLocal()
     try:
-        where_clause = {"manual_id": manual_id}
+        target_ids: list[str] = []
+        where = ChunkFilter(manual_id=manual_id)
 
         if bookmark_id:
             # Hierarchical filter
             target_ids = _get_descendant_bookmark_ids(manual_id, bookmark_id, db)
-            where_clause = {
-                "$and": [{"manual_id": manual_id}, {"bookmark_id": {"$in": target_ids}}]
-            }
+            where = ChunkFilter(manual_id=manual_id, bookmark_ids=target_ids)
 
         # Dense and lexical retrieval, fused by rank.
         #
@@ -564,13 +525,14 @@ def search_manual(
         # -- a purely Japanese one against this English corpus -- which is why
         # the two are fused by rank rather than by score. An empty lexical list
         # simply leaves the dense ranking untouched.
-        query_vec = [embedder.embed_query(query)]
-        dense = collection.query(
-            query_embeddings=query_vec,
-            n_results=lexical.DENSE_CANDIDATES,
-            where=where_clause,
-        )
-        dense_ids = dense["ids"][0] if dense["ids"] else []
+        dense_ids = [
+            hit.id
+            for hit in store.search(
+                embedder.embed_query(query),
+                limit=lexical.DENSE_CANDIDATES,
+                where=where,
+            )
+        ]
 
         lexical_ids = lexical.search(
             lexical.sqlite_connection(db),
@@ -579,29 +541,20 @@ def search_manual(
             manual_id=manual_id,
         )
         if bookmark_id:
-            # The dense side got this through `where`; the lexical index does
+            # The dense side got this through the filter; the lexical index does
             # not carry the bookmark, so it is filtered against the same set.
             allowed = set(dense_ids)
-            allowed.update(
-                _chunk_ids_in_bookmarks(collection, manual_id, target_ids)
-            )
+            allowed.update(_chunk_ids_in_bookmarks(store, manual_id, target_ids))
             lexical_ids = [i for i in lexical_ids if i in allowed]
 
         ordered = lexical.fuse_dense_and_lexical(dense_ids, lexical_ids)[:5]
 
         # One fetch for whatever the fusion chose, in that order.
-        results = _fetch_in_order(collection, ordered)
-
-        # results is a dict with lists of lists (for documents, metadatas, etc.)
-        # Structure: {'ids': [['id1', ...]], 'metadatas': [[{...}, ...]], 'documents': [['text', ...]]}
+        chunks = store.get(ordered)
 
         search_result_items = []
 
-        if results["ids"] and results["ids"][0]:
-            ids = results["ids"][0]
-            docs = results["documents"][0]
-            metas = results["metadatas"][0]
-
+        if chunks:
             # Pre-fetch bookmarks for hierarchy reconstruction
             # We can't easily pre-fetch just the parents needed without knowing them.
             # But we can cache the manual's bookmarks map.
@@ -612,12 +565,18 @@ def search_manual(
 
             # Figures referenced by the hits, resolved in a single query.
             figures_by_id = _load_figures(
-                db, [str(m["figure_id"]) for m in metas if m.get("figure_id")]
+                db,
+                [
+                    str(chunk.metadata["figure_id"])
+                    for chunk in chunks
+                    if chunk.metadata.get("figure_id")
+                ],
             )
 
-            for i, chunk_id in enumerate(ids):
-                text = docs[i]
-                meta = metas[i]
+            for chunk in chunks:
+                chunk_id = chunk.id
+                text = chunk.document
+                meta = chunk.metadata
 
                 # Get Bookmark Info
                 chunk_bm_id = meta.get("bookmark_id")

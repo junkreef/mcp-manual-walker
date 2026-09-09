@@ -16,29 +16,13 @@ from mcp_manual_walker import lexical
 from mcp_manual_walker.config import settings
 from mcp_manual_walker.database import SessionLocal, init_db
 from mcp_manual_walker.embeddings import (
-    COLLECTION_NAME,
     EMBEDDING_MODEL_METADATA_KEY,
-    check_collection_model,
-    collection_metadata,
+    check_embedding_model,
     get_embedder,
 )
 from mcp_manual_walker.models import Bookmark, Figure, Manual
 from mcp_manual_walker.tui import watch
-
-# chromadb is imported where it is used, for the same reason as the builder:
-# `watch` needs neither.
-chromadb = None
-
-
-def _load_chromadb():
-    global chromadb
-    if chromadb is None:
-        try:
-            import chromadb as _chromadb
-        except ImportError:
-            return None
-        chromadb = _chromadb
-    return chromadb
+from mcp_manual_walker.vector_store import Chunk, ChunkFilter, open_store
 
 # Configure logging
 logging.basicConfig(
@@ -91,20 +75,28 @@ CHUNK_COMPRESS_LEVEL = 6
 # 3.96 GB to 3.68 GB even though the chunk stream lost 425 MB.
 FIGURE_COMPRESS_TYPE = zipfile.ZIP_STORED
 
-# Chunks handed to Chroma in one add() on import.
+# Chunks handed to the vector store in one add() on import.
 CHUNK_IMPORT_BATCH = 2000
 
-# Chunks read back from Chroma in one page when rebuilding the lexical index.
+# Chunks read back in one page when rebuilding the lexical index.
 LEXICAL_REINDEX_BATCH = 5000
 FIGURES_DIR_NAME = "figures"
 
 
-def get_chroma_client():
-    module = _load_chromadb()
-    if module is None:
-        logger.error("chromadb is not installed.")
+def get_store(create: bool = False, embedder=None):
+    """Opens the configured vector store, or exits with an actionable error.
+
+    Opened where it is used rather than at import time, for the same reason the
+    builder does: `watch` needs no vector backend at all.
+    """
+    try:
+        return open_store(embedder=embedder, create=create)
+    except ImportError as e:
+        logger.error(f"The vector backend's client library is missing: {e}")
         sys.exit(1)
-    return module.PersistentClient(path=str(settings.CHROMADB_PATH))
+    except Exception as e:
+        logger.error(f"Could not open the vector store: {e}")
+        sys.exit(1)
 
 
 def command_build(args):
@@ -238,7 +230,7 @@ def bookmark_to_dict(bookmark):
     }
 
 
-def _write_chunks(collection, manual_ids: list[str], out) -> int:
+def _write_chunks(store, manual_ids: list[str], out) -> int:
     """Writes every chunk of the given manuals to `out`, one JSON line each.
 
     `out` is any text stream; the export points it at a zstd compressor
@@ -248,7 +240,7 @@ def _write_chunks(collection, manual_ids: list[str], out) -> int:
     the peak is one manual's chunks rather than the corpus.
 
     Reading one manual per query is also the only size that always fits: a
-    `$in` over several fails once the *matching chunks* exceed SQLite's
+    filter over several fails once the *matching chunks* exceed SQLite's
     parameter limit, not the ids -- measured on this corpus, 10 ids matching
     11,125 chunks was fine and 20 ids was not, and a manual holds anywhere
     from 328 to several thousand chunks.
@@ -259,24 +251,16 @@ def _write_chunks(collection, manual_ids: list[str], out) -> int:
     """
     written = 0
     for index, manual_id in enumerate(manual_ids, start=1):
-        got = collection.get(
-            where={"manual_id": manual_id},
-            include=["embeddings", "metadatas", "documents"],
-        )
-        embeddings = got.get("embeddings")
-        for i, chunk_id in enumerate(got["ids"]):
-            emb = None
-            if embeddings is not None and i < len(embeddings):
-                emb = embeddings[i]
-                if hasattr(emb, "tolist"):
-                    emb = emb.tolist()
+        for chunk in store.scroll(
+            ChunkFilter(manual_id=manual_id), with_embedding=True
+        ):
             out.write(
                 json.dumps(
                     {
-                        "id": chunk_id,
-                        "embedding": emb,
-                        "metadata": got["metadatas"][i],
-                        "document": got["documents"][i],
+                        "id": chunk.id,
+                        "embedding": chunk.embedding,
+                        "metadata": chunk.metadata,
+                        "document": chunk.document,
                     },
                     ensure_ascii=False,
                 )
@@ -344,11 +328,11 @@ def _stored_info(name: str) -> zipfile.ZipInfo:
     return info
 
 
-def _write_chunk_member(zf: zipfile.ZipFile, collection, manual_ids) -> int:
+def _write_chunk_member(zf: zipfile.ZipFile, store, manual_ids) -> int:
     """Streams every chunk into the archive as one zstd-compressed member.
 
     The member itself is stored, because its bytes are already a zstd frame.
-    Chroma is read, serialized, compressed and written in one pass, so the
+    The store is read, serialized, compressed and written in one pass, so the
     corpus is never held in memory nor spilled to a temporary file.
     """
     info = _stored_info(CHUNKS_ZST_FILE_NAME)
@@ -359,7 +343,7 @@ def _write_chunk_member(zf: zipfile.ZipFile, collection, manual_ids) -> int:
         with compressor.stream_writer(member, closefd=False) as raw:
             text = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
             try:
-                count = _write_chunks(collection, manual_ids, text)
+                count = _write_chunks(store, manual_ids, text)
                 text.flush()
             finally:
                 # Detach rather than close: closing the wrapper would close
@@ -375,8 +359,7 @@ def command_export(args):
     logger.info(f"Exporting manuals matching target: {target}")
 
     session = SessionLocal()
-    client = get_chroma_client()
-    collection = client.get_collection(name=COLLECTION_NAME)
+    store = get_store()
 
     try:
         stmt = select(Manual).where(Manual.relative_path.startswith(target))
@@ -398,7 +381,7 @@ def command_export(args):
         # Nothing here is staged in a temporary directory: for this corpus that
         # staging was 12.3 GB of writes for a 3.4 GB result.
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            chunk_count = _write_chunk_member(zf, collection, manual_ids)
+            chunk_count = _write_chunk_member(zf, store, manual_ids)
 
             for manual in manuals:
                 for figure in manual.figures:
@@ -467,7 +450,6 @@ def command_import(args):
     logger.info(f"Importing from {input_path}")
 
     session = SessionLocal()
-    client = get_chroma_client()
 
     try:
         # The archive stays open for the whole import and every member is read
@@ -502,28 +484,19 @@ def command_import(args):
                 )
                 return
 
-            # Load the embedding model only to stamp the collection metadata; every
-            # vector comes from the archive, so Chroma never embeds anything here.
+            # Load the embedding model only to stamp the store with the model
+            # name; every vector comes from the archive, so nothing is embedded
+            # here.
             logger.info("Loading embedding model...")
             embedder = get_embedder()
-
-            if embedder:
-                collection = client.get_or_create_collection(
-                    name=COLLECTION_NAME,
-                    embedding_function=None,
-                    metadata=collection_metadata(embedder),
-                )
-            else:
+            if embedder is None:
                 # Without the model we cannot stamp the model name on a freshly
-                # created collection; an existing one keeps its own metadata.
+                # created store; an existing one keeps what it recorded.
                 logger.warning(
-                    "Embedding model unavailable: a newly created collection will "
+                    "Embedding model unavailable: a newly created store will "
                     "not record which model built its vectors."
                 )
-                collection = client.get_or_create_collection(
-                    name=COLLECTION_NAME,
-                    embedding_function=None,
-                )
+            store = get_store(create=True, embedder=embedder)
 
             # Import SQLite Data
             imported_count = 0
@@ -606,7 +579,7 @@ def command_import(args):
                 f"{imported_figures} figure(s) restored."
             )
 
-            # Import Chroma Data, a batch at a time. An archive of this corpus
+            # Import the vectors, a batch at a time. An archive of this corpus
             # holds half a million chunks; accumulating them before the first
             # add() is the same mistake that made the export side run out of
             # memory.
@@ -630,11 +603,21 @@ def command_import(args):
                 nonlocal added, pending
                 if not pending["ids"]:
                     return
-                collection.add(
-                    ids=pending["ids"],
-                    embeddings=pending["embeddings"],
-                    metadatas=pending["metadatas"],
-                    documents=pending["documents"],
+                store.add(
+                    [
+                        Chunk(
+                            id=cid,
+                            document=document,
+                            metadata=meta,
+                            embedding=embedding,
+                        )
+                        for cid, embedding, meta, document in zip(
+                            pending["ids"],
+                            pending["embeddings"],
+                            pending["metadatas"],
+                            pending["documents"],
+                        )
+                    ]
                 )
                 lexical.add_chunks(
                     lexical_conn,
@@ -678,9 +661,11 @@ def command_import(args):
                 flush_chunks()
 
             if added:
-                logger.info(f"ChromaDB Import: Added {added:,} chunks.")
+                logger.info(f"Vector store import: added {added:,} chunks.")
             else:
-                logger.info("ChromaDB Import: No chunks to add (all skipped or empty).")
+                logger.info(
+                    "Vector store import: no chunks to add (all skipped or empty)."
+                )
             if skipped_chunks:
                 logger.warning(f"{skipped_chunks:,} chunk(s) had no embedding.")
 
@@ -694,44 +679,42 @@ def command_import(args):
 
 
 def command_reindex_lexical(args):
-    """Rebuilds the BM25 index from the chunks already in ChromaDB.
+    """Rebuilds the BM25 index from the chunks already in the vector store.
 
     The lexical index is derived data, so it is not in an export archive and a
-    database made before it existed simply has none. Rebuilding it from Chroma
-    takes a couple of minutes against the twenty an import costs, so this is
-    the way to add it to a database that is otherwise fine.
+    database made before it existed simply has none. Rebuilding it from the
+    vector store takes a couple of minutes against the twenty an import costs,
+    so this is the way to add it to a database that is otherwise fine.
     """
     session = SessionLocal()
-    client = get_chroma_client()
+    store = get_store()
     try:
-        collection = client.get_collection(name=COLLECTION_NAME)
         conn = lexical.sqlite_connection(session)
         lexical.drop_table(conn)
         lexical.create_table(conn)
 
-        total = collection.count()
+        total = store.count()
         logger.info(f"Rebuilding the lexical index over {total:,} chunk(s)...")
-        written = offset = 0
-        while True:
-            got = collection.get(
-                limit=LEXICAL_REINDEX_BATCH,
-                offset=offset,
-                include=["documents", "metadatas"],
-            )
-            if not got["ids"]:
-                break
-            written += lexical.add_chunks(
-                conn,
+        written = seen = 0
+        # The store streams the whole corpus; batches are re-formed here only
+        # because the FTS insert is cheaper in groups than row by row.
+        batch: list[tuple[str, str, str]] = []
+        for chunk in store.scroll(ChunkFilter(), batch_size=LEXICAL_REINDEX_BATCH):
+            batch.append(
                 (
-                    (cid, (meta or {}).get("manual_id") or "", doc or "")
-                    for cid, meta, doc in zip(
-                        got["ids"], got["metadatas"], got["documents"]
-                    )
-                ),
+                    chunk.id,
+                    (chunk.metadata or {}).get("manual_id") or "",
+                    chunk.document or "",
+                )
             )
-            offset += len(got["ids"])
-            if offset % (LEXICAL_REINDEX_BATCH * 10) == 0:
-                logger.info(f"  {offset:,}/{total:,}")
+            if len(batch) >= LEXICAL_REINDEX_BATCH:
+                written += lexical.add_chunks(conn, batch)
+                seen += len(batch)
+                batch = []
+                if seen % (LEXICAL_REINDEX_BATCH * 10) == 0:
+                    logger.info(f"  {seen:,}/{total:,}")
+        if batch:
+            written += lexical.add_chunks(conn, batch)
         lexical.optimize(conn)
         session.commit()
         logger.info(f"Lexical index rebuilt: {written:,} chunk(s).")
@@ -750,9 +733,10 @@ def command_optimize_lexical(args):
     time.
 
     This is the cheap half of `reindex-lexical`. That command rereads every
-    chunk out of ChromaDB and is the right answer when the index is *wrong* or
-    missing; this one only compacts what is already there, and is the right
-    answer when it is merely untidy -- after a `delete`, most obviously.
+    chunk out of the vector store and is the right answer when the index is
+    *wrong* or missing; this one only compacts what is already there, and is
+    the right answer when it is merely untidy -- after a `delete`, most
+    obviously.
 
     FTS5's incremental 'merge' is deliberately not offered. It does bounded
     work per call, which sounds like the kinder option for a large index, but
@@ -801,8 +785,7 @@ def command_delete(args):
     logger.info(f"Attempting to delete targets matching: {target}")
 
     session = SessionLocal()
-    client = get_chroma_client()
-    collection = client.get_collection(name=COLLECTION_NAME)
+    store = get_store()
 
     try:
         # Find manuals starting with the target string (directory or specific file)
@@ -819,12 +802,12 @@ def command_delete(args):
         for manual in manuals:
             logger.info(f"Deleting manual: {manual.relative_path} (ID: {manual.id})")
 
-            # Delete from ChromaDB
+            # Delete from the vector store
             try:
-                collection.delete(where={"manual_id": manual.id})
-                logger.info("  - Deleted from ChromaDB")
+                store.delete_manual(manual.id)
+                logger.info("  - Deleted from the vector store")
             except Exception as e:
-                logger.error(f"  - Failed to delete from ChromaDB: {e}")
+                logger.error(f"  - Failed to delete from the vector store: {e}")
 
             # Delete from SQLite (cascades to bookmarks and figures)
             session.delete(manual)
@@ -832,7 +815,7 @@ def command_delete(args):
 
         # And from the BM25 index, in the same transaction as the rows above.
         # It is derived data, but leaving it behind is not merely stale: the
-        # ids it keeps returning no longer resolve in Chroma, so those hits
+        # ids it keeps returning no longer resolve in the store, so those hits
         # drop out of the results after the ranks have already been fused.
         # One statement for all of them -- manual_id is UNINDEXED, so this is
         # a scan of the index and it should only be paid once.
@@ -858,7 +841,7 @@ def command_search(args):
 
     logger.info(f"Searching for: '{query}'")
 
-    client = get_chroma_client()
+    store = get_store()
 
     logger.info("Loading embedding model...")
     embedder = get_embedder()
@@ -866,37 +849,28 @@ def command_search(args):
         logger.error("Could not load the embedding model.")
         return
 
-    collection = client.get_collection(name=COLLECTION_NAME)
-
     try:
-        check_collection_model(collection, settings.EMBEDDING_MODEL)
+        check_embedding_model(store.embedding_model, settings.EMBEDDING_MODEL)
     except RuntimeError as e:
         logger.error(str(e))
         return
 
-    # The query is embedded here and passed explicitly: the collection has no
-    # embedding function of its own.
-    query_embeddings = [embedder.embed_query(query)]
-
-    results = collection.query(
-        query_embeddings=query_embeddings,
-        n_results=n_results,
-        include=["documents", "metadatas", "distances"],
-    )
+    # The query is embedded here and passed explicitly: no backend is ever
+    # configured with an embedding function of its own.
+    hits = store.search(embedder.embed_query(query), limit=n_results)
 
     print(f"\nSearch Results for '{query}':")
     print("-" * 80)
 
-    if not results["documents"] or not results["documents"][0]:
+    if not hits:
         print("No results found.")
         return
 
-    for i in range(len(results["documents"][0])):
-        doc = results["documents"][0][i]
-        meta = results["metadatas"][0][i]
-        dist = results["distances"][0][i]
+    for rank, hit in enumerate(hits, start=1):
+        doc = hit.document or ""
+        meta = hit.metadata
 
-        print(f"Rank {i + 1} (Distance: {dist:.4f})")
+        print(f"Rank {rank} (Similarity: {hit.score:.4f})")
         print(f"Source: {meta.get('source')} (Manual ID: {meta.get('manual_id')})")
         if meta.get("bookmark_id"):
             print(f"Bookmark ID: {meta.get('bookmark_id')}")
@@ -1028,7 +1002,7 @@ def main():
     # Lexical reindex Command
     parser_lex = subparsers.add_parser(
         "reindex-lexical",
-        help="Rebuild the BM25 index from the chunks already in ChromaDB",
+        help="Rebuild the BM25 index from the chunks already in the vector store",
     )
     parser_lex.set_defaults(func=command_reindex_lexical)
 

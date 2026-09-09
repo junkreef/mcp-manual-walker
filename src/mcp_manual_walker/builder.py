@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import ctypes
 import fnmatch
+import importlib.util
 import io
 import logging
 import math
@@ -61,35 +62,49 @@ try:
 except ImportError:
     MarkdownHeaderTextSplitter = None
 
-try:
-    import chromadb
-except ImportError:
-    chromadb = None
-
 # Imports for DB Sync
 # Local imports
 try:
     from mcp_manual_walker.chunking import _picture_description, chunk_document
     from mcp_manual_walker.config import settings
     from mcp_manual_walker.database import SessionLocal, init_db
-    from mcp_manual_walker.embeddings import (
-        COLLECTION_NAME,
-        check_collection_model,
-        collection_metadata,
-        get_embedder,
-    )
+    from mcp_manual_walker.embeddings import check_embedding_model, get_embedder
     from mcp_manual_walker.models import Bookmark, Figure, Manual
     from mcp_manual_walker.pdf_utils import extract_pdf_fingerprint
+    from mcp_manual_walker.vector_store import Chunk, open_store, reset_store
 except ImportError as e:
     logger.error(f"Failed to import local modules: {e}")
     sys.exit(1)
 
 
-# Chroma rejects very large single batches, so inserts are sliced.
-CHROMA_ADD_BATCH_SIZE = 1000
+# Some backends reject very large single writes, so inserts are sliced.
+CHUNK_ADD_BATCH_SIZE = 1000
 
 # Per-process Docling converter, initialized once in each worker process.
 _converter = None
+
+
+def _missing_vector_backend_package() -> str | None:
+    """The pip name of the configured backend's client, if it is not installed.
+
+    `sys.modules` is consulted before the import system because a module that
+    is already loaded is by definition available -- including a stand-in one,
+    which `find_spec` refuses to answer for at all ("__spec__ is not set").
+    """
+    packages = {
+        "chroma": ("chromadb", "chromadb"),
+        "qdrant": ("qdrant_client", "qdrant-client"),
+    }
+    entry = packages.get(settings.VECTOR_BACKEND.strip().lower())
+    if entry is None:
+        return None
+    module, pip_name = entry
+    if module in sys.modules:
+        return None
+    try:
+        return None if importlib.util.find_spec(module) else pip_name
+    except (ImportError, ValueError):
+        return pip_name
 
 
 def check_dependencies():
@@ -98,8 +113,9 @@ def check_dependencies():
         missing.append("docling")
     if MarkdownHeaderTextSplitter is None:
         missing.append("langchain-text-splitters")
-    if chromadb is None:
-        missing.append("chromadb")
+    backend_package = _missing_vector_backend_package()
+    if backend_package is not None:
+        missing.append(backend_package)
 
     if missing:
         logger.error(f"Missing required dependencies: {', '.join(missing)}")
@@ -797,7 +813,7 @@ def merge_parts(parts: list[tuple[int, object, list[dict]]]):
 
 def _ingest_document(
     session: Session,
-    collection,
+    store,
     embedder,
     manual_id: str,
     pdf_path: Path,
@@ -806,11 +822,12 @@ def _ingest_document(
     figures: list[dict],
 ) -> int:
     """
-    Chunks a converted document, embeds it and stores it in ChromaDB.
+    Chunks a converted document, embeds it and stores it in the vector store.
 
     The rendered figures are written to the SQLite ``figures`` table and the
     chunk that describes each of them only carries the resulting ``figure_id``
-    into Chroma, so the image bytes never leave the relational database.
+    into the vector store, so the image bytes never leave the relational
+    database.
 
     Runs in the main process while the worker processes keep converting, so the
     GPU serves the Docling pipelines and the embedding model at the same time.
@@ -858,7 +875,7 @@ def _ingest_document(
         if chunk_meta.get("bookmark_id"):
             meta["bookmark_id"] = str(chunk_meta["bookmark_id"])
 
-        # Chroma metadata values must be str/int/float/bool
+        # Metadata values must be str/int/float/bool in every backend
         if chunk_meta.get("type"):
             meta["type"] = str(chunk_meta["type"])
         if chunk_meta.get("page") is not None:
@@ -932,8 +949,9 @@ def _ingest_document(
         stored_figures += 1
         figure_rows[index] = figure
 
-    # Commit the figures before touching Chroma: a figure row without its chunk
-    # is harmless, a chunk pointing at a missing figure id is not.
+    # Commit the figures before touching the vector store: a figure row
+    # without its chunk is harmless, a chunk pointing at a missing figure id
+    # is not.
     if stored_figures:
         session.commit()
         logger.info(f"Stored {stored_figures} figure(s) in SQLite for {rel_path}")
@@ -953,16 +971,21 @@ def _ingest_document(
         with embedder.on_device():
             embeddings = embedder.embed_documents(documents)
 
-    for start in range(0, len(ids), CHROMA_ADD_BATCH_SIZE):
-        end = start + CHROMA_ADD_BATCH_SIZE
-        collection.add(
-            ids=ids[start:end],
-            documents=documents[start:end],
-            metadatas=metadatas[start:end],
-            embeddings=embeddings[start:end],
+    for start in range(0, len(ids), CHUNK_ADD_BATCH_SIZE):
+        end = start + CHUNK_ADD_BATCH_SIZE
+        store.add(
+            [
+                Chunk(id=cid, document=document, metadata=meta, embedding=embedding)
+                for cid, document, meta, embedding in zip(
+                    ids[start:end],
+                    documents[start:end],
+                    metadatas[start:end],
+                    embeddings[start:end],
+                )
+            ]
         )
 
-    logger.info(f"Added {len(chunks)} chunks to ChromaDB for {pdf_path.name}")
+    logger.info(f"Added {len(chunks)} chunks to the vector store for {pdf_path.name}")
 
     # The lexical half of retrieval. Written here rather than in a pass at the
     # end so an interrupted build leaves the two indexes describing the same
@@ -1039,9 +1062,7 @@ def build(
             logger.warning(f"Deleting existing DB: {settings.DB_FILE_PATH}")
             settings.DB_FILE_PATH.unlink()
 
-        if settings.CHROMADB_PATH.exists():
-            logger.warning(f"Resetting ChromaDB directory: {settings.CHROMADB_PATH}")
-            shutil.rmtree(settings.CHROMADB_PATH)
+        reset_store()
 
         if settings.MARKDOWN_OUTPUT_DIR.exists():
             logger.warning(
@@ -1217,28 +1238,21 @@ def build(
             logger.info("No files to process.")
             return
 
-        # Initialize Chroma components only when there is work to do, so the
+        # Initialize the vector store only when there is work to do, so the
         # embedding model is not loaded for a no-op build.
-        logger.info(f"Initializing ChromaDB at {settings.CHROMADB_PATH}...")
-        client = chromadb.PersistentClient(path=str(settings.CHROMADB_PATH))
+        logger.info(f"Initializing the {settings.VECTOR_BACKEND} vector store...")
         embedder = get_embedder()
         if embedder is None:
             sys.exit(1)
 
-        # embedding_function=None: every vector is computed here and passed
-        # explicitly, so Chroma must never embed anything on its own.
-        collection = client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            embedding_function=None,
-            metadata=collection_metadata(embedder),
-        )
+        store = open_store(embedder=embedder, create=True)
 
-        # get_or_create_collection ignores the metadata of an existing
-        # collection, so an older collection keeps its own model name: refuse to
-        # mix vectors from two models. After a reset the collection is fresh.
+        # Creating a store that already exists keeps the metadata it was made
+        # with, so an older one keeps its own model name: refuse to mix vectors
+        # from two models. After a reset the store is fresh.
         if not reset:
             try:
-                check_collection_model(collection, embedder.model_name)
+                check_embedding_model(store.embedding_model, embedder.model_name)
             except RuntimeError as e:
                 logger.error(str(e))
                 sys.exit(1)
@@ -1246,7 +1260,7 @@ def build(
         for mid in stale_manual_ids:
             try:
                 logger.info(f"Deleting stale chunks for manual {mid}.")
-                collection.delete(where={"manual_id": mid})
+                store.delete_manual(mid)
             except Exception as e:
                 logger.error(f"Failed to delete stale chunks for manual {mid}: {e}")
 
@@ -1382,7 +1396,7 @@ def build(
                 try:
                     chunks = _ingest_document(
                         session,
-                        collection,
+                        store,
                         embedder,
                         manual_id,
                         pdf_path,
@@ -1446,7 +1460,7 @@ def build(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Build ChromaDB from PDFs using Docling."
+        description="Build the vector database from PDFs using Docling."
     )
     parser.add_argument(
         "--pdf_dir", type=str, required=True, help="Directory containing PDF files."

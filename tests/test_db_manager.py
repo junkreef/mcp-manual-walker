@@ -24,6 +24,7 @@ from mcp_manual_walker.db_manager import (
     command_optimize_lexical,
 )
 from mcp_manual_walker.models import Base, Figure, Manual
+from mcp_manual_walker.vector_store import Chunk
 
 
 @pytest.fixture
@@ -34,13 +35,23 @@ def mock_session():
 
 
 @pytest.fixture
-def mock_chroma():
-    with patch("mcp_manual_walker.db_manager.get_chroma_client") as mock:
-        client_instance = mock.return_value
-        collection_instance = MagicMock()
-        client_instance.get_collection.return_value = collection_instance
-        client_instance.get_or_create_collection.return_value = collection_instance
-        yield client_instance, collection_instance
+def mock_store():
+    """Stands in for whichever vector backend is configured.
+
+    The commands reach it only through the VectorStore interface, so one mock
+    serves every backend and the tests below assert on that interface rather
+    than on any engine's own call shape.
+    """
+    with patch("mcp_manual_walker.db_manager.get_store") as mock:
+        store = MagicMock()
+        store.scroll.return_value = iter(())
+        mock.return_value = store
+        yield store
+
+
+def added_chunks(store):
+    """Every Chunk handed to store.add(), across all calls, in order."""
+    return [chunk for call in store.add.call_args_list for chunk in call.args[0]]
 
 
 def make_session(db_path):
@@ -115,8 +126,7 @@ def test_command_list_json(mock_session, capsys):
     assert output_data[0]["file_name"] == "doc1.pdf"
 
 
-def test_command_delete(mock_session, mock_chroma):
-    client, collection = mock_chroma
+def test_command_delete(mock_session, mock_store):
 
     # Setup
     manual = Manual(
@@ -147,16 +157,15 @@ def test_command_delete(mock_session, mock_chroma):
     mock_session.delete.assert_called_with(manual)
     mock_session.commit.assert_called_once()
 
-    # Check Chroma delete
-    collection.delete.assert_called_with(where={"manual_id": "uuid-del"})
+    # Check the vector store delete
+    mock_store.delete_manual.assert_called_with("uuid-del")
 
     # Check the BM25 index, and that only the named manual left it
     assert [r[0] for r in fts.execute("SELECT chunk_id FROM chunks_fts")] == ["c2"]
     assert fts.execute("SELECT total FROM chunks_fts_stats").fetchone()[0] == 1
 
 
-def test_command_export(tmp_path, mock_session, mock_chroma):
-    client, collection = mock_chroma
+def test_command_export(tmp_path, mock_session, mock_store):
 
     # Setup Data
     manual = Manual(
@@ -173,13 +182,10 @@ def test_command_export(tmp_path, mock_session, mock_chroma):
 
     mock_session.execute.return_value.scalars.return_value.all.return_value = [manual]
 
-    # Mock Chroma get
-    collection.get.return_value = {
-        "ids": ["c1", "c2"],
-        "embeddings": [[0.1, 0.2], [0.3, 0.4]],
-        "metadatas": [{"m": 1}, {"m": 2}],
-        "documents": ["doc1", "doc2"],
-    }
+    mock_store.scroll.return_value = iter([
+        Chunk(id="c1", document="doc1", metadata={"m": 1}, embedding=[0.1, 0.2]),
+        Chunk(id="c2", document="doc2", metadata={"m": 2}, embedding=[0.3, 0.4]),
+    ])
 
     archive = tmp_path / "out.zip"
     command_export(Namespace(target="exp.pdf", output=str(archive)))
@@ -200,8 +206,7 @@ def test_command_export(tmp_path, mock_session, mock_chroma):
     assert [c["embedding"] for c in chunks] == [[0.1, 0.2], [0.3, 0.4]]
 
 
-def test_command_import(mock_session, mock_chroma):
-    client, collection = mock_chroma
+def test_command_import(mock_session, mock_store):
 
     # Mock data
     manifest_data = {
@@ -249,14 +254,13 @@ def test_command_import(mock_session, mock_chroma):
             command_import(Namespace(input=str(archive)))
 
     assert mock_session.add.call_count >= 1
-    collection.add.assert_called()
-    assert collection.add.call_args.kwargs["ids"] == ["c1"]
-    assert collection.add.call_args.kwargs["documents"] == ["chunk"]
+    mock_store.add.assert_called()
+    assert [c.id for c in added_chunks(mock_store)] == ["c1"]
+    assert [c.document for c in added_chunks(mock_store)] == ["chunk"]
 
 
-def test_command_import_rejects_other_embedding_model(mock_session, mock_chroma):
-    """An export built with another model must not be merged into the collection."""
-    client, collection = mock_chroma
+def test_command_import_rejects_other_embedding_model(mock_session, mock_store):
+    """An export built with another model must not be merged into the store."""
 
     manifest_data = {
         "version": "1.0",
@@ -301,12 +305,11 @@ def test_command_import_rejects_other_embedding_model(mock_session, mock_chroma)
             # Refused by returning, not by raising: the CLI logs and stops.
             command_import(Namespace(input=str(archive)))
 
-    collection.add.assert_not_called()
+    mock_store.add.assert_not_called()
     mock_get_embedder.assert_not_called()
 
-def test_export_import_round_trip_with_figures(tmp_path, mock_chroma):
+def test_export_import_round_trip_with_figures(tmp_path, mock_store):
     """A manual with a figure survives export and import byte for byte."""
-    client, collection = mock_chroma
     image = png_bytes()
 
     source = make_session(tmp_path / "source.db")
@@ -341,19 +344,19 @@ def test_export_import_round_trip_with_figures(tmp_path, mock_chroma):
     source.add(manual)
     source.commit()
 
-    collection.get.return_value = {
-        "ids": ["uuid-fig_0"],
-        "embeddings": [[0.1, 0.2]],
-        "metadatas": [
-            {
+    mock_store.scroll.return_value = iter([
+        Chunk(
+            id="uuid-fig_0",
+            document="Figure 1: Panel",
+            metadata={
                 "manual_id": "uuid-fig",
                 "type": "figure",
                 "page": 4,
                 "figure_id": "figure-1",
-            }
-        ],
-        "documents": ["Figure 1: Panel"],
-    }
+            },
+            embedding=[0.1, 0.2],
+        )
+    ])
 
     archive = tmp_path / "export.zip"
     with patch("mcp_manual_walker.db_manager.SessionLocal", return_value=source):
@@ -403,8 +406,7 @@ def test_export_import_round_trip_with_figures(tmp_path, mock_chroma):
     assert (restored.width, restored.height) == (8, 6)
 
     # The chunk metadata still points at the same figure id.
-    added = collection.add.call_args.kwargs
-    assert added["metadatas"][0]["figure_id"] == "figure-1"
+    assert added_chunks(mock_store)[0].metadata["figure_id"] == "figure-1"
 
     # Deleting the manual takes its figures with it.
     target.delete(target.get(Manual, "uuid-fig"))
@@ -412,9 +414,8 @@ def test_export_import_round_trip_with_figures(tmp_path, mock_chroma):
     assert target.get(Figure, "figure-1") is None
 
 
-def test_command_import_accepts_archive_without_figures(tmp_path, mock_chroma):
+def test_command_import_accepts_archive_without_figures(tmp_path, mock_store):
     """A format_version 1 archive (no figures at all) still imports."""
-    client, collection = mock_chroma
 
     archive = tmp_path / "legacy.zip"
     with zipfile.ZipFile(archive, "w") as zf:
@@ -468,16 +469,15 @@ def test_command_import_accepts_archive_without_figures(tmp_path, mock_chroma):
     manual = target.get(Manual, "uuid-legacy")
     assert manual is not None
     assert manual.figures == []
-    assert collection.add.call_args.kwargs["ids"] == ["uuid-legacy_0"]
+    assert [c.id for c in added_chunks(mock_store)] == ["uuid-legacy_0"]
 
 
-def test_figure_images_are_stored_not_deflated(tmp_path, mock_session, mock_chroma):
+def test_figure_images_are_stored_not_deflated(tmp_path, mock_session, mock_store):
     """PNG is already compressed; deflating it again is pure cost.
 
     Measured on the zOS/V3R1 export: 2,140 MB of PNGs deflated to 2,000 MB, a
     7% gain for roughly a third of the export's runtime.
     """
-    client, collection = mock_chroma
     manual = Manual(
         id="uuid-store",
         file_name="s.pdf",
@@ -502,12 +502,7 @@ def test_figure_images_are_stored_not_deflated(tmp_path, mock_session, mock_chro
     )
     manual.figures = [figure]
     mock_session.execute.return_value.scalars.return_value.all.return_value = [manual]
-    collection.get.return_value = {
-        "ids": [],
-        "embeddings": [],
-        "metadatas": [],
-        "documents": [],
-    }
+    mock_store.scroll.return_value = iter(())
 
     archive = tmp_path / "stored.zip"
     command_export(Namespace(target="s.pdf", output=str(archive)))
@@ -518,9 +513,8 @@ def test_figure_images_are_stored_not_deflated(tmp_path, mock_session, mock_chro
         assert zf.read("figures/fig-store.png") == figure.image
 
 
-def test_a_version_2_archive_still_imports(tmp_path, mock_session, mock_chroma):
+def test_a_version_2_archive_still_imports(tmp_path, mock_session, mock_store):
     """chroma.json predates chunks.jsonl; those archives must keep working."""
-    client, collection = mock_chroma
     archive = tmp_path / "v2.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr(
@@ -568,15 +562,14 @@ def test_a_version_2_archive_still_imports(tmp_path, mock_session, mock_chroma):
         mock_session.scalars.return_value.first.return_value = None
         command_import(Namespace(input=str(archive)))
 
-    assert collection.add.call_args.kwargs["ids"] == ["c-v2"]
-    assert collection.add.call_args.kwargs["documents"] == ["legacy chunk"]
+    assert [c.id for c in added_chunks(mock_store)] == ["c-v2"]
+    assert [c.document for c in added_chunks(mock_store)] == ["legacy chunk"]
 
 
 def test_import_leaves_no_temporary_file_beside_the_archive(
-    tmp_path, mock_session, mock_chroma
+    tmp_path, mock_session, mock_store
 ):
     """Version 3 unpacked a 10 GB chunks.jsonl next to the archive first."""
-    client, collection = mock_chroma
     archive = tmp_path / "clean.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr(
@@ -602,10 +595,9 @@ def test_import_leaves_no_temporary_file_beside_the_archive(
 
 
 def test_a_long_chunk_stream_survives_the_round_trip(
-    tmp_path, mock_session, mock_chroma
+    tmp_path, mock_session, mock_store
 ):
     """More chunks than fit one zstd block, to exercise the streaming path."""
-    client, collection = mock_chroma
     manual = Manual(
         id="uuid-long",
         file_name="l.pdf",
@@ -620,12 +612,15 @@ def test_a_long_chunk_stream_survives_the_round_trip(
     mock_session.execute.return_value.scalars.return_value.all.return_value = [manual]
 
     count = 5000
-    collection.get.return_value = {
-        "ids": [f"c{i}" for i in range(count)],
-        "embeddings": [[float(i), float(i) + 0.5] for i in range(count)],
-        "metadatas": [{"manual_id": "uuid-long"} for _ in range(count)],
-        "documents": [f"document body {i} " + "filler " * 20 for i in range(count)],
-    }
+    mock_store.scroll.return_value = iter([
+        Chunk(
+            id=f"c{i}",
+            document=f"document body {i} " + "filler " * 20,
+            metadata={"manual_id": "uuid-long"},
+            embedding=[float(i), float(i) + 0.5],
+        )
+        for i in range(count)
+    ])
 
     archive = tmp_path / "long.zip"
     command_export(Namespace(target="l.pdf", output=str(archive)))
