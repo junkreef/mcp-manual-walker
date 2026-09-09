@@ -64,6 +64,92 @@ You need to have Python 3.11+ and `uv` installed.
     uv run python -m mcp_manual_walker.main
     ```
 
+    Or run it in a container — see [Running in containers](#-running-in-containers).
+
+## 🐳 Running in containers
+
+`compose.yaml` brings up the search server and the Qdrant it talks to. The
+builder is deliberately not in it: it wants a GPU, Docling's model downloads
+and several gigabytes of VRAM, and it runs once per corpus rather than
+continuously, so it belongs on the machine with the card. Build there and move
+the result with `db_manager export` / `import`, which is backend-neutral.
+
+```sh
+cp .env.example .env          # set EMBEDDING_API_BASE (see below)
+docker compose up -d --build
+docker compose --profile tools run --rm db_manager import --input /import/corpus.zip
+```
+
+The server is on `http://127.0.0.1:8000/mcp`. Files to import come from `./data`
+on the host, mounted read-only at `/import`.
+
+**The server does not need to be restarted after the corpus arrives.** Starting
+it next to an empty Qdrant is the normal ordering, so it re-attaches on the
+first request once the collection exists.
+
+### Two images, because the server has two shapes
+
+| Target | Size | Needs |
+| --- | --- | --- |
+| `server-remote` (default) | **905 MB** | an OpenAI-compatible endpoint |
+| `server` (`--profile local`) | 2.43 GB | nothing; downloads 1.2 GiB of weights on first use |
+
+The size difference is the whole of it: `sentence-transformers` and torch are
+not in the remote image at all. They moved to the `local-embeddings` extra,
+which `cpu` and `cu130` pull in, so nothing changes for a `uv sync --extra cpu`
+install.
+
+**Which is faster is a question about your machines, not about these images.**
+The two targets do not do the work differently; they do it in different places.
+`server-remote` sends the query somewhere else, so its latency is that host
+plus the network. `server` does it here, so its latency is this host's CPU. On
+one setup — a Lemonade Server on the LAN with a GPU against CPU float32 in a
+container on this host — `search_manual` measured a p50 of 131 ms remote
+against 295 ms local over 15 searches. Move either machine and the comparison
+moves with it. Do not read that as a property of the images.
+
+What does not depend on the environment is the shape of the decision:
+
+*   Take `server-remote` if you already run an inference endpoint, or if the
+    server host is small — it is a third of the image and holds no model.
+*   Take `server` if you would rather not depend on another service being up,
+    or if there is no endpoint to point at.
+
+The one comparison that does generalise is between a *query* and a *chunk*,
+because it follows the token count rather than the hardware: a search query is
+a few dozen tokens and a chunk is a few hundred, so embedding a whole corpus
+through an endpoint costs roughly an order of magnitude more per item than
+embedding a query does. That is why the builder is not offered either of these
+images and keeps its GPU.
+
+```sh
+docker compose up -d --build                  # server-remote
+docker compose --profile local up -d --build  # server
+```
+
+Run one or the other, never both: they publish the same port.
+
+### What is where
+
+| | |
+| --- | --- |
+| `mmw_data` (volume) | The SQLite database — manuals, bookmarks, figures, the BM25 index. Half the corpus: a chunk id in Qdrant means nothing without it. |
+| `qdrant_storage` (volume) | The vectors. |
+| `hf_cache` (volume) | The embedding model, for the `local` profile only. |
+| `./data` → `/import:ro` | Read-only, so a bind mount cannot trip over the container's uid. Archives and PDFs are read from here. |
+
+Qdrant's ports are published on loopback only, because it has no
+authentication unless `QDRANT__SERVICE__API_KEY` is set. Publish it wider only
+once you have set one.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `EMBEDDING_API_BASE` | *(required)* | The endpoint the default image embeds through. Not needed with `--profile local`. |
+| `MCP_PORT` | `8000` | Host port for the server. |
+| `MCP_BIND` | `127.0.0.1` | Host address to publish it on. |
+| `QDRANT_VERSION` | `v1.19.1` | Qdrant image tag. |
+| `QDRANT_HTTP_PORT` / `QDRANT_GRPC_PORT` | `6333` / `6334` | Host ports for Qdrant, on loopback. |
+
 ## 🛠️ Usage
 
 The server provides a set of tools for AI agents. The typical workflow is as follows:
@@ -529,13 +615,24 @@ The memory line is the whole reason the second backend exists, and it is a
 difference in kind rather than in degree. Chroma's vectors and graph live in an
 hnswlib arena the kernel cannot take back. Qdrant memory-maps both — its
 segments report `storage_type: InRamMmap` even when nothing has been asked to
-go "on disk" — so the same data is page cache. Measured by running the whole
-684,398-chunk corpus in a container capped with `--memory` and swap disabled:
+go "on disk" — so the same data is page cache.
+
+The consequence is visible under a hard cgroup limit. The whole
+684,398-chunk corpus, in a container capped with `--memory` and swap disabled:
 
 | Container cap | 8 GB | 4 GB | 2 GB | 1 GB | **512 MB** |
 | --- | --- | --- | --- | --- | --- |
 | One manual, p50 | 2.83 ms | 4.37 ms | 3.92 ms | 2.92 ms | **2.58 ms** |
 | Whole corpus, p50 | 5.20 ms | 6.71 ms | 5.84 ms | 5.52 ms | **5.02 ms** |
+
+**Read that as "the process does not need the memory", not as "the machine
+does not".** The host had about 10 GB free throughout, so the mmapped pages
+stayed in the global page cache even when the container's own cgroup could not
+be charged for them. On a host that is genuinely short of memory those pages
+get evicted and re-read, and the times rise. The claim the table supports is
+the narrow one: nothing was killed and nothing degraded at any cap, because
+none of that data has to be anonymous memory. Chroma at the same size cannot
+be given a 512 MB cap at all.
 
 The HNSW graph itself is 43 MB on disk for those 684,398 vectors, against
 2,677 MB of vector storage — Qdrant compresses the links, so the graph was
@@ -798,13 +895,20 @@ is hundreds of thousands of 1.2 kB chunks, and an HTTP round trip per batch is
 not the way to embed those. Leave the builder on `EMBEDDING_BACKEND=local` with
 its GPU.
 
-Measured against a Lemonade Server on the LAN serving
+One data point, on one setup — a Lemonade Server on the LAN serving
 `Qwen3-Embedding-0.6B-GGUF` (Q8_0, llama.cpp/Vulkan):
 
 | | |
 | --- | --- |
-| One query, warm | **24 ms** (p50) |
+| One query, warm | 24 ms (p50) |
 | A whole chunk (~300 tokens) | ~320 ms |
+
+The absolute figures belong to that endpoint and that network; yours will
+differ, and whether they beat embedding in-process depends on which machine is
+better. **The ratio is the part that carries over**, because it follows the
+token count rather than the hardware: a chunk costs roughly an order of
+magnitude more than a query. That is what makes an endpoint the right place for
+one query per request and the wrong place for a whole corpus.
 
 **A quantized GGUF of the same model is vector-compatible with a database built
 from the full-precision checkpoint.** Measured on 64 chunks drawn from a real

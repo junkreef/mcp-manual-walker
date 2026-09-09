@@ -19,7 +19,9 @@ class Settings(BaseSettings):
     # 1024-dimensional chunks. Qdrant memory-maps the same data and needs a
     # server process. Measured on 684,398 chunks: Chroma about 2.9 GB the
     # process must have, Qdrant about 350 MB it must have plus 2.7 GB the
-    # kernel may reclaim, still answering in 2.6 ms under a 512 MB cap.
+    # kernel may reclaim. Under a 512 MB container cap Qdrant kept answering,
+    # which says the process does not need the memory rather than that the
+    # machine does not -- the host still had page cache to give it.
     VECTOR_BACKEND: str = "chroma"
     CHROMADB_PATH: Path = Path("./data/db/chroma_db")
 

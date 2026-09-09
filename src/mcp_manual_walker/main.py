@@ -73,9 +73,37 @@ def init_vector_store() -> None:
         app_state.init_error = str(e)
 
 
+def _reopen_store() -> bool:
+    """Tries again to attach to a store that was not there at startup.
+
+    A server started before its database exists is the normal case rather than
+    an error: `docker compose up` brings this up next to an empty Qdrant, and
+    the corpus arrives afterwards through `db_manager import`. Without this the
+    server would answer every request with the same stale complaint until
+    somebody restarted it.
+
+    The embedding model is not reloaded. It is the expensive half of startup --
+    1.11 GiB of weights under the local backend -- and it has nothing to do
+    with whether the collection has appeared yet.
+    """
+    try:
+        store = open_store()
+        check_embedding_model(store.embedding_model, settings.EMBEDDING_MODEL)
+    except Exception as e:  # noqa: BLE001 - reported through the tool below
+        app_state.init_error = str(e)
+        return False
+
+    if app_state.embedder is None:
+        app_state.embedder = get_embedder()
+    app_state.store = store
+    app_state.init_error = None
+    logger.info("The vector store is now available.")
+    return True
+
+
 def _require_store():
     """Returns the vector store, or raises a ToolError explaining why it is gone."""
-    if app_state.store is None:
+    if app_state.store is None and not _reopen_store():
         message = "Vector database is not initialized."
         if app_state.init_error:
             message = f"{message} {app_state.init_error}"

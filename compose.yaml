@@ -1,0 +1,134 @@
+# The search server and the vector database it talks to.
+#
+#   docker compose up -d --build
+#       The server, embedding queries through an OpenAI-compatible endpoint.
+#       Set EMBEDDING_API_BASE first (see .env.example).
+#
+#   docker compose --profile local up -d --build
+#       The server with Qwen3-Embedding-0.6B in its own process instead. No
+#       endpoint needed; a larger image and a model download on first use.
+#
+#   docker compose --profile tools run --rm db_manager import --input /import/corpus.zip
+#       Any db_manager subcommand against the same databases. Files to read
+#       come from ./data on the host, mounted read-only at /import.
+#
+# The builder is deliberately absent. It wants a GPU, Docling's model
+# downloads and several gigabytes of VRAM, and it runs once per corpus rather
+# than continuously, so it belongs on the machine with the card. Build there
+# and move the result with `db_manager export` / `import`, which is
+# backend-neutral.
+
+name: mcp-manual-walker
+
+x-app-env: &app-env
+  VECTOR_BACKEND: qdrant
+  QDRANT_URL: http://qdrant:6333
+  QDRANT_GRPC_PORT: 6334
+  # Both halves of a corpus have to agree about which model made the vectors,
+  # so this is stated once and shared by the server and the tools.
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-remote-embedding: &remote-embedding
+  EMBEDDING_BACKEND: openai
+  EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:?set EMBEDDING_API_BASE, or use the "local" profile}
+  EMBEDDING_API_MODEL: ${EMBEDDING_API_MODEL:-}
+  EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+
+x-app-volumes: &app-volumes
+  # The relational database: manuals, bookmarks, figures, the BM25 index and
+  # the recorded embedding model. It is half of the corpus -- a chunk id in
+  # Qdrant means nothing without it -- so it outlives any container.
+  - mmw_data:/app/data
+  # Read-only, so a bind mount cannot trip over the container's uid: this is
+  # only where export archives and PDFs are read from.
+  - ./data:/import:ro
+
+services:
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_VERSION:-v1.19.1}
+    restart: unless-stopped
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    ports:
+      # Loopback only. The server reaches Qdrant over the compose network, and
+      # Qdrant has no authentication unless QDRANT__SERVICE__API_KEY is set;
+      # publish it wider only once you have set one.
+      - "127.0.0.1:${QDRANT_HTTP_PORT:-6333}:6333"
+      - "127.0.0.1:${QDRANT_GRPC_PORT:-6334}:6334"
+    healthcheck:
+      # The image carries no curl and no wget, but it does carry bash, and
+      # /dev/tcp is enough to prove the port is answering.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # The default server: queries are embedded by somebody else's process, so
+  # this image carries no torch and no model -- 905 MB against 2.43 GB. Where
+  # the work happens changes what has to be installed here; whether it also
+  # answers sooner depends on the two machines involved.
+  mcp:
+    build:
+      context: .
+      target: server-remote
+    image: mcp-manual-walker:remote
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      <<: [*app-env, *remote-embedding]
+    volumes: *app-volumes
+    ports:
+      - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8000}:8000"
+
+  # The same server with the model in process. One or the other, never both:
+  # they would fight over the port.
+  mcp-local:
+    profiles: ["local"]
+    build:
+      context: .
+      target: server
+    image: mcp-manual-walker:local
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      EMBEDDING_BACKEND: local
+    volumes:
+      - mmw_data:/app/data
+      - ./data:/import:ro
+      # The weights are ~1.2 GiB and are fetched on first use; keeping them
+      # here means a restart is not another download.
+      - hf_cache:/home/app/.cache/huggingface
+    ports:
+      - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8000}:8000"
+
+  # One-off commands: import, export, delete, list, reindex-lexical. Uses the
+  # small image, because none of those embed anything except `search`.
+  db_manager:
+    profiles: ["tools"]
+    build:
+      context: .
+      target: server-remote
+    image: mcp-manual-walker:remote
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-openai}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
+      EMBEDDING_API_MODEL: ${EMBEDDING_API_MODEL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+    volumes: *app-volumes
+    entrypoint: ["python", "-m", "mcp_manual_walker.db_manager"]
+
+volumes:
+  mmw_data:
+  qdrant_storage:
+  hf_cache:
