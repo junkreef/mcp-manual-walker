@@ -8,9 +8,13 @@
 #       The server with Qwen3-Embedding-0.6B in its own process instead. No
 #       endpoint needed; a larger image and a model download on first use.
 #
-#   docker compose --profile tools run --rm db_manager import --input /import/corpus.zip
-#       Any db_manager subcommand against the same databases. Files to read
-#       come from ./data on the host, mounted read-only at /import.
+#   docker compose --profile tools run --rm db_manager import --input /app/data/corpus.zip
+#       Any db_manager subcommand against the same databases.
+#
+# Everything persistent lives under ./data on the host, the same place a
+# non-container install puts it, so the two can share one database and a
+# backup is a copy of a directory. That needs the containers to run as the
+# user who owns ./data rather than as root; see MMW_UID below.
 #
 # The builder is deliberately absent. It wants a GPU, Docling's model
 # downloads and several gigabytes of VRAM, and it runs once per corpus rather
@@ -19,6 +23,17 @@
 # backend-neutral.
 
 name: mcp-manual-walker
+
+# Who the containers run as. ./data is owned by whoever cloned the repository,
+# and a container writing into it as root would leave files that user cannot
+# delete. 1000:1000 is the first login account on most Linux systems; if that
+# is not you, put MMW_UID and MMW_GID in a .env file beside this one:
+#
+#     printf 'MMW_UID=%s\nMMW_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+#
+# (UID cannot be used directly: bash marks it readonly and never exports it,
+# so compose would not see it.)
+x-run-as: &run-as "${MMW_UID:-1000}:${MMW_GID:-1000}"
 
 x-app-env: &app-env
   VECTOR_BACKEND: qdrant
@@ -35,21 +50,29 @@ x-remote-embedding: &remote-embedding
   EMBEDDING_API_MODEL: ${EMBEDDING_API_MODEL:-}
   EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
 
+# ./data holds everything that has to survive the containers: the relational
+# database (manuals, bookmarks, figures, the BM25 index, the recorded
+# embedding model), the vectors under ./data/qdrant, and whatever archives and
+# PDFs are being read. The SQLite half is not optional baggage -- a chunk id in
+# Qdrant means nothing without it -- so the two belong in one directory and one
+# backup.
 x-app-volumes: &app-volumes
-  # The relational database: manuals, bookmarks, figures, the BM25 index and
-  # the recorded embedding model. It is half of the corpus -- a chunk id in
-  # Qdrant means nothing without it -- so it outlives any container.
-  - mmw_data:/app/data
-  # Read-only, so a bind mount cannot trip over the container's uid: this is
-  # only where export archives and PDFs are read from.
-  - ./data:/import:ro
+  - ./data:/app/data
 
 services:
   qdrant:
     image: qdrant/qdrant:${QDRANT_VERSION:-v1.19.1}
     restart: unless-stopped
+    user: *run-as
+    environment:
+      # Qdrant's image runs as root and writes two things next to its binary
+      # rather than into its storage: an init marker and a snapshots
+      # directory. Running as anyone else then fails on /qdrant, which is
+      # root-owned in the image, so both are pointed at the volume instead.
+      QDRANT_INIT_FILE_PATH: /qdrant/storage/.qdrant-initialized
+      QDRANT__STORAGE__SNAPSHOTS_PATH: /qdrant/storage/snapshots
     volumes:
-      - qdrant_storage:/qdrant/storage
+      - ./data/qdrant:/qdrant/storage
     ports:
       # Loopback only. The server reaches Qdrant over the compose network, and
       # Qdrant has no authentication unless QDRANT__SERVICE__API_KEY is set;
@@ -75,6 +98,7 @@ services:
       target: server-remote
     image: mcp-manual-walker:remote
     restart: unless-stopped
+    user: *run-as
     depends_on:
       qdrant:
         condition: service_healthy
@@ -93,18 +117,19 @@ services:
       target: server
     image: mcp-manual-walker:local
     restart: unless-stopped
+    user: *run-as
     depends_on:
       qdrant:
         condition: service_healthy
     environment:
       <<: *app-env
       EMBEDDING_BACKEND: local
-    volumes:
-      - mmw_data:/app/data
-      - ./data:/import:ro
-      # The weights are ~1.2 GiB and are fetched on first use; keeping them
-      # here means a restart is not another download.
-      - hf_cache:/home/app/.cache/huggingface
+      # The image points this at the app user's home, which is the wrong place
+      # once the container runs as somebody else. Under ./data it is writable,
+      # visible and obviously excludable from a backup -- the weights are
+      # ~1.2 GiB and can always be fetched again.
+      HF_HOME: /app/data/model-cache
+    volumes: *app-volumes
     ports:
       - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8000}:8000"
 
@@ -116,6 +141,7 @@ services:
       context: .
       target: server-remote
     image: mcp-manual-walker:remote
+    user: *run-as
     depends_on:
       qdrant:
         condition: service_healthy
@@ -128,7 +154,3 @@ services:
     volumes: *app-volumes
     entrypoint: ["python", "-m", "mcp_manual_walker.db_manager"]
 
-volumes:
-  mmw_data:
-  qdrant_storage:
-  hf_cache:
