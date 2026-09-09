@@ -230,6 +230,19 @@ def test_get_embedder_selects_the_remote_backend():
     assert embedder.model_name == settings.EMBEDDING_MODEL
 
 
+def test_get_embedder_accepts_remote_as_a_spelling_of_openai():
+    """The image tag, the compose anchor and the README all say "remote"."""
+    with (
+        patch.object(settings, "EMBEDDING_BACKEND", "remote"),
+        patch.object(settings, "EMBEDDING_API_BASE", API_BASE),
+        patch.object(settings, "EMBEDDING_API_MODEL", "Qwen3-Embedding-0.6B-GGUF"),
+    ):
+        embedder = get_embedder()
+
+    assert isinstance(embedder, OpenAICompatibleEmbedder)
+    assert embedder.model_name == settings.EMBEDDING_MODEL
+
+
 def test_get_embedder_refuses_the_remote_backend_without_a_base_url(caplog):
     with (
         patch.object(settings, "EMBEDDING_BACKEND", "openai"),

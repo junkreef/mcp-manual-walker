@@ -200,7 +200,11 @@ sudo git clone https://github.com/junkreef/mcp-manual-walker.git \
 cd /opt/mcp-manual-walker
 
 # The data, created before the first `up`: Docker makes a missing bind-mount
-# source itself, and it makes it owned by root.
+# source itself, and it makes it owned by root. Name both directories --
+# `install -d` only sets ownership on what it creates, so a parent that
+# already exists keeps whichever owner it was made with, and a root-owned
+# parent stops the server creating data/pdfs however right the child looks.
+sudo install -d -o mmw -g mmw /var/lib/mcp-manual-walker
 sudo install -d -o mmw -g mmw /var/lib/mcp-manual-walker/qdrant
 
 # The two files that describe this host rather than the project.
@@ -252,6 +256,48 @@ sudo docker compose --profile tools run --rm db_manager \
 Note the argument: the path is the container's, so a file you want imported
 goes into `/var/lib/mcp-manual-walker` on the host and is named `/app/data/...`
 on the command line.
+
+#### When the unit fails to start
+
+`--wait` reports `container mcp-manual-walker-mcp-1 is unhealthy` for anything
+that stops the server answering, which includes a container that exited a
+second after it started. The unit's own journal will not say why — that is in
+the container's log, and `restart: unless-stopped` may already have replaced
+the container that holds it:
+
+```sh
+sudo docker compose -f /opt/mcp-manual-walker/compose.yaml logs --tail 40 mcp
+```
+
+Two failures account for most first starts, and neither looks like what it is:
+
+**`PermissionError: [Errno 13] Permission denied: '/app/data/pdfs'`.** The data
+directory is not owned by `MMW_UID:MMW_GID`. Check the parent, not just what is
+under it — a root-owned parent with correctly-owned children is exactly what
+you get from creating the directory one way and its contents another:
+
+```sh
+ls -ldn /var/lib/mcp-manual-walker
+sudo chown -R mmw:mmw /var/lib/mcp-manual-walker
+```
+
+**Nothing answers at the embedding endpoint.** `localhost` in `.env` means the
+container itself, where nothing is listening — the value has to be an address
+the container can reach, so a service on the host or the LAN needs its real IP.
+Ask the container rather than the host, because they do not share a network:
+
+```sh
+sudo docker compose -f /opt/mcp-manual-walker/compose.yaml exec mcp \
+    python -c "import urllib.request as u; print(u.urlopen('http://192.168.0.1:11434/v1/models', timeout=8).status)"
+```
+
+Take the containers down before restarting the unit if one is already looping:
+`up` treats a restarting container as present and will not replace it.
+
+```sh
+cd /opt/mcp-manual-walker && sudo docker compose down
+sudo systemctl restart mcp-manual-walker
+```
 
 ### Backing it up
 
@@ -1099,7 +1145,7 @@ EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `EMBEDDING_BACKEND` | `local` | `local` loads the model with Sentence Transformers in-process; `openai` calls a remote OpenAI-compatible endpoint. |
+| `EMBEDDING_BACKEND` | `local` | `local` loads the model with Sentence Transformers in-process; `openai` calls a remote OpenAI-compatible endpoint, and `remote` is accepted as a second spelling of it. |
 | `EMBEDDING_API_BASE` | *(empty)* | Base URL of the endpoint, e.g. `http://localhost:11434/v1`. Required when the backend is `openai`. |
 | `EMBEDDING_API_MODEL` | *(uses `EMBEDDING_MODEL`)* | The id the **endpoint** knows the model by. Not recorded on the collection. |
 | `EMBEDDING_API_KEY` | *(empty)* | Sent as `Authorization: Bearer …` when set. |
