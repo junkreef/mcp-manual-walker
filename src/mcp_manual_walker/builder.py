@@ -1062,8 +1062,6 @@ def build(
             logger.warning(f"Deleting existing DB: {settings.DB_FILE_PATH}")
             settings.DB_FILE_PATH.unlink()
 
-        reset_store()
-
         if settings.MARKDOWN_OUTPUT_DIR.exists():
             logger.warning(
                 f"Resetting Markdown Output directory: {settings.MARKDOWN_OUTPUT_DIR}"
@@ -1078,6 +1076,12 @@ def build(
     if not settings.DB_FILE_PATH.parent.exists():
         settings.DB_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     init_db()
+
+    # After init_db, not with the deletions above: a backend that keeps no
+    # metadata of its own records the embedding model in the relational
+    # database, and clearing that needs a database to clear it in.
+    if reset:
+        reset_store()
 
     # Process PDFs - Recursive scan
     pdf_files = select_pdf_files(pdf_dir, include)

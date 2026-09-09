@@ -256,7 +256,7 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `DOCLING_IMAGES_SCALE` | `2.0` | Render scale for the figure crops stored in SQLite (`1.0` = 72 dpi, `2.0` = 144 dpi). Higher means sharper PNGs and a bigger database file. |
 | `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
 | `EMBEDDING_DTYPE` | `auto` | Dtype the weights load under. `auto` reads it from the checkpoint (bfloat16); set `float32` on a CPU-only server (see below). |
-| `VECTOR_BACKEND` | `chroma` | Which vector database holds the chunks. Reached through `vector_store.VectorStore`; see [The vector index](#-the-vector-index). |
+| `VECTOR_BACKEND` | `chroma` | Which vector database holds the chunks: `chroma` (embedded) or `qdrant` (a server). See [Choosing a backend](#choosing-a-backend). |
 
 Chunking builds one markdown serializer per document rather than per table.
 `TableItem.export_to_markdown(doc)` constructs a `MarkdownDocSerializer` on
@@ -494,7 +494,8 @@ row.
 Chunks reach the vector database through one interface,
 `vector_store.VectorStore` — eight operations and three filter shapes, which is
 everything the builder, the search server and `db_manager` actually ask of it.
-`VECTOR_BACKEND` chooses the implementation; today the only one is `chroma`.
+`VECTOR_BACKEND` chooses the implementation: `chroma` (embedded, the default)
+or `qdrant` (a server).
 
 The interface exists because Chroma's HNSW index is held in an anonymous
 hnswlib arena that has to be resident, and past roughly a million 1024-dim
@@ -514,6 +515,86 @@ the engine put behind them. Two things every backend has to normalise:
 Because the export archive holds nothing engine-specific — one JSON object per
 chunk, with `id`, `embedding`, `metadata` and `document` — it is also the
 migration path between backends: export from one, import into another.
+
+#### Choosing a backend
+
+|  | Chroma | Qdrant |
+| --- | --- | --- |
+| Deployment | embedded, no server | a server process (Docker) |
+| Resident memory, 684,398 × 1024-dim | **~2.9 GB**, all of it heap | **~350 MB** heap, plus ~2.7 GB the kernel may reclaim |
+| Behaviour when RAM runs short | fails | gets slower |
+| Right for | a corpus that fits | a corpus that does not |
+
+The memory line is the whole reason the second backend exists, and it is a
+difference in kind rather than in degree. Chroma's vectors and graph live in an
+hnswlib arena the kernel cannot take back. Qdrant memory-maps both — its
+segments report `storage_type: InRamMmap` even when nothing has been asked to
+go "on disk" — so the same data is page cache. Measured by running the whole
+684,398-chunk corpus in a container capped with `--memory` and swap disabled:
+
+| Container cap | 8 GB | 4 GB | 2 GB | 1 GB | **512 MB** |
+| --- | --- | --- | --- | --- | --- |
+| One manual, p50 | 2.83 ms | 4.37 ms | 3.92 ms | 2.92 ms | **2.58 ms** |
+| Whole corpus, p50 | 5.20 ms | 6.71 ms | 5.84 ms | 5.52 ms | **5.02 ms** |
+
+The HNSW graph itself is 43 MB on disk for those 684,398 vectors, against
+2,677 MB of vector storage — Qdrant compresses the links, so the graph was
+never the thing that did not fit.
+
+**Quantization and on-disk vectors are deliberately off.** They were measured
+on the same corpus and made matters worse: `int8` with `always_ram` *added*
+about 700 MB of unreclaimable memory the mmapped originals do not need, and
+took a filtered search from 2.6 ms to 20.4 ms. Binary quantization cost recall
+(93.2% against 96.2%) for no memory saving. The settings exist for a corpus
+several times this one.
+
+**Per-tenant graphs are off too, and should stay off if you ever want to search
+across manuals.** Qdrant can skip the global graph (`m: 0`) and build one per
+value of a payload field, which is tempting here because every `search_manual`
+call carries a `manual_id`. It indexes in 30 s instead of 405 s and answers a
+filtered search perfectly — and answers a corpus-wide one at **0.2% recall@5**,
+because there is no global graph left to walk.
+
+One Qdrant-specific behaviour worth knowing: it **L2-normalizes the vectors of
+a cosine collection when it stores them**. An export taken from Qdrant
+therefore returns unit vectors rather than the exact numbers that went in — on
+3,273 real chunks whose stored norms ranged 0.998047–1.003795, the largest
+per-dimension difference was 5.99e-04 as stored and 2.42e-08 once the source
+was normalized too. Cosine ranking is scale-invariant, so retrieval is
+unaffected; only a byte-for-byte archive comparison will notice.
+
+```sh
+uv sync --extra cpu --extra qdrant
+docker run -d -p 6333:6333 -p 6334:6334 \
+    -v "$(pwd)/qdrant_storage:/qdrant/storage" qdrant/qdrant
+```
+
+```.env
+VECTOR_BACKEND=qdrant
+QDRANT_URL=http://localhost:6333
+```
+
+An existing Chroma database moves across without a rebuild, because the archive
+is backend-neutral:
+
+```sh
+VECTOR_BACKEND=chroma uv run db_manager export --target . --output corpus.zip
+VECTOR_BACKEND=qdrant uv run db_manager import --input corpus.zip
+```
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `QDRANT_URL` | `http://localhost:6333` | Where the server is. |
+| `QDRANT_API_KEY` | *(empty)* | Sent when set. |
+| `QDRANT_GRPC_PORT` | `6334` | gRPC port. |
+| `QDRANT_PREFER_GRPC` | `true` | A build uploads hundreds of thousands of 4 kB vectors; JSON-encoding them is the expensive part. |
+| `QDRANT_COLLECTION` | `manual_chunks` | Collection name. |
+| `QDRANT_TIMEOUT` | `60.0` | Request timeout, in seconds. |
+| `QDRANT_HNSW_EF` | `128` | Candidates held during a graph traversal. Measured 96.2% recall@5 corpus-wide against an exact scan of the same collection. |
+| `QDRANT_ON_DISK_VECTORS` | `false` | Qdrant already mmaps vectors it calls "in RAM"; see above. |
+| `QDRANT_ON_DISK_PAYLOAD` | `false` | Keeps the chunk text out of memory. Measured no benefit here. |
+| `QDRANT_QUANTIZATION` | `none` | `none`, `int8` or `binary`. See above before turning this on. |
+| `QDRANT_OVERSAMPLING` | `2.0` | Shortlist multiplier when rescoring a quantized search. Ignored when quantization is `none`. |
 
 The graph parameters are pinned in `collection_metadata()` rather than left to
 Chroma's defaults. The defaults (`max_neighbors` 16, `ef_construction` 100) are

@@ -26,6 +26,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The Qdrant backend (VECTOR_BACKEND=qdrant). Optional because Chroma is
+# embedded and remains the right answer for a small corpus, and because this
+# one needs a server to talk to.
+qdrant = [
+    "qdrant-client>=1.12",
+]
 # The torch build is chosen by extra: CPU wheels for the search server,
 # CUDA 13.0 wheels for the builder. They are mutually exclusive.
 cpu = [
@@ -49,6 +55,9 @@ dev = [
     "pytest-cov",
     "pytest-asyncio",
     "reportlab",
+    # The Qdrant backend's tests run against a mocked client, so they need the
+    # models it builds requests out of even when no server is around.
+    "qdrant-client>=1.12",
 ]
 
 [tool.ruff]

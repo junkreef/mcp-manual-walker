@@ -22,12 +22,12 @@ Two conventions the backends have to normalise, because they disagree:
   is what lets the BM25 index in SQLite and the export archive keep referring
   to chunks the way they already do.
 
-One decision is recorded here rather than implemented, because it only bites
-the second backend: **Qdrant has no collection metadata**, so it has nowhere to
-put the embedding model name that `embedding_model` returns and the server
-checks at startup. When that backend lands, the name goes in a small table in
-the application's own SQLite database. The Chroma backend keeps reading it from
-the collection metadata, which is where every existing database already has it.
+One asymmetry is worth stating here rather than in either backend: **Qdrant has
+no collection metadata**, so it has nowhere to put the embedding model name
+that `embedding_model` returns and the server checks at startup. It keeps the
+name in a small table in the application's own SQLite database instead (see
+`record_embedding_model` below). The Chroma backend goes on reading it from the
+collection metadata, which is where every existing database already has it.
 """
 
 from __future__ import annotations
@@ -155,6 +155,9 @@ class VectorStore(Protocol):
         """Releases whatever the backend holds. Safe to call more than once."""
 
 
+_EXPECTED = "expected 'chroma' or 'qdrant'"
+
+
 def open_store(embedder: Any = None, create: bool = False) -> VectorStore:
     """Opens the configured backend.
 
@@ -170,10 +173,12 @@ def open_store(embedder: Any = None, create: bool = False) -> VectorStore:
         from mcp_manual_walker.chroma_store import ChromaVectorStore
 
         return ChromaVectorStore.open(embedder=embedder, create=create)
+    if backend == "qdrant":
+        from mcp_manual_walker.qdrant_store import QdrantVectorStore
 
-    raise ValueError(
-        f"VECTOR_BACKEND is '{settings.VECTOR_BACKEND}'; expected 'chroma'."
-    )
+        return QdrantVectorStore.open(embedder=embedder, create=create)
+
+    raise ValueError(f"VECTOR_BACKEND is '{settings.VECTOR_BACKEND}'; {_EXPECTED}.")
 
 
 def reset_store() -> None:
@@ -186,10 +191,13 @@ def reset_store() -> None:
 
         ChromaVectorStore.reset()
         return
+    if backend == "qdrant":
+        from mcp_manual_walker.qdrant_store import QdrantVectorStore
 
-    raise ValueError(
-        f"VECTOR_BACKEND is '{settings.VECTOR_BACKEND}'; expected 'chroma'."
-    )
+        QdrantVectorStore.reset()
+        return
+
+    raise ValueError(f"VECTOR_BACKEND is '{settings.VECTOR_BACKEND}'; {_EXPECTED}.")
 
 
 def batched(chunks: Iterable[Chunk], size: int) -> Iterator[list[Chunk]]:
@@ -202,3 +210,61 @@ def batched(chunks: Iterable[Chunk], size: int) -> Iterator[list[Chunk]]:
             batch = []
     if batch:
         yield batch
+
+
+# Key under which the embedding model name is kept in `vector_store_meta`.
+EMBEDDING_MODEL_META_KEY = "embedding_model"
+
+
+def _meta_session():
+    """A session on the relational database, opening it if nothing else has.
+
+    The vector store can be reached before `init_db` in a process that only
+    wanted vectors, and a backend that keeps its model name here would
+    otherwise fail with SQLAlchemy's "could not locate a bind", which says
+    nothing about what went wrong. `init_db` is idempotent.
+    """
+    from mcp_manual_walker import database
+
+    if database.engine is None:
+        database.init_db()
+    return database.SessionLocal()
+
+
+def record_embedding_model(name: str) -> None:
+    """Records which model produced the stored vectors, for backends that cannot.
+
+    See models.VectorStoreMeta for why this lives in the relational database.
+    Written only when a store is created, never on open: a store that already
+    holds vectors keeps the name it was built with, so that opening it with a
+    different EMBEDDING_MODEL is caught rather than silently overwritten.
+    """
+    from mcp_manual_walker.models import VectorStoreMeta
+
+    with _meta_session() as session:
+        row = session.get(VectorStoreMeta, EMBEDDING_MODEL_META_KEY)
+        if row is None:
+            session.add(VectorStoreMeta(key=EMBEDDING_MODEL_META_KEY, value=name))
+        else:
+            row.value = name
+        session.commit()
+
+
+def recorded_embedding_model() -> Optional[str]:
+    """The recorded model name, or None if nothing has recorded one."""
+    from mcp_manual_walker.models import VectorStoreMeta
+
+    with _meta_session() as session:
+        row = session.get(VectorStoreMeta, EMBEDDING_MODEL_META_KEY)
+        return row.value if row is not None else None
+
+
+def forget_embedding_model() -> None:
+    """Drops the recorded name, so a reset store does not look like an old one."""
+    from mcp_manual_walker.models import VectorStoreMeta
+
+    with _meta_session() as session:
+        row = session.get(VectorStoreMeta, EMBEDDING_MODEL_META_KEY)
+        if row is not None:
+            session.delete(row)
+            session.commit()

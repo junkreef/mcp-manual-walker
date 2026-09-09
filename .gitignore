@@ -155,3 +155,9 @@ reembed_*.py
 # Backups of .env are still .env: the pattern above only covers the exact name.
 .env.bak*
 .env.*.bak
+
+# The Qdrant proof-of-concept harness and the scratch it produces: a local
+# venv, a corpus cache, the server's storage directory and the measurements.
+poc/
+.venv-poc/
+qdrant_storage/

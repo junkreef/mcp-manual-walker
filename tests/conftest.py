@@ -73,3 +73,18 @@ def dummy_pdf_factory():
         return path
 
     return _create_pdf
+
+
+@pytest.fixture
+def sqlite_db(tmp_path, monkeypatch):
+    """Binds SessionLocal to an empty relational database.
+
+    Needed by anything that reads or writes `vector_store_meta`, which is where
+    a backend with no metadata of its own records the embedding model.
+    """
+    from mcp_manual_walker import database
+    from mcp_manual_walker.config import settings
+
+    monkeypatch.setattr(settings, "DB_FILE_PATH", tmp_path / "meta.db")
+    database.init_db()
+    yield
