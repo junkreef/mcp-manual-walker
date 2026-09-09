@@ -113,8 +113,13 @@ def _thread_executor(max_workers, initializer=None, initargs=()):
 @pytest.fixture
 def builder_env(mock_settings):
     """
-    Reloads builder.py with docling/langchain/chromadb replaced by mocks and
-    yields a namespace with the handles the tests need to assert on.
+    Reloads builder.py with docling and langchain replaced by mocks, hands it
+    a stand-in vector store, and yields the handles the tests assert on.
+
+    The store is mocked at the interface rather than at a backend's client, so
+    these tests say nothing about which backend is configured -- and so that
+    patching cannot be defeated by another test file having already imported
+    the backend module and bound the real client inside it.
     """
     mock_docling = MagicMock()
     mock_docling_conv = MagicMock()
@@ -131,10 +136,6 @@ def builder_env(mock_settings):
 
     mock_lts = MagicMock()
 
-    mock_chromadb = MagicMock()
-    mock_chromadb.utils = MagicMock()
-    mock_chromadb.utils.embedding_functions = MagicMock()
-
     # Mock Docling behavior
     mock_inst = MagicMock()
     mock_res = MagicMock()
@@ -145,11 +146,8 @@ def builder_env(mock_settings):
     mock_inst.convert.return_value = mock_res
     mock_docling_conv.DocumentConverter.return_value = mock_inst
 
-    # Mock ChromaDB behavior
-    mock_client_inst = MagicMock()
-    mock_coll = MagicMock()
-    mock_client_inst.get_or_create_collection.return_value = mock_coll
-    mock_chromadb.PersistentClient.return_value = mock_client_inst
+    # Stand-in for whichever vector backend is configured.
+    mock_store = MagicMock()
 
     pipeline_options = mock_docling.datamodel.pipeline_options
 
@@ -175,11 +173,6 @@ def builder_env(mock_settings):
                 mock_docling_backend.docling_parse_backend
             ),
             "langchain_text_splitters": mock_lts,
-            "chromadb": mock_chromadb,
-            "chromadb.utils": mock_chromadb.utils,
-            "chromadb.utils.embedding_functions": (
-                mock_chromadb.utils.embedding_functions
-            ),
         },
     ):
         # Import/Reload builder inside patched environment so that the guarded
@@ -196,9 +189,9 @@ def builder_env(mock_settings):
             # The builder brackets embedding with the device handover.
             on_device=contextlib.nullcontext,
         )
-        # get_or_create_collection returns the metadata of an already existing
-        # collection, so the mock has to look like a matching one.
-        mock_coll.metadata = {"embedding_model": settings.EMBEDDING_MODEL}
+        # Opening a store that already exists keeps the model it recorded, so
+        # the mock has to look like a matching one.
+        mock_store.embedding_model = settings.EMBEDDING_MODEL
 
         with (
             patch("mcp_manual_walker.pdf_utils.extract_pdf_metadata") as mock_meta,
@@ -212,6 +205,11 @@ def builder_env(mock_settings):
                 "mcp_manual_walker.builder.get_embedder",
                 return_value=fake_embedder,
             ),
+            patch(
+                "mcp_manual_walker.builder.open_store",
+                return_value=mock_store,
+            ) as mock_open_store,
+            patch("mcp_manual_walker.builder.reset_store"),
         ):
             mock_hash.return_value = "dummy_hash"
             mock_meta.return_value = {
@@ -248,9 +246,9 @@ def builder_env(mock_settings):
             yield types.SimpleNamespace(
                 builder=builder,
                 mock_inst=mock_inst,
-                mock_client=mock_client_inst,
+                mock_open_store=mock_open_store,
                 mock_res=mock_res,
-                mock_coll=mock_coll,
+                mock_store=mock_store,
                 mock_hash=mock_hash,
                 mock_meta=mock_meta,
                 mock_chunk=mock_chunk,
@@ -275,32 +273,33 @@ def test_builder_smoke(pdf_dir, mock_settings, builder_env):
     builder_env.builder.build(pdf_dir, reset=True, save_markdown=True)
 
     assert builder_env.mock_inst.convert.call_count == 2
-    assert builder_env.mock_coll.add.call_count == 2
+    assert builder_env.mock_store.add.call_count == 2
 
-    # Chroma must never embed anything itself: vectors are always passed in,
-    # and the collection records which model produced them.
-    create_kwargs = builder_env.mock_client.get_or_create_collection.call_args.kwargs
-    assert create_kwargs["embedding_function"] is None
-    assert create_kwargs["metadata"]["embedding_model"] == settings.EMBEDDING_MODEL
+    # The store is opened for writing and told which model made the vectors,
+    # so it can record it and refuse a later build with a different one.
+    open_kwargs = builder_env.mock_open_store.call_args.kwargs
+    assert open_kwargs["create"] is True
+    assert open_kwargs["embedder"].model_name == settings.EMBEDDING_MODEL
 
     # Check args of last call
-    kwargs = builder_env.mock_coll.add.call_args[1]
+    chunks = builder_env.mock_store.add.call_args.args[0]
 
-    assert len(kwargs["ids"]) == 2
-    assert len(kwargs["documents"]) == 2
-    metas = kwargs["metadatas"]
+    assert len({c.id for c in chunks}) == 2
+    assert len(chunks) == 2
+    assert all(c.document for c in chunks)
+    metas = [c.metadata for c in chunks]
     assert metas[0]["bookmark_id"] == "bm1"
     assert metas[1]["bookmark_id"] == "bm2"
     assert "manual_id" in metas[0]
 
-    # Chunk kind and figure location travel into the Chroma metadata
+    # Chunk kind and figure location travel into the stored metadata
     assert metas[0]["type"] == "text"
     assert "page" not in metas[0]
     assert metas[1]["type"] == "figure"
     assert metas[1]["page"] == 2
 
-    # The image itself stays in SQLite: Chroma only learns the figure id, not
-    # the picture index or the caption/labels/description copies.
+    # The image itself stays in SQLite: the vector store only learns the figure
+    # id, not the picture index or the caption/labels/description copies.
     assert "figure_id" in metas[1]
     for key in ("picture_index", "figure_caption", "figure_labels",
                 "figure_description"):
@@ -308,7 +307,7 @@ def test_builder_smoke(pdf_dir, mock_settings, builder_env):
     assert "figure_id" not in metas[0]
 
     # Embeddings are computed in the main process and passed explicitly
-    assert len(kwargs["embeddings"]) == len(kwargs["ids"])
+    assert all(c.embedding for c in chunks)
 
     # Markdown files keep the nested layout of the source tree
     md_root = mock_settings.MARKDOWN_OUTPUT_DIR
@@ -493,7 +492,7 @@ def test_an_interrupted_build_is_resumed_not_skipped(
     log = tmp_path / "progress.jsonl"
     builder_env.mock_inst.convert.side_effect = RuntimeError("interrupted")
     builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
-    assert builder_env.mock_coll.add.call_count == 0
+    assert builder_env.mock_store.add.call_count == 0
 
     # Rows exist for both files, hashes unchanged, nothing converted.
     session = database.SessionLocal()
@@ -510,7 +509,7 @@ def test_an_interrupted_build_is_resumed_not_skipped(
     run = read_progress(log)
     assert run.summary["skipped"] == 0
     assert run.summary["converted"] == 2
-    assert builder_env.mock_coll.add.call_count == 2
+    assert builder_env.mock_store.add.call_count == 2
 
     session = database.SessionLocal()
     try:
@@ -524,10 +523,10 @@ def test_a_finished_manual_is_still_skipped_on_a_re_run(
 ):
     log = tmp_path / "progress.jsonl"
     builder_env.builder.build(pdf_dir, reset=True, progress_file=log)
-    builder_env.mock_coll.add.reset_mock()
+    builder_env.mock_store.add.reset_mock()
     builder_env.builder.build(pdf_dir, reset=False, progress_file=log)
 
-    assert builder_env.mock_coll.add.call_count == 0
+    assert builder_env.mock_store.add.call_count == 0
     assert read_progress(log).summary["skipped"] == 2
 
 
@@ -562,10 +561,10 @@ def test_a_deferred_document_is_converted_by_a_later_pass(
     # as one pass over all of it.
     log = tmp_path / "progress.jsonl"
     builder_env.builder.build(pdf_dir, reset=True, progress_file=log, min_pages=10)
-    assert builder_env.mock_coll.add.call_count == 0
+    assert builder_env.mock_store.add.call_count == 0
 
     builder_env.builder.build(pdf_dir, reset=False, progress_file=log, max_pages=9)
-    assert builder_env.mock_coll.add.call_count == 2
+    assert builder_env.mock_store.add.call_count == 2
     assert read_progress(log).summary["converted"] == 2
 
 
@@ -630,7 +629,7 @@ def test_a_long_document_is_converted_as_parts_and_ingested_once(
     # ...but each document is levelled, merged and stored exactly once.
     assert len(split_support.concatenated) == 2
     assert split_support.heading_model.return_value.assign_heading_levels.call_count == 2
-    assert builder_env.mock_coll.add.call_count == 2
+    assert builder_env.mock_store.add.call_count == 2
 
     run = read_progress(log)
     assert run.summary["converted"] == 2
@@ -711,7 +710,7 @@ def test_builder_skips_unchanged(pdf_dir, mock_settings, builder_env):
     builder_env.builder.build(pdf_dir, reset=False, save_markdown=False)
 
     assert builder_env.mock_inst.convert.call_count == first_count
-    builder_env.mock_coll.delete.assert_not_called()
+    builder_env.mock_store.delete_manual.assert_not_called()
 
 
 def test_builder_rebuilds_changed_manual(pdf_dir, mock_settings, builder_env):
@@ -727,9 +726,9 @@ def test_builder_rebuilds_changed_manual(pdf_dir, mock_settings, builder_env):
 
     assert builder_env.mock_inst.convert.call_count == 4
 
-    delete_calls = builder_env.mock_coll.delete.call_args_list
+    delete_calls = builder_env.mock_store.delete_manual.call_args_list
     assert len(delete_calls) == 2
-    deleted_ids = {call.kwargs["where"]["manual_id"] for call in delete_calls}
+    deleted_ids = {call.args[0] for call in delete_calls}
     assert set(manual_ids) == deleted_ids
 
 
@@ -823,7 +822,7 @@ def test_builder_continues_after_conversion_failure(
     builder_env.builder.build(pdf_dir, reset=True, save_markdown=False)
 
     assert builder_env.mock_inst.convert.call_count == 2
-    assert builder_env.mock_coll.add.call_count == 1
+    assert builder_env.mock_store.add.call_count == 1
 
 
 def test_chunks_sharing_a_picture_store_one_figure_row(
@@ -861,9 +860,9 @@ def test_chunks_sharing_a_picture_store_one_figure_row(
         session.close()
 
     ids = {
-        meta.get("figure_id")
-        for call in builder_env.mock_coll.add.call_args_list
-        for meta in call.kwargs["metadatas"]
+        chunk.metadata.get("figure_id")
+        for call in builder_env.mock_store.add.call_args_list
+        for chunk in call.args[0]
     }
     assert None not in ids
     # Three chunks of one picture resolve to one figure id per document.

@@ -12,6 +12,10 @@ class Settings(BaseSettings):
 
     PDF_ROOT_DIR: Path = Path("./data/pdfs")
     DB_FILE_PATH: Path = Path("./data/mcp_manual_walker.db")
+    # Which vector backend holds the chunks. Only "chroma" is implemented; the
+    # setting exists because the store is now reached through an interface, and
+    # a second backend is the reason that interface exists.
+    VECTOR_BACKEND: str = "chroma"
     CHROMADB_PATH: Path = Path("./data/db/chroma_db")
     MARKDOWN_OUTPUT_DIR: Path = Path("./data/markdown")
     # Append-only JSONL log of per-file build progress, truncated at the start

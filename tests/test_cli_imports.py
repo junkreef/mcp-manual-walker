@@ -50,8 +50,19 @@ def test_the_builder_is_reachable_when_a_build_actually_runs():
     ).getsource(db_manager.command_build)
 
 
-def test_chroma_is_loaded_on_demand():
+def test_the_vector_backend_is_loaded_on_demand():
+    """Laziness must not mean unreachable.
+
+    The backend module is imported by `vector_store.open_store` when a command
+    actually needs vectors, and it brings its client with it. `watch` and the
+    bare CLI never reach that line, which is what the first test above pins.
+    """
+    assert modules_after("import mcp_manual_walker.chroma_store") == {"chromadb"}
+
+
+def test_opening_a_store_goes_through_the_interface():
+    """db_manager must not reach for a backend's client directly."""
     from mcp_manual_walker import db_manager
 
-    assert db_manager._load_chromadb() is not None
-    assert db_manager.chromadb is not None
+    source = __import__("inspect").getsource(db_manager.get_store)
+    assert "open_store(" in source

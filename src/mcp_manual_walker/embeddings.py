@@ -562,16 +562,13 @@ def collection_metadata(embedder: Embedder) -> dict[str, Any]:
     }
 
 
-def check_collection_model(collection: Any, expected_model: str) -> None:
+def check_embedding_model(stored_model: Optional[str], expected_model: str) -> None:
     """
-    Verifies that a Chroma collection was built with the expected model.
+    Verifies that stored vectors came from the expected model.
 
     Vectors from different models are not comparable, so a mismatch has to stop
     the caller instead of silently returning nonsense results.
     """
-    metadata = getattr(collection, "metadata", None) or {}
-    stored_model = metadata.get(EMBEDDING_MODEL_METADATA_KEY)
-
     if stored_model is None:
         raise RuntimeError(
             "The vector collection does not record an embedding model, so it "
@@ -586,3 +583,9 @@ def check_collection_model(collection: Any, expected_model: str) -> None:
             f"settings.EMBEDDING_MODEL is '{expected_model}'. "
             "Rebuild with `db_manager build --reset`."
         )
+
+
+def check_collection_model(collection: Any, expected_model: str) -> None:
+    """Verifies a Chroma collection object was built with the expected model."""
+    metadata = getattr(collection, "metadata", None) or {}
+    check_embedding_model(metadata.get(EMBEDDING_MODEL_METADATA_KEY), expected_model)

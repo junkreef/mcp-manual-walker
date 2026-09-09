@@ -256,6 +256,7 @@ The pipeline's concurrency and device placement are tuned through environment va
 | `DOCLING_IMAGES_SCALE` | `2.0` | Render scale for the figure crops stored in SQLite (`1.0` = 72 dpi, `2.0` = 144 dpi). Higher means sharper PNGs and a bigger database file. |
 | `EMBEDDING_DEVICE` | `auto` | Device for the SentenceTransformers embedding model (`auto`, `cpu`, `cuda`, `cuda:N`). |
 | `EMBEDDING_DTYPE` | `auto` | Dtype the weights load under. `auto` reads it from the checkpoint (bfloat16); set `float32` on a CPU-only server (see below). |
+| `VECTOR_BACKEND` | `chroma` | Which vector database holds the chunks. Reached through `vector_store.VectorStore`; see [The vector index](#-the-vector-index). |
 
 Chunking builds one markdown serializer per document rather than per table.
 `TableItem.export_to_markdown(doc)` constructs a `MarkdownDocSerializer` on
@@ -490,11 +491,35 @@ row.
 
 ### 🔍 The vector index
 
-Chunks live in one Chroma collection with an HNSW index, and the graph
-parameters are pinned in `collection_metadata()` rather than left to Chroma's
-defaults. The defaults (`max_neighbors` 16, `ef_construction` 100) are sized
-for smaller collections, and at half a million vectors they leave the graph
-fragile enough that the **order the vectors arrive in** decides how good it is.
+Chunks reach the vector database through one interface,
+`vector_store.VectorStore` — eight operations and three filter shapes, which is
+everything the builder, the search server and `db_manager` actually ask of it.
+`VECTOR_BACKEND` chooses the implementation; today the only one is `chroma`.
+
+The interface exists because Chroma's HNSW index is held in an anonymous
+hnswlib arena that has to be resident, and past roughly a million 1024-dim
+chunks that arena stops fitting in RAM. Nothing in the application depended on
+Chroma in particular — it depended on eight calls — so the calls were named and
+the engine put behind them. Two things every backend has to normalise:
+
+*   **Score direction.** Chroma returns a cosine *distance* (smaller is
+    better), most other engines a similarity. `Hit.score` is always a
+    similarity.
+*   **Chunk identity.** The application's ids are strings
+    (`"<manual_id>_<n>"`). Chroma stores them as they are; an engine that
+    accepts only integers or UUIDs has to map them itself and keep the original
+    in its payload, so that the BM25 index in SQLite and the export archive can
+    go on naming chunks the way they already do.
+
+Because the export archive holds nothing engine-specific — one JSON object per
+chunk, with `id`, `embedding`, `metadata` and `document` — it is also the
+migration path between backends: export from one, import into another.
+
+The graph parameters are pinned in `collection_metadata()` rather than left to
+Chroma's defaults. The defaults (`max_neighbors` 16, `ef_construction` 100) are
+sized for smaller collections, and at half a million vectors they leave the
+graph fragile enough that the **order the vectors arrive in** decides how good
+it is.
 
 Measured on this corpus — 504,346 chunks, 50 real questions in Japanese and
 English, recall@5 against an exact full scan:
