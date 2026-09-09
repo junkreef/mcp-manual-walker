@@ -21,6 +21,7 @@ from mcp_manual_walker.db_manager import (
     command_export,
     command_import,
     command_list,
+    command_optimize_lexical,
 )
 from mcp_manual_walker.models import Base, Figure, Manual
 
@@ -638,3 +639,38 @@ def test_a_long_chunk_stream_survives_the_round_trip(
     assert chunks[-1]["id"] == f"c{count - 1}"
     assert chunks[-1]["embedding"] == [float(count - 1), float(count - 1) + 0.5]
     assert chunks[2500]["document"].startswith("document body 2500 ")
+
+
+def _fts_session(mock_session, rows):
+    """Puts a real in-memory FTS index behind the mocked session."""
+    conn = sqlite3.connect(":memory:")
+    lexical.create_table(conn)
+    lexical.add_chunks(conn, rows)
+    lexical.optimize(conn)
+    mock_session.connection.return_value.connection.driver_connection = conn
+    return conn
+
+
+def test_command_optimize_lexical_records_the_total(mock_session):
+    """The merge is a no-op on an index that is already merged, but the chunk
+    count must still be the one the rarity gate will read."""
+    conn = _fts_session(
+        mock_session, [(f"c{i}", "m1", f"alpha beta {i}") for i in range(50)]
+    )
+    conn.execute("DELETE FROM chunks_fts_stats")
+
+    command_optimize_lexical(Namespace())
+
+    assert conn.execute("SELECT total FROM chunks_fts_stats").fetchone()[0] == 50
+    mock_session.commit.assert_called_once()
+
+
+def test_command_optimize_lexical_without_an_index_does_nothing(mock_session):
+    """Databases built before the lexical index existed have no table at all."""
+    mock_session.connection.return_value.connection.driver_connection = (
+        sqlite3.connect(":memory:")
+    )
+
+    command_optimize_lexical(Namespace())
+
+    mock_session.commit.assert_not_called()
