@@ -348,6 +348,14 @@ back leaves it believing the stack is up.
 | `QDRANT_HTTP_PORT` / `QDRANT_GRPC_PORT` | `6333` / `6334` | Host ports for Qdrant, on loopback. |
 | `MMW_UID` / `MMW_GID` | `1000` / `1000` | Who the containers run as, so that what they write into the data directory belongs to you. |
 
+Only the variables the compose file names reach the containers — `.env` is read
+for interpolation, not injected wholesale, which is why `HOST` and `PORT` can
+sit in the same file and mean something else. `EMBEDDING_QUERY_PREFIX` and
+`EMBEDDING_DOCUMENT_PREFIX` are passed as bare keys rather than with a `:-`
+default, so leaving them out of `.env` leaves them unset in the container and
+the model's own stored prompt applies. Anything else you want the container to
+see has to be added to `compose.yaml` the same way.
+
 ## 🛠️ Usage
 
 The server provides a set of tools for AI agents. The typical workflow is as follows:
