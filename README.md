@@ -678,6 +678,73 @@ uv run db_manager build --pdf_dir ./data/pdfs --reset
 | `EMBEDDING_BATCH_SIZE` | `32` | Upper bound on the rows in one encode batch. |
 | `EMBEDDING_TOKEN_BUDGET` | `24576` | Upper bound on the padded tokens in one encode batch (`len(batch) × the longest text in it`). A batch is padded to its longest member, so budgeting rows alone prices every batch at its worst one. `0` falls back to plain row batching — see [Batching the embeddings](#-batching-the-embeddings). |
 
+#### 🌐 Embedding through a remote endpoint
+
+The search server does not have to load the model at all. Set
+`EMBEDDING_BACKEND=openai` and it will embed each query through an
+OpenAI-compatible `/v1/embeddings` endpoint — [Lemonade
+Server](https://lemonade-server.ai/), Ollama, vLLM, llama.cpp's server, or
+anything else that speaks the same shape — instead of holding 1.11–2.22 GiB of
+weights and a torch install in its own process.
+
+This is for the **server**, not the builder. A query is one short text; a build
+is hundreds of thousands of 1.2 kB chunks, and an HTTP round trip per batch is
+not the way to embed those. Leave the builder on `EMBEDDING_BACKEND=local` with
+its GPU.
+
+Measured against a Lemonade Server on the LAN serving
+`Qwen3-Embedding-0.6B-GGUF` (Q8_0, llama.cpp/Vulkan):
+
+| | |
+| --- | --- |
+| One query, warm | **24 ms** (p50) |
+| A whole chunk (~300 tokens) | ~320 ms |
+
+**A quantized GGUF of the same model is vector-compatible with a database built
+from the full-precision checkpoint.** Measured on 64 chunks drawn from a real
+export archive, re-embedded through the endpoint and compared with the vectors
+the builder had stored for the same text:
+
+| | |
+| --- | --- |
+| Cosine similarity vs. the stored vector | **0.9994** mean, 0.9991 worst |
+| Top-5 neighbour agreement | **98.4 %** |
+
+So switching an existing server to the remote backend needs no rebuild. That is
+also why `EMBEDDING_MODEL` — not `EMBEDDING_API_MODEL` — remains the name
+recorded on the collection: the collection identifies a *vector space*, and
+which process produced today's vectors is a deployment detail. The endpoint's
+own id for the model is usually different anyway (`Qwen3-Embedding-0.6B-GGUF`
+against `Qwen/Qwen3-Embedding-0.6B`), and folding it into the recorded identity
+would make the startup check reject a database it can read perfectly well.
+
+One thing the remote backend has to carry itself: **the instruction prefix**.
+With Sentence Transformers the prefixes come from the model's own
+`config_sentence_transformers.json`; an OpenAI-compatible endpoint exposes no
+such thing and embeds exactly the string it is sent. The known prompts for the
+Qwen3-Embedding family are therefore built into `embeddings.py`. For any other
+model, set `EMBEDDING_QUERY_PREFIX` and `EMBEDDING_DOCUMENT_PREFIX` explicitly
+— getting this wrong is silent, since the vectors are still 1024 well-formed
+numbers that simply answer a slightly different question than the stored ones.
+
+```.env
+EMBEDDING_BACKEND=openai
+EMBEDDING_API_BASE=http://192.168.250.1:13305/v1
+EMBEDDING_API_MODEL=Qwen3-Embedding-0.6B-GGUF
+# EMBEDDING_MODEL stays as it is: it names the vector space, not the endpoint.
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
+```
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `EMBEDDING_BACKEND` | `local` | `local` loads the model with Sentence Transformers in-process; `openai` calls a remote OpenAI-compatible endpoint. |
+| `EMBEDDING_API_BASE` | *(empty)* | Base URL of the endpoint, e.g. `http://localhost:11434/v1`. Required when the backend is `openai`. |
+| `EMBEDDING_API_MODEL` | *(uses `EMBEDDING_MODEL`)* | The id the **endpoint** knows the model by. Not recorded on the collection. |
+| `EMBEDDING_API_KEY` | *(empty)* | Sent as `Authorization: Bearer …` when set. |
+| `EMBEDDING_API_BATCH_SIZE` | `16` | Texts per request. |
+| `EMBEDDING_API_TIMEOUT` | `120.0` | HTTP timeout per request, in seconds. |
+| `EMBEDDING_API_MAX_RETRIES` | `3` | Attempts per request, with exponential backoff. |
+
 ## 🗺️ Roadmap
 
 *   [ ] Implement a more sophisticated search functionality.

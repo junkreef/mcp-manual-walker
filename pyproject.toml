@@ -16,6 +16,10 @@ dependencies = [
     "chromadb",
     "sentence-transformers>=5.2.0",
     "rich",
+    # The remote embedding backend talks to an OpenAI-compatible endpoint.
+    # Already present as an mcp/fastmcp dependency, but embeddings imports it
+    # directly.
+    "httpx",
     # Compresses the chunk stream in an export archive. Already present as a
     # chromadb dependency, but db_manager imports it directly.
     "zstandard",

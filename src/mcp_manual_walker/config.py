@@ -83,6 +83,29 @@ class Settings(BaseSettings):
     DOCLING_OCR_LANG: str = "japan"
     # Embedding model (shared by the builder and the search server; must match the DB)
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-0.6B"
+    # Where the vectors are produced.
+    #   "local"  load the model with SentenceTransformers in this process
+    #   "openai" call an OpenAI-compatible /v1/embeddings endpoint
+    # The search server embeds one query per request, which is all a remote
+    # endpoint has to be good at, and in exchange it needs neither torch nor a
+    # resident copy of the model. The builder embeds the whole corpus and wants
+    # the GPU it already has, so it stays on "local".
+    EMBEDDING_BACKEND: str = "local"
+    # Base URL of the OpenAI-compatible API, e.g. "http://localhost:11434/v1"
+    # (Ollama), "http://localhost:8000/v1" (vLLM), or a Lemonade Server.
+    EMBEDDING_API_BASE: str = ""
+    # Sent as "Authorization: Bearer ******" when set.
+    EMBEDDING_API_KEY: str = ""
+    # The id the *endpoint* knows the model by, which is a deployment detail and
+    # is often not EMBEDDING_MODEL: a Lemonade Server serving Qwen3-Embedding-0.6B
+    # as a GGUF calls it "Qwen3-Embedding-0.6B-GGUF". Empty means: use
+    # EMBEDDING_MODEL. EMBEDDING_MODEL remains the name stamped on the vector
+    # collection, because that is what identifies the vector space.
+    EMBEDDING_API_MODEL: str = ""
+    EMBEDDING_API_TIMEOUT: float = 120.0
+    # Texts per request. Kept modest because a request carries whole chunks.
+    EMBEDDING_API_BATCH_SIZE: int = 16
+    EMBEDDING_API_MAX_RETRIES: int = 3
     # "auto" | "cpu" | "cuda" ... for SentenceTransformers
     EMBEDDING_DEVICE: str = "auto"
     # Torch dtype the weights are loaded under. "auto" takes the dtype from the
