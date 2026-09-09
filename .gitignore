@@ -156,8 +156,6 @@ reembed_*.py
 .env.bak*
 .env.*.bak
 
-# The Qdrant proof-of-concept harness and the scratch it produces: a local
-# venv, a corpus cache, the server's storage directory and the measurements.
-poc/
-.venv-poc/
+# Qdrant's storage when it is run straight from `docker run` rather than
+# through compose, as the README's backend section shows.
 qdrant_storage/
