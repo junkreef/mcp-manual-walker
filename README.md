@@ -68,14 +68,19 @@ You need to have Python 3.11+ and `uv` installed.
 
 ## 🐳 Running in containers
 
-`compose.yaml` brings up the search server and the Qdrant it talks to. The
-builder is deliberately not in it: it wants a GPU, Docling's model downloads
-and several gigabytes of VRAM, and it runs once per corpus rather than
-continuously, so it belongs on the machine with the card. Build there and move
-the result with `db_manager export` / `import`, which is backend-neutral.
+`compose.yaml` brings up the search server and the Qdrant it talks to. It is
+not in the repository: it is your copy of `compose.example.yaml`, because
+ports, bind mounts and the user the containers run as are properties of one
+host. Copy it, edit it, and diff it against the original when you want to see
+what you changed. The builder is deliberately not in it: it wants a GPU,
+Docling's model downloads and several gigabytes of VRAM, and it runs once per
+corpus rather than continuously, so it belongs on the machine with the card.
+Build there and move the result with `db_manager export` / `import`, which is
+backend-neutral.
 
 ```sh
 mkdir -p data/qdrant                                  # before the first `up`
+cp compose.example.yaml compose.yaml                  # yours to edit
 cp .env.example .env                                  # set EMBEDDING_API_BASE
 printf 'MMW_UID=%s\nMMW_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 docker compose up -d --build
@@ -85,7 +90,7 @@ docker compose --profile tools run --rm db_manager import --input /app/data/corp
 The server is on `http://127.0.0.1:8000/mcp`.
 
 The first line matters: Docker creates a missing bind-mount source itself, and
-it creates it owned by root. The third is only needed if your account is not
+it creates it owned by root. The fourth is only needed if your account is not
 `1000:1000`, which is the default — see [Where the data lives](#where-the-data-lives).
 
 **The server does not need to be restarted after the corpus arrives.** Starting
@@ -138,7 +143,10 @@ Run one or the other, never both: they publish the same port.
 
 **`./data`, the same place a non-container install puts it.** The whole
 directory is bind-mounted at `/app/data`, so a container database and a local
-one are the same database, and a backup is a copy of a directory.
+one are the same database, and a backup is a copy of a directory. Set
+`MMW_DATA_DIR` to an absolute path when the checkout is not the right home for
+it — a systemd install keeps its data in `/var/lib`. Inside the container the
+path is `/app/data` either way, so nothing else in the configuration changes.
 
 | Path | What |
 | --- | --- |
@@ -167,6 +175,83 @@ other user.
 Qdrant's ports are published on loopback only, because it has no
 authentication unless `QDRANT__SERVICE__API_KEY` is set. Publish it wider only
 once you have set one.
+
+### Running it as a systemd service
+
+`docker compose up -d` already survives a reboot on its own — `restart:
+unless-stopped` sees to that — so a unit file buys something narrower:
+`systemctl stop` as the one way to take the stack down, ordering against other
+units, and the stack in `systemctl status` next to everything else on the
+machine. `deploy/mcp-manual-walker.service.example` is that unit.
+
+An installed copy differs from a checkout in two ways, and both are about who
+owns what. The code lives under `/opt`, where root owns it and nothing writes
+to it. The data does not: it belongs to a service account rather than to a
+login, so it goes to `/var/lib` and `MMW_DATA_DIR` points at it.
+
+```sh
+# A user with no login and no home, whose only job is to own the data.
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin mmw
+
+# The code. Everything the image needs is tracked, so a clone is enough --
+# and it leaves `git pull` as the way to update.
+sudo git clone https://github.com/junkreef/mcp-manual-walker.git \
+    /opt/mcp-manual-walker
+cd /opt/mcp-manual-walker
+
+# The data, created before the first `up`: Docker makes a missing bind-mount
+# source itself, and it makes it owned by root.
+sudo install -d -o mmw -g mmw /var/lib/mcp-manual-walker/qdrant
+
+# The two files that describe this host rather than the project.
+sudo cp compose.example.yaml compose.yaml
+sudo cp .env.example .env
+printf 'MMW_DATA_DIR=/var/lib/mcp-manual-walker\nMMW_UID=%s\nMMW_GID=%s\n' \
+    "$(id -u mmw)" "$(id -g mmw)" | sudo tee -a .env
+sudoedit .env    # set EMBEDDING_API_BASE
+
+# Build now rather than during the first boot: the unit has no timeout, but a
+# machine that takes ten minutes to come up is its own problem.
+sudo docker compose build
+
+sudo install -m 644 deploy/mcp-manual-walker.service.example \
+    /etc/systemd/system/mcp-manual-walker.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now mcp-manual-walker
+```
+
+`--profile local` is a line in the unit rather than a flag you remember:
+change `ExecStart` to `docker compose --profile local up -d --wait` and give
+`ExecStop` and `ExecReload` the same profile, or `down` will leave the
+container it does not know about running.
+
+The unit is `Type=oneshot` with `RemainAfterExit=yes`, because `up -d` exits
+immediately and leaves systemd no process to follow; without it the unit would
+go inactive the moment it succeeded, and `systemctl stop` would never run
+`docker compose down`. `--wait` makes a successful start mean the stack
+answers rather than that it was launched.
+
+Day to day:
+
+```sh
+sudo systemctl status mcp-manual-walker
+sudo systemctl reload mcp-manual-walker   # after editing compose.yaml or .env
+sudo journalctl -u mcp-manual-walker      # the unit's own output; container
+sudo docker compose -f /opt/mcp-manual-walker/compose.yaml logs -f mcp
+```
+
+`db_manager` is unchanged, but it has to run from the install directory and as
+root, because that is where `compose.yaml` and `.env` are:
+
+```sh
+cd /opt/mcp-manual-walker
+sudo docker compose --profile tools run --rm db_manager \
+    import --input /app/data/corpus.zip
+```
+
+Note the argument: the path is the container's, so a file you want imported
+goes into `/var/lib/mcp-manual-walker` on the host and is named `/app/data/...`
+on the command line.
 
 ### Backing it up
 
@@ -202,14 +287,20 @@ It is smaller than the raw directories (the vectors compress) and it can be
 imported into either backend — but it takes minutes rather than seconds, so
 for a same-machine snapshot the tarball is the right tool.
 
+Under systemd, `systemctl stop mcp-manual-walker` and `start` replace the
+`docker compose stop` / `start` above, and the directory to archive is
+`MMW_DATA_DIR` rather than `data/`. Stopping the containers behind the unit's
+back leaves it believing the stack is up.
+
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `EMBEDDING_API_BASE` | *(required)* | The endpoint the default image embeds through. Not needed with `--profile local`. |
+| `MMW_DATA_DIR` | `./data` | The host directory bind-mounted at `/app/data`. An absolute path when the data does not belong beside the checkout. |
 | `MCP_PORT` | `8000` | Host port for the server. |
 | `MCP_BIND` | `127.0.0.1` | Host address to publish it on. |
 | `QDRANT_VERSION` | `v1.19.1` | Qdrant image tag. |
 | `QDRANT_HTTP_PORT` / `QDRANT_GRPC_PORT` | `6333` / `6334` | Host ports for Qdrant, on loopback. |
-| `MMW_UID` / `MMW_GID` | `1000` / `1000` | Who the containers run as, so that what they write under `./data` belongs to you. |
+| `MMW_UID` / `MMW_GID` | `1000` / `1000` | Who the containers run as, so that what they write into the data directory belongs to you. |
 
 ## 🛠️ Usage
 

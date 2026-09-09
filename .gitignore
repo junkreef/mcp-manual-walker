@@ -159,3 +159,13 @@ reembed_*.py
 # Qdrant's storage when it is run straight from `docker run` rather than
 # through compose, as the README's backend section shows.
 qdrant_storage/
+
+# The compose file in use, which is a copy of compose.example.yaml with this
+# host's ports, paths and profiles in it. Same reason .env is ignored: it
+# describes one machine, not the project.
+/compose.yaml
+/compose.yml
+/compose.override.yaml
+/docker-compose.yaml
+/docker-compose.yml
+/docker-compose.override.yaml

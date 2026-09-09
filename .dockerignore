@@ -28,5 +28,6 @@ poc/
 
 tests/
 docs/
+deploy/
 *.md
 !README.md
