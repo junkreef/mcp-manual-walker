@@ -468,9 +468,18 @@ def get_embedder() -> Optional[Embedder]:
 
     Returns None (after logging an actionable error) when the selected backend
     is unusable: sentence-transformers or torch not installed for "local", or a
-    missing/unreachable endpoint for "openai".
+    missing/unreachable endpoint for "openai" (also spelled "remote").
     """
     backend = settings.EMBEDDING_BACKEND.strip().lower()
+
+    # Everything else about this feature is called "remote": the build target
+    # and image tag (server-remote), the compose anchor, the README section,
+    # the log line below. "openai" names the wire protocol rather than the
+    # arrangement, so "remote" is what a reader of any of those reaches for
+    # first -- and it used to land here as an unknown backend, leaving a server
+    # that starts and then cannot search.
+    if backend == "remote":
+        backend = "openai"
 
     if backend == "openai":
         logger.info(
@@ -497,7 +506,7 @@ def get_embedder() -> Optional[Embedder]:
     if backend != "local":
         logger.error(
             f"EMBEDDING_BACKEND is '{settings.EMBEDDING_BACKEND}'; "
-            "expected 'local' or 'openai'."
+            "expected 'local' or 'openai' (or 'remote' for the latter)."
         )
         return None
 
