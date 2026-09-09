@@ -75,13 +75,18 @@ continuously, so it belongs on the machine with the card. Build there and move
 the result with `db_manager export` / `import`, which is backend-neutral.
 
 ```sh
-cp .env.example .env          # set EMBEDDING_API_BASE (see below)
+mkdir -p data/qdrant                                  # before the first `up`
+cp .env.example .env                                  # set EMBEDDING_API_BASE
+printf 'MMW_UID=%s\nMMW_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 docker compose up -d --build
-docker compose --profile tools run --rm db_manager import --input /import/corpus.zip
+docker compose --profile tools run --rm db_manager import --input /app/data/corpus.zip
 ```
 
-The server is on `http://127.0.0.1:8000/mcp`. Files to import come from `./data`
-on the host, mounted read-only at `/import`.
+The server is on `http://127.0.0.1:8000/mcp`.
+
+The first line matters: Docker creates a missing bind-mount source itself, and
+it creates it owned by root. The third is only needed if your account is not
+`1000:1000`, which is the default — see [Where the data lives](#where-the-data-lives).
 
 **The server does not need to be restarted after the corpus arrives.** Starting
 it next to an empty Qdrant is the normal ordering, so it re-attaches on the
@@ -129,18 +134,73 @@ docker compose --profile local up -d --build  # server
 
 Run one or the other, never both: they publish the same port.
 
-### What is where
+### Where the data lives
 
-| | |
+**`./data`, the same place a non-container install puts it.** The whole
+directory is bind-mounted at `/app/data`, so a container database and a local
+one are the same database, and a backup is a copy of a directory.
+
+| Path | What |
 | --- | --- |
-| `mmw_data` (volume) | The SQLite database — manuals, bookmarks, figures, the BM25 index. Half the corpus: a chunk id in Qdrant means nothing without it. |
-| `qdrant_storage` (volume) | The vectors. |
-| `hf_cache` (volume) | The embedding model, for the `local` profile only. |
-| `./data` → `/import:ro` | Read-only, so a bind mount cannot trip over the container's uid. Archives and PDFs are read from here. |
+| `data/mcp_manual_walker.db` | Manuals, bookmarks, figures, the BM25 index, the recorded embedding model. Half the corpus: a chunk id in Qdrant means nothing without it. |
+| `data/qdrant/` | The vectors. |
+| `data/model-cache/` | The embedding model, `--profile local` only. Re-downloadable, so leave it out of backups. |
+| `data/pdfs/`, `data/*.zip` | Sources: what the builder reads and what `import` reads. |
+
+Because those files are yours rather than the container's, **the containers run
+as you**, not as root or as the image's own user. The default is `1000:1000`,
+which is the first login account on most Linux systems. If that is not you:
+
+```sh
+printf 'MMW_UID=%s\nMMW_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+```
+
+`UID` cannot be used directly, incidentally: bash marks it readonly and never
+exports it, so compose would not see it.
+
+Qdrant's own image expects to be root — it writes an init marker and a
+snapshots directory next to its binary rather than into its storage — so the
+compose file redirects both into the volume with `QDRANT_INIT_FILE_PATH` and
+`QDRANT__STORAGE__SNAPSHOTS_PATH`. Without that it panics on startup as any
+other user.
 
 Qdrant's ports are published on loopback only, because it has no
 authentication unless `QDRANT__SERVICE__API_KEY` is set. Publish it wider only
 once you have set one.
+
+### Backing it up
+
+Stop the writers first. Qdrant keeps segment files memory-mapped and SQLite
+keeps a write-ahead log, so a copy taken while either is running can be a
+copy of a half-finished write.
+
+```sh
+docker compose stop
+tar -czf mmw-backup-$(date +%F).tar.gz \
+    --exclude=data/model-cache --exclude='data/*.zip' data/
+docker compose start
+```
+
+To restore, put the directory back and start:
+
+```sh
+docker compose down
+rm -rf data/ && tar -xzf mmw-backup-2026-09-09.tar.gz
+docker compose up -d
+```
+
+An export archive is the other way to move a corpus, and the better one
+between *different* machines or backends, because it carries no engine's
+on-disk format:
+
+```sh
+docker compose --profile tools run --rm db_manager export \
+    --target . --output /app/data/corpus.zip
+```
+
+It is smaller than the raw directories (the vectors compress) and it can be
+imported into either backend — but it takes minutes rather than seconds, so
+for a same-machine snapshot the tarball is the right tool.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
@@ -149,6 +209,7 @@ once you have set one.
 | `MCP_BIND` | `127.0.0.1` | Host address to publish it on. |
 | `QDRANT_VERSION` | `v1.19.1` | Qdrant image tag. |
 | `QDRANT_HTTP_PORT` / `QDRANT_GRPC_PORT` | `6333` / `6334` | Host ports for Qdrant, on loopback. |
+| `MMW_UID` / `MMW_GID` | `1000` / `1000` | Who the containers run as, so that what they write under `./data` belongs to you. |
 
 ## 🛠️ Usage
 
