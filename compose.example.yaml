@@ -53,6 +53,15 @@ x-app-env: &app-env
   # so this is stated once and shared by the server and the tools.
   EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # Passed through from .env only when it is actually set there. A key with no
+  # value means "take it from the environment or don't set it at all", which is
+  # the distinction these two need and ${VAR:-} would destroy: an empty string
+  # is a real answer here -- "prepend nothing" -- while unset means "use the
+  # prompt the model ships with". Writing ${VAR:-} would hand every container
+  # an empty prefix and silently drop Qwen's "Instruct: ..." instruction from
+  # every query, leaving searches to look for the wrong thing.
+  EMBEDDING_QUERY_PREFIX:
+  EMBEDDING_DOCUMENT_PREFIX:
 
 x-remote-embedding: &remote-embedding
   EMBEDDING_BACKEND: openai
