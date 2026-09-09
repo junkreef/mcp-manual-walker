@@ -52,29 +52,36 @@ The server automatically performs the following actions on startup:
 #### 3.2. Tools for AI Agents (APIs)
 
 The agent interacts with the system using stable, unique IDs for manuals and bookmarks. The typical workflow is:
-1. Call `list_manuals()` to see all available manuals and get their `id`s.
+1. Call `list_manuals()` to browse the library folder by folder until the manual it wants appears, and take that manual's `id`.
 2. Call `get_manual_metadata(manual_id)` to get the table of contents for a specific manual, which includes the `id` for each bookmark.
 3. Call `get_markdown_content(bookmark_id)` to retrieve the content of a specific section.
 
 ---
 
-**Tool 1: `list_manuals()`**
+**Tool 1: `list_manuals(folder: str = "")`**
 
-*   **Function**: Returns a list of all available manuals.
-*   **Input**: None
-*   **Output**: A list of objects, where each object contains the manual's unique ID, filename, and document title.
-*   **Example**:
+*   **Function**: Lists what sits directly inside one folder of the manual library, the way `ls` does. Nothing deeper is returned, so a library of several hundred manuals is explored a folder at a time instead of arriving in a single response.
+*   **Input**:
+    *   `folder` (string, optional): The directory to list, relative to the PDF root directory and separated by `/`. Taken from the `path` of a `"directory"` entry of a previous call. Empty lists the root.
+*   **Output**: A flat list of entries. A `"directory"` entry carries the `path` to pass back and the `manual_count` of manuals below it at any depth; a `"manual"` entry carries the `id` the other tools need. Directories come first, then manuals, each in name order. An unknown `folder` is an error.
+*   **Example**: `list_manuals(folder="Db2 for zOS")`
     ```json
     [
       {
-        "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-        "file_name": "manual_v1.2.pdf",
-        "document_title": "Operator's Manual v1.2"
+        "type": "directory",
+        "name": "v13.1",
+        "path": "Db2 for zOS/v13.1",
+        "id": null,
+        "document_title": null,
+        "manual_count": 30
       },
       {
-        "id": "98b6f7a8-3c3e-4b4a-9a8f-9a8b7c6d5e4f",
-        "file_name": "troubleshooting.pdf",
-        "document_title": "Troubleshooting Guide"
+        "type": "manual",
+        "name": "manual_v1.2.pdf",
+        "path": "Db2 for zOS/manual_v1.2.pdf",
+        "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "document_title": "Operator's Manual v1.2",
+        "manual_count": null
       }
     ]
     ```
