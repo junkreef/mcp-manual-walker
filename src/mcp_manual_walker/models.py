@@ -74,6 +74,33 @@ class Bookmark(Base):
     )
 
 
+class VectorStoreMeta(Base):
+    """Facts about the vector store that the vector store cannot hold itself.
+
+    Chroma records the embedding model in its collection metadata, which is
+    what the server checks before serving: vectors from two models are not
+    comparable, and a mismatch has to stop the caller rather than quietly
+    return nonsense. Qdrant has no equivalent -- a collection carries its
+    vector parameters and nothing else -- so for backends like it the name is
+    kept here instead, beside the manuals whose chunks those vectors are.
+
+    The cost of that choice is that the relational database and the vector
+    database now have to belong to each other. They already did in practice:
+    a chunk id means nothing without the bookmarks table, and a figure id
+    means nothing without the figures table.
+    """
+
+    __tablename__ = "vector_store_meta"
+
+    key: Mapped[str] = Column(String, primary_key=True)
+    value: Mapped[Optional[str]] = Column(Text, nullable=True)
+    updated_at: Mapped[datetime] = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
 class Figure(Base):
     """A picture detected by Docling, stored as a PNG blob.
 

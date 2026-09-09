@@ -12,11 +12,43 @@ class Settings(BaseSettings):
 
     PDF_ROOT_DIR: Path = Path("./data/pdfs")
     DB_FILE_PATH: Path = Path("./data/mcp_manual_walker.db")
-    # Which vector backend holds the chunks. Only "chroma" is implemented; the
-    # setting exists because the store is now reached through an interface, and
-    # a second backend is the reason that interface exists.
+    # Which vector backend holds the chunks: "chroma" or "qdrant".
+    #
+    # Chroma is embedded and needs no server, which is right up to the point
+    # where its hnswlib arena stops fitting in RAM -- roughly a million
+    # 1024-dimensional chunks. Qdrant memory-maps the same data and needs a
+    # server process. Measured on 684,398 chunks: Chroma about 2.9 GB the
+    # process must have, Qdrant about 350 MB it must have plus 2.7 GB the
+    # kernel may reclaim, still answering in 2.6 ms under a 512 MB cap.
     VECTOR_BACKEND: str = "chroma"
     CHROMADB_PATH: Path = Path("./data/db/chroma_db")
+
+    # Qdrant. Only consulted when VECTOR_BACKEND is "qdrant".
+    QDRANT_URL: str = "http://localhost:6333"
+    QDRANT_API_KEY: str = ""
+    QDRANT_GRPC_PORT: int = 6334
+    # gRPC rather than HTTP: a build uploads hundreds of thousands of 4 kB
+    # vectors, and JSON-encoding them is the expensive part.
+    QDRANT_PREFER_GRPC: bool = True
+    QDRANT_COLLECTION: str = "manual_chunks"
+    QDRANT_TIMEOUT: float = 60.0
+    # Candidates held during a graph traversal. Higher means better recall and
+    # a slower query; 128 measured 96.2% recall@5 against an exact scan of the
+    # same collection, corpus-wide.
+    QDRANT_HNSW_EF: int = 128
+    # The three memory knobs, all off because on this corpus all three made
+    # matters worse. Qdrant already memory-maps vectors it calls "in RAM", so
+    # moving them "to disk" buys nothing, and int8 with always_ram *adds* about
+    # 700 MB of unreclaimable memory while taking filtered search from 2.6 ms
+    # to 20.4 ms. They are here because a corpus several times this one may
+    # answer differently.
+    QDRANT_ON_DISK_VECTORS: bool = False
+    QDRANT_ON_DISK_PAYLOAD: bool = False
+    # "none" | "int8" | "binary"
+    QDRANT_QUANTIZATION: str = "none"
+    # Shortlist multiplier used to rescore a quantized search. Ignored when
+    # QDRANT_QUANTIZATION is "none".
+    QDRANT_OVERSAMPLING: float = 2.0
     MARKDOWN_OUTPUT_DIR: Path = Path("./data/markdown")
     # Append-only JSONL log of per-file build progress, truncated at the start
     # of every build and read by `db_manager watch`. Purely observational: the
