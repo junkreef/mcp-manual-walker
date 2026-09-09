@@ -1,0 +1,51 @@
+# The compose stack as a system service. Copy it into place and edit it there,
+# the same way compose.yaml is a copy of compose.example.yaml:
+#
+#     sudo install -m 644 deploy/mcp-manual-walker.service.example \
+#         /etc/systemd/system/mcp-manual-walker.service
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now mcp-manual-walker
+#
+# See the README's "Running it as a systemd service" for the rest: the mmw
+# user, the data directory, and building the images before the first start.
+
+[Unit]
+Description=MCP Manual Walker
+Documentation=https://github.com/junkreef/mcp-manual-walker
+# The containers cannot be started before the daemon that holds them, and
+# pulling the Qdrant image on a first start needs a route out.
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+# `up -d` returns as soon as the containers are started, so there is no process
+# for systemd to follow. RemainAfterExit is what makes the unit count as active
+# afterwards, and therefore what makes `systemctl stop` run ExecStop at all.
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/mcp-manual-walker
+
+# --wait holds until Qdrant is healthy and the server is up, so a unit that
+# reports "started" has a stack that answers, and anything ordered After= this
+# one is not lied to. It also turns a container that dies immediately into a
+# failed start rather than a silent one.
+ExecStart=/usr/bin/docker compose up -d --wait
+ExecStop=/usr/bin/docker compose down
+# Picks up an edited compose.yaml or .env: recreating only what changed is what
+# `up` already does, so a reload is a start against a running stack.
+ExecReload=/usr/bin/docker compose up -d --wait
+
+# Restarting is Docker's job here, not systemd's: `restart: unless-stopped` in
+# compose.yaml already brings a crashed container back, and it keeps the
+# distinction between a container that fell over and an operator who ran
+# `docker compose stop`, which systemd cannot see. Restart= would fight it.
+Restart=no
+
+# Pulling and starting can outrun the default 90 seconds on a first boot, and a
+# oneshot that is killed halfway leaves the stack half-created.
+TimeoutStartSec=0
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
