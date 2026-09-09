@@ -17,9 +17,9 @@ from .embeddings import check_embedding_model, get_embedder
 from .models import Bookmark, Figure, Manual
 from .schemas import (
     BookmarkNode,
+    DirectoryEntry,
     FigureInfo,
     FigureRef,
-    ManualInfo,
     ManualMetadata,
     MarkdownContent,
     SearchResult,
@@ -131,39 +131,109 @@ async def lifespan(app: FastMCP):
 app = FastMCP(lifespan=lifespan)
 
 
+def _normalize_folder(folder: str | None) -> str:
+    """Turns a caller-supplied folder into a path prefix: `''` or `'a/b/'`.
+
+    The trailing slash is what keeps the prefix match on a folder boundary, so
+    that listing `zOS` cannot pick up a sibling folder named `zOS-legacy`.
+    """
+    if not folder:
+        return ""
+    cleaned = folder.replace("\\", "/").strip().strip("/")
+    if not cleaned or cleaned == ".":
+        return ""
+    return f"{cleaned}/"
+
+
 @app.tool(
     name="list_manuals",
-    description="""Provides a comprehensive list of all available manuals. This tool is
-    the primary entry point for discovering content. It returns a list of all manuals
-    found in the system, each with a unique ID that is required by other tools
-    like `get_manual_metadata`.
+    description="""Browses the manual library one folder at a time, the way `ls` does.
+    This tool is the primary entry point for discovering content. Called without
+    arguments it returns the entries at the root of the library; called with the
+    `folder` of a directory it returns what sits directly inside that directory.
+    Nothing deeper is returned, so a large library can be explored without pulling
+    hundreds of entries into the context at once.
+
+    Every entry has a `type`:
+    * `"directory"` — a folder. Pass its `path` back as `folder` to look inside.
+      Its `manual_count` tells how many manuals it holds at any depth.
+    * `"manual"` — a PDF. Its `id` is the `manual_id` the other tools need.
 
     Workflow Example:
-    1. Call `list_manuals()` to get a list of all available manuals.
-    2. Identify the manual you are interested in from the list.
-    3. Use the `id` of that manual to call `get_manual_metadata()` to retrieve its
-       table of contents and other details.""",
+    1. Call `list_manuals()` to see the top-level folders and manuals.
+    2. Call `list_manuals(folder="Db2 for zOS")` to descend, repeating until the
+       entries of type `"manual"` appear.
+    3. Use the `id` of the manual you want to call `get_manual_metadata()` and
+       retrieve its table of contents.""",
     tags={"manual", "discovery"},
     annotations={"readOnlyHint": True},
 )
-def list_manuals() -> List[ManualInfo]:
-    """Returns a list of all available manuals."""
+def list_manuals(
+    folder: Annotated[
+        str,
+        Field(
+            description="""The directory to list, relative to the library root and
+            separated by `/` (for example `Db2 for zOS/v13.1`). Obtained from the
+            `path` of a `"directory"` entry of a previous call. Leave it empty to
+            list the root of the library."""
+        ),
+    ] = "",
+) -> List[DirectoryEntry]:
+    """Returns the manuals and subfolders directly inside the given folder."""
+    prefix = _normalize_folder(folder)
     db: Session = SessionLocal()
     try:
-        manuals = db.query(Manual).order_by(Manual.file_name).all()
-        return [
-            ManualInfo(
-                id=m.id,
-                file_name=m.file_name,
-                document_title=m.document_title,
-            )
-            for m in manuals
-        ]
+        manuals = db.query(Manual).order_by(Manual.relative_path).all()
+
+        # Manual counts per immediate subdirectory, keyed by its name.
+        subdirectories: dict[str, int] = {}
+        files: list[DirectoryEntry] = []
+        matched = False
+
+        for m in manuals:
+            # Paths written on Windows carry backslashes; the tool speaks `/`.
+            relative_path = m.relative_path.replace("\\", "/")
+            if prefix and not relative_path.startswith(prefix):
+                continue
+            matched = True
+
+            remainder = relative_path[len(prefix) :]
+            head, separator, _ = remainder.partition("/")
+            if separator:
+                subdirectories[head] = subdirectories.get(head, 0) + 1
+            else:
+                files.append(
+                    DirectoryEntry(
+                        type="manual",
+                        name=m.file_name,
+                        path=relative_path,
+                        id=m.id,
+                        document_title=m.document_title,
+                    )
+                )
     except Exception as e:
-        logger.error(f"Error fetching list of manuals: {e}")
+        logger.error(f"Error listing folder '{folder}': {e}")
         raise ToolError(e)
     finally:
         db.close()
+
+    if prefix and not matched:
+        raise ToolError(
+            f"No folder named '{folder}' exists in the manual library. "
+            "Call `list_manuals()` without arguments to list the root, then "
+            "follow the `path` of the directory entries."
+        )
+
+    directories = [
+        DirectoryEntry(
+            type="directory",
+            name=name,
+            path=f"{prefix}{name}",
+            manual_count=count,
+        )
+        for name, count in sorted(subdirectories.items())
+    ]
+    return directories + sorted(files, key=lambda entry: entry.name)
 
 
 def _build_toc(bookmarks: list[Bookmark]) -> list[BookmarkNode]:

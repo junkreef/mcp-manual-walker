@@ -17,7 +17,7 @@ from mcp_manual_walker.embeddings import COLLECTION_NAME
 from mcp_manual_walker.main import app
 from mcp_manual_walker.models import Bookmark, Figure, Manual
 from mcp_manual_walker.schemas import (
-    ManualInfo,
+    DirectoryEntry,
     ManualMetadata,
     MarkdownContent,
     SearchResult,
@@ -285,7 +285,9 @@ async def test_e2e_workflow(test_client: Client):
     # 1. List manuals
     result = await test_client.call_tool("list_manuals")
     assert result.structured_content is not None
-    manuals = [ManualInfo(**manual) for manual in result.structured_content["result"]]
+    manuals = [
+        DirectoryEntry(**entry) for entry in result.structured_content["result"]
+    ]
     assert len(manuals) == 1
     manual = manuals[0]
     manual_id = manual.id
@@ -310,13 +312,98 @@ async def test_e2e_workflow(test_client: Client):
     assert "Content for page 2" in content_response.markdown_content
 
 
+def _add_manual(relative_path: str) -> None:
+    """Registers a manual row at `relative_path`, without any content."""
+    db = database.SessionLocal()
+    try:
+        db.add(
+            Manual(
+                id=str(uuid.uuid4()),
+                file_name=relative_path.rsplit("/", 1)[-1],
+                document_title=None,
+                relative_path=relative_path,
+                file_hash=hashlib.blake2b(
+                    relative_path.encode(), digest_size=8
+                ).hexdigest(),
+                page_count=1,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _list(client: Client, folder: str | None = None) -> list[DirectoryEntry]:
+    """Calls `list_manuals` and parses its entries."""
+    arguments = {} if folder is None else {"folder": folder}
+    result = await client.call_tool("list_manuals", arguments)
+    assert result.structured_content is not None
+    return [DirectoryEntry(**entry) for entry in result.structured_content["result"]]
+
+
+@pytest.mark.asyncio
+async def test_list_manuals_browses_one_folder_at_a_time(test_client: Client):
+    """`list_manuals` returns the immediate children of a folder, nothing deeper."""
+    _add_manual("zOS/V3R2/first.pdf")
+    _add_manual("zOS/V3R2/second.pdf")
+    _add_manual("zOS/V4R1/third.pdf")
+    _add_manual("Db2 for zOS/v13.1/fourth.pdf")
+
+    # The root lists the top-level folders plus the manual sitting next to them,
+    # and each folder reports how many manuals it holds at any depth.
+    root = await _list(test_client)
+    assert [(e.type, e.name) for e in root] == [
+        ("directory", "Db2 for zOS"),
+        ("directory", "zOS"),
+        ("manual", "dummy_manual.pdf"),
+    ]
+    assert {e.name: e.manual_count for e in root if e.type == "directory"} == {
+        "Db2 for zOS": 1,
+        "zOS": 3,
+    }
+    dummy = next(e for e in root if e.type == "manual")
+    assert dummy.id == _test_state["manual_id"]
+    assert dummy.path == "dummy_manual.pdf"
+    assert dummy.manual_count is None
+
+    # An intermediate folder exposes only its own subfolders.
+    level_one = await _list(test_client, "zOS")
+    assert [(e.type, e.path, e.manual_count) for e in level_one] == [
+        ("directory", "zOS/V3R2", 2),
+        ("directory", "zOS/V4R1", 1),
+    ]
+
+    # The leaf folder yields the manuals themselves, each with a usable id.
+    leaf = await _list(test_client, "zOS/V3R2")
+    assert [e.name for e in leaf] == ["first.pdf", "second.pdf"]
+    assert all(e.type == "manual" and e.id for e in leaf)
+    assert [e.path for e in leaf] == ["zOS/V3R2/first.pdf", "zOS/V3R2/second.pdf"]
+
+    # Surrounding slashes are a matter of taste, not of meaning.
+    assert await _list(test_client, "/zOS/V3R2/") == leaf
+    assert await _list(test_client, "") == root
+
+
+@pytest.mark.asyncio
+async def test_list_manuals_rejects_an_unknown_folder(test_client: Client):
+    """A folder that matches nothing is a mistake worth reporting."""
+    _add_manual("zOS/V3R2/first.pdf")
+
+    # A prefix must match on a folder boundary: 'zO' is not the folder 'zOS'.
+    with pytest.raises(ToolError) as excinfo:
+        await _list(test_client, "zO")
+    assert "zO" in str(excinfo.value)
+
+
 @pytest.mark.asyncio
 async def test_content_retrieval(test_client: Client):
     """
     Tests that get_markdown_content returns full content for a section (and subtree).
     """
     result = await test_client.call_tool("list_manuals")
-    manuals = [ManualInfo(**manual) for manual in result.structured_content["result"]]
+    manuals = [
+        DirectoryEntry(**entry) for entry in result.structured_content["result"]
+    ]
     manual_id = manuals[0].id
     result = await test_client.call_tool(
         "get_manual_metadata", {"manual_id": manual_id}
@@ -345,7 +432,7 @@ async def test_search_manual(test_client: Client):
     Tests the search_manual tool using vector search.
     """
     result = await test_client.call_tool("list_manuals")
-    manual_id = ManualInfo(**result.structured_content["result"][0]).id
+    manual_id = DirectoryEntry(**result.structured_content["result"][0]).id
 
     # Search for something unique to page 2
     query = "Content for page 2"
@@ -374,7 +461,7 @@ async def test_search_manual_with_bookmark_filter(test_client: Client):
     Tests the search_manual tool with hierarchical bookmark filtering.
     """
     result = await test_client.call_tool("list_manuals")
-    manual_id = ManualInfo(**result.structured_content["result"][0]).id
+    manual_id = DirectoryEntry(**result.structured_content["result"][0]).id
     result = await test_client.call_tool(
         "get_manual_metadata", {"manual_id": manual_id}
     )
@@ -425,7 +512,7 @@ async def test_search_manual_rejects_other_embedding_model(
 ):
     """A collection built by another model must not be queried silently."""
     result = await mismatched_model_client.call_tool("list_manuals")
-    manual_id = ManualInfo(**result.structured_content["result"][0]).id
+    manual_id = DirectoryEntry(**result.structured_content["result"][0]).id
 
     with pytest.raises(ToolError) as excinfo:
         await mismatched_model_client.call_tool(

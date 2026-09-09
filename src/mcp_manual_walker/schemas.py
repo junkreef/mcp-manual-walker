@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -8,6 +8,50 @@ class ManualInfo(BaseModel):
     file_name: str = Field(..., description="The filename of the manual PDF.")
     document_title: Optional[str] = Field(
         None, description="The title of the document as extracted from PDF metadata."
+    )
+
+
+class DirectoryEntry(BaseModel):
+    """One item sitting directly inside a folder of the manual library."""
+
+    type: Literal["directory", "manual"] = Field(
+        ...,
+        description=(
+            'Either "directory", a folder to descend into with another '
+            '`list_manuals` call, or "manual", a PDF that can be opened with '
+            "`get_manual_metadata`."
+        ),
+    )
+    name: str = Field(..., description="The folder name or the PDF filename.")
+    path: str = Field(
+        ...,
+        description=(
+            "The path of this entry relative to the library root, with `/` as "
+            "the separator. Pass a directory's path back to `list_manuals` to "
+            "see what is inside it."
+        ),
+    )
+    id: Optional[str] = Field(
+        None,
+        description=(
+            "The unique identifier of the manual, required by the other tools. "
+            "Null for directories."
+        ),
+    )
+    document_title: Optional[str] = Field(
+        None,
+        description=(
+            "The title of the document as extracted from PDF metadata. "
+            "Null for directories."
+        ),
+    )
+    manual_count: Optional[int] = Field(
+        None,
+        description=(
+            "How many manuals live under this directory, at any depth, so the "
+            "size of a branch is known before descending into it. "
+            "Null for manuals."
+        ),
     )
 
 
