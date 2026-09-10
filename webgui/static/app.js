@@ -82,7 +82,7 @@ async function runSearch(event) {
   $("results").replaceChildren();
 
   const payload = { query, limit: Number($("limit").value) };
-  if (scope?.type === "manual") payload.manual_id = scope.id;
+  if (scope?.type === "manual") payload.manual_path = scope.path;
   if (scope?.type === "bookmark") payload.bookmark_id = scope.id;
 
   try {
@@ -196,8 +196,8 @@ function renderHit(hit) {
     button("Search in this manual", () => {
       setScope({
         type: "manual",
-        id: hit.manual_id,
-        label: hit.manual?.file_name ?? hit.manual_id,
+        path: hit.manual_path,
+        label: hit.manual?.file_name ?? hit.manual_path,
       });
       runSearch();
     })
@@ -268,7 +268,7 @@ async function showFolder(folder) {
           button(
             `📄 ${entry.document_title || entry.name}`,
             () => {
-              setScope({ type: "manual", id: entry.id, label: entry.name });
+              setScope({ type: "manual", path: entry.path, label: entry.name });
               $("browser").hidden = true;
             },
             "entry"

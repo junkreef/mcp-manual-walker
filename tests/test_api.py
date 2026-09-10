@@ -167,6 +167,7 @@ def _build_test_environment(tmp_path, monkeypatch, dummy_pdf_factory, stored_mod
         db.commit()
 
         _test_state["manual_id"] = manual.id
+        _test_state["manual_path"] = manual.relative_path.replace("\\", "/")
         _test_state["figure_id"] = figure.id
         _test_state["figure_png"] = png_bytes
         _test_state["figure_bookmark_id"] = section1_1.id
@@ -312,6 +313,13 @@ async def test_e2e_workflow(test_client: Client):
     assert "Content for page 2" in content_response.markdown_content
 
 
+def test_manual_entry_path_documents_its_search_input_mapping():
+    description = DirectoryEntry.model_fields["path"].description
+    assert description is not None
+    assert "search_manual.manual_path" in description
+    assert "document_title" in description
+
+
 def _add_manual(relative_path: str) -> None:
     """Registers a manual row at `relative_path`, without any content."""
     db = database.SessionLocal()
@@ -385,6 +393,25 @@ async def test_list_manuals_browses_one_folder_at_a_time(test_client: Client):
 
 
 @pytest.mark.asyncio
+async def test_manual_path_patterns_resolve_listed_paths(test_client: Client):
+    _add_manual("zOS/V3R1/first.pdf")
+    _add_manual("zOS/V3R1/nested/second.pdf")
+    _add_manual("zOS/V3R2/third.pdf")
+
+    db = database.SessionLocal()
+    try:
+        exact = service.resolve_manual_path("zOS/V3R1/first.pdf", db)
+        wildcard = service.resolve_manual_path("zOS/V3R1/*", db)
+        all_manuals = service.resolve_manual_path("*", db)
+    finally:
+        db.close()
+
+    assert exact is not None and len(exact) == 1
+    assert wildcard is not None and len(wildcard) == 2
+    assert all_manuals is None
+
+
+@pytest.mark.asyncio
 async def test_list_manuals_rejects_an_unknown_folder(test_client: Client):
     """A folder that matches nothing is a mistake worth reporting."""
     _add_manual("zOS/V3R2/first.pdf")
@@ -432,12 +459,13 @@ async def test_search_manual(test_client: Client):
     Tests the search_manual tool using vector search.
     """
     result = await test_client.call_tool("list_manuals")
-    manual_id = DirectoryEntry(**result.structured_content["result"][0]).id
+    manual = DirectoryEntry(**result.structured_content["result"][0])
 
-    # Search for something unique to page 2
+    # Search for something unique to page 2. A manual entry's path is the
+    # exact value the search tool accepts; its title is display metadata only.
     query = "Content for page 2"
     result = await test_client.call_tool(
-        "search_manual", {"manual_id": manual_id, "query": query}
+        "search_manual", {"manual_path": manual.path, "query": query}
     )
     search_result = SearchResult.model_validate(result.structured_content)
 
@@ -446,7 +474,9 @@ async def test_search_manual(test_client: Client):
         (m for m in search_result.results if "Content for page 2" in m.context), None
     )
     assert match is not None
-    assert match.manual_id == manual_id
+    assert search_result.manual_path == manual.path
+    assert match.manual_id == manual.id
+    assert match.manual_path == manual.path
 
     # Verify hierarchy for Page 2 (Section 1.1 -> Chapter 1)
     assert len(match.bookmarks) >= 2
@@ -461,9 +491,9 @@ async def test_search_manual_with_bookmark_filter(test_client: Client):
     Tests the search_manual tool with hierarchical bookmark filtering.
     """
     result = await test_client.call_tool("list_manuals")
-    manual_id = DirectoryEntry(**result.structured_content["result"][0]).id
+    manual = DirectoryEntry(**result.structured_content["result"][0])
     result = await test_client.call_tool(
-        "get_manual_metadata", {"manual_id": manual_id}
+        "get_manual_metadata", {"manual_id": manual.id}
     )
     toc = ManualMetadata.model_validate(result.structured_content).table_of_contents
 
@@ -477,7 +507,7 @@ async def test_search_manual_with_bookmark_filter(test_client: Client):
 
     result = await test_client.call_tool(
         "search_manual",
-        {"manual_id": manual_id, "query": query, "bookmark_id": chapter1.id},
+        {"manual_path": manual.path, "query": query, "bookmark_id": chapter1.id},
     )
     res = SearchResult.model_validate(result.structured_content)
     assert any("Content for page 10" in m.context for m in res.results)
@@ -485,7 +515,7 @@ async def test_search_manual_with_bookmark_filter(test_client: Client):
     # Filter by Section 1.1 (Direct) -> Should match
     result = await test_client.call_tool(
         "search_manual",
-        {"manual_id": manual_id, "query": query, "bookmark_id": section1_1.id},
+        {"manual_path": manual.path, "query": query, "bookmark_id": section1_1.id},
     )
     res = SearchResult.model_validate(result.structured_content)
     assert any("Content for page 10" in m.context for m in res.results)
@@ -496,7 +526,11 @@ async def test_search_manual_with_bookmark_filter(test_client: Client):
 
     result = await test_client.call_tool(
         "search_manual",
-        {"manual_id": manual_id, "query": query_p1, "bookmark_id": section1_1.id},
+        {
+            "manual_path": manual.path,
+            "query": query_p1,
+            "bookmark_id": section1_1.id,
+        },
     )
     res = SearchResult.model_validate(result.structured_content)
     # Should be empty or at least not contain page 1
@@ -512,11 +546,12 @@ async def test_search_manual_rejects_other_embedding_model(
 ):
     """A collection built by another model must not be queried silently."""
     result = await mismatched_model_client.call_tool("list_manuals")
-    manual_id = DirectoryEntry(**result.structured_content["result"][0]).id
+    manual_path = DirectoryEntry(**result.structured_content["result"][0]).path
 
     with pytest.raises(ToolError) as excinfo:
         await mismatched_model_client.call_tool(
-            "search_manual", {"manual_id": manual_id, "query": "Content for page 2"}
+            "search_manual",
+            {"manual_path": manual_path, "query": "Content for page 2"},
         )
 
     message = str(excinfo.value)
@@ -527,11 +562,11 @@ async def test_search_manual_rejects_other_embedding_model(
 @pytest.mark.asyncio
 async def test_search_manual_returns_figure_hits(test_client: Client):
     """A figure chunk is reported as such and carries its figure reference."""
-    manual_id = _test_state["manual_id"]
+    manual_path = _test_state["manual_path"]
 
     result = await test_client.call_tool(
         "search_manual",
-        {"manual_id": manual_id, "query": "wiring diagram of the pump"},
+        {"manual_path": manual_path, "query": "wiring diagram of the pump"},
     )
     search_result = SearchResult.model_validate(result.structured_content)
 
@@ -546,7 +581,8 @@ async def test_search_manual_returns_figure_hits(test_client: Client):
 
     # Ordinary page chunks stay plain text without a figure reference.
     result = await test_client.call_tool(
-        "search_manual", {"manual_id": manual_id, "query": "Content for page 2"}
+        "search_manual",
+        {"manual_path": manual_path, "query": "Content for page 2"},
     )
     search_result = SearchResult.model_validate(result.structured_content)
     text_hit = next(

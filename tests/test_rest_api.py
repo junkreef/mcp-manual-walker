@@ -47,14 +47,14 @@ def test_health_reports_what_the_server_is_holding(api):
     assert body["chunks"] == 31
 
 
-def test_a_search_needs_no_manual_id(api):
+def test_a_search_defaults_to_the_whole_corpus(api):
     """The whole reason this API exists: a question, and nothing else."""
     response = api.post("/search", json={"query": "unique text for search"})
     assert response.status_code == 200
 
     body = response.json()
     assert body["count"] > 0
-    assert body["manual_id"] is None
+    assert body["manual_path"] == "*"
 
     first = body["results"][0]
     assert first["rank"] == 1
@@ -64,6 +64,7 @@ def test_a_search_needs_no_manual_id(api):
     # A corpus-wide hit has to say which manual it came from.
     assert first["manual"]["file_name"] == "dummy_manual.pdf"
     assert first["manual_id"] == _test_state["manual_id"]
+    assert first["manual_path"] == _test_state["manual_path"]
 
 
 def test_the_same_search_can_be_run_as_a_get(api):
@@ -75,18 +76,38 @@ def test_the_same_search_can_be_run_as_a_get(api):
     assert "Content for page 20" in body["results"][0]["context"]
 
 
-def test_a_search_can_be_narrowed_to_a_manual(api):
+def test_a_search_can_use_a_path_returned_by_the_manuals_endpoint(api):
+    entry = api.get("/manuals").json()[0]
     body = api.post(
         "/search",
-        json={"query": "unique text", "manual_id": _test_state["manual_id"]},
+        json={"query": "unique text", "manual_path": entry["path"]},
     ).json()
 
-    assert body["manual_id"] == _test_state["manual_id"]
-    assert all(hit["manual_id"] == _test_state["manual_id"] for hit in body["results"])
+    assert body["manual_path"] == entry["path"]
+    assert all(hit["manual_path"] == entry["path"] for hit in body["results"])
 
 
-def test_a_bookmark_is_enough_to_narrow_a_search_to_a_section(api):
-    """The bookmark names its manual, so the caller does not have to."""
+def test_a_search_accepts_a_wildcard_path(api):
+    body = api.post(
+        "/search",
+        json={"query": "unique text", "manual_path": "dummy*"},
+    ).json()
+
+    assert body["count"] > 0
+    assert body["manual_path"] == "dummy*"
+
+
+def test_a_search_rejects_a_path_that_matches_no_manual(api):
+    response = api.post(
+        "/search",
+        json={"query": "unique text", "manual_path": "missing/*"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_a_bookmark_can_narrow_a_corpus_search_to_a_section(api):
+    """The default path range contains the bookmark's manual."""
     bookmark_id = _test_state["figure_bookmark_id"]
     body = api.post(
         "/search", json={"query": "unique text", "bookmark_id": bookmark_id}

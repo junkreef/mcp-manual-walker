@@ -364,7 +364,7 @@ see has to be added to `compose.yaml` the same way.
 
 The server provides a set of tools for AI agents. The typical workflow is as follows:
 
-1.  Call `list_manuals()` to browse the library. It answers with the entries of one folder at a time, so descend with `list_manuals(folder)` until the manuals themselves appear, each with its unique ID.
+1.  Call `list_manuals()` to browse the library. It answers with the entries of one folder at a time, so descend with `list_manuals(folder)` until the manuals themselves appear. A manual entry's `path` is the exact value accepted by `search_manual.manual_path`; `document_title` is display metadata and is not used as a search path. Its `id` is used by the metadata tools.
 2.  Use `get_manual_metadata(manual_id)` to retrieve the hierarchical table of contents (bookmarks) for a specific manual.
 3.  Finally, call `get_markdown_content(bookmark_id)` to get the token-efficient Markdown content for the desired section.
 4.  When a section or a search hit points at a figure, call `get_figure(figure_id)` to look at the picture itself.
@@ -375,10 +375,10 @@ This process allows an agent to intelligently navigate large documents and only 
 
 | Tool | Input | Output |
 | --- | --- | --- |
-| `list_manuals` | optional `folder` | The entries directly inside that folder (the library root when omitted). Each is either a `"directory"`, with the `path` to pass back and the `manual_count` it holds at any depth, or a `"manual"`, with the `id` the other tools need. |
+| `list_manuals` | optional `folder` | The entries directly inside that folder (the library root when omitted). A directory's `path` goes back to `list_manuals.folder`; a manual's `path` goes unchanged to `search_manual.manual_path`. |
 | `get_manual_metadata` | `manual_id` | The manual's metadata and its hierarchical `table_of_contents`; each bookmark carries the `id` the content tools need. |
 | `get_markdown_content` | `bookmark_id` | The Markdown of that section and its subsections, plus the `figures` it contains. |
-| `search_manual` | `manual_id`, `query`, optional `bookmark_id` | The top matching chunks with their bookmark path, `chunk_type` and, for figures, a `figure` reference. |
+| `search_manual` | `query`, optional `manual_path`, optional `bookmark_id` | Searches the exact `list_manuals.path`, a wildcard such as `zOS/V3R1/*`, or the whole corpus with `*` (the default). |
 | `get_figure` | `figure_id` | The figure's PNG image plus a JSON block of its metadata. |
 
 ### Figures in the tool responses
@@ -431,7 +431,7 @@ curl -s 'localhost:8001/search?q=IEF450I&limit=3'
 | Endpoint | Answers with |
 | --- | --- |
 | `GET /health` | Whether a search can be answered, the backend and model in use, and how many manuals and chunks are held. Never requires the API key. |
-| `POST /search` | The best matching chunks for `query`, with `manual_id`, `bookmark_id` and `limit` all optional. |
+| `POST /search` | The best matching chunks for `query`; `manual_path` defaults to `*`, and `bookmark_id` and `limit` are optional. |
 | `GET /search?q=…` | The same search from query-string parameters. |
 | `GET /manuals?folder=…` | One folder of the library, one level deep, exactly as `list_manuals` returns it. |
 | `GET /manuals/{manual_id}` | The manual's metadata and hierarchical table of contents. |
@@ -439,12 +439,11 @@ curl -s 'localhost:8001/search?q=IEF450I&limit=3'
 | `GET /figures/{figure_id}` | A figure's caption, labels, description and size. |
 | `GET /figures/{figure_id}/image` | The PNG itself, so an `<img src>` can point straight at it. |
 
-**A search here does not need a manual.** The `search_manual` tool requires one
-because an agent has already browsed its way to it; a RAG client has a question
-and nothing else, and making it choose a manual first would be asking it to
-solve retrieval before it may use retrieval. So `manual_id` narrows a search
-rather than starting one, `bookmark_id` narrows it to a section — and since a
-bookmark names exactly one manual, `bookmark_id` alone is enough.
+**A search does not need a manual.** `manual_path` defaults to `*`, meaning the
+whole corpus. To search one manual, pass the `path` from its `list_manuals` or
+`GET /manuals` entry unchanged. A pattern such as `zOS/V3R1/*` selects every
+manual below that folder, including nested folders. `bookmark_id` can narrow
+any selected range to one section and its descendants.
 
 Each hit carries more than the tool returns, because a client showing a result
 list has to say where it came from:
@@ -452,7 +451,7 @@ list has to say where it came from:
 ```json
 {
   "query": "how do I mount a zFS file system",
-  "manual_id": null,
+  "manual_path": "*",
   "bookmark_id": null,
   "limit": 5,
   "count": 5,
@@ -461,6 +460,7 @@ list has to say where it came from:
       "chunk_id": "8f0c…", "rank": 1, "score": 0.71, "retrieval": "both",
       "chunk_type": "text", "page": 214,
       "manual_id": "d10e…",
+      "manual_path": "z/OS/v2r5/zos-unix-sysadmin.pdf",
       "manual": {
         "id": "d10e…", "file_name": "zos-unix-sysadmin.pdf",
         "document_title": "z/OS UNIX System Services Planning",
@@ -1012,8 +1012,8 @@ several times this one.
 
 **Per-tenant graphs are off too, and should stay off if you ever want to search
 across manuals.** Qdrant can skip the global graph (`m: 0`) and build one per
-value of a payload field, which is tempting here because every `search_manual`
-call carries a `manual_id`. It indexes in 30 s instead of 405 s and answers a
+value of a payload field, which was tempting when every `search_manual` call
+targeted one manual. It indexes in 30 s instead of 405 s and answers a
 filtered search perfectly — and answers a corpus-wide one at **0.2% recall@5**,
 because there is no global graph left to walk.
 
@@ -1207,8 +1207,8 @@ definition at rank 4:
 | whole corpus | 13 | 13 | no |
 | scoped to Vol 8 | 4 | **4** | **yes** |
 
-which is what `search_manual`'s `manual_id` is for. Dense retrieval does not
-find that chunk either way — not even within the 1,437 chunks of the volume
+which is what an exact `search_manual.manual_path` is for. Dense retrieval does
+not find that chunk either way — not even within the 1,437 chunks of the volume
 holding it.
 
 Bookmarks are no help as a third signal: `BPX1MNT` has two bookmarks naming it,

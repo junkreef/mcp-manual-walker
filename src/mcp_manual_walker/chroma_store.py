@@ -42,8 +42,8 @@ def _where(filter: ChunkFilter) -> Optional[dict]:
     Chroma rejects a one-element `$and`, so a single condition is emitted bare.
     """
     conditions: list[dict] = []
-    if filter.manual_id is not None:
-        conditions.append({"manual_id": filter.manual_id})
+    if filter.manual_ids is not None:
+        conditions.append({"manual_id": {"$in": list(filter.manual_ids)}})
     if filter.bookmark_ids is not None:
         conditions.append({"bookmark_id": {"$in": list(filter.bookmark_ids)}})
 

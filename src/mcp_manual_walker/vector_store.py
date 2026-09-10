@@ -6,7 +6,7 @@ exactly three filter shapes -- rather than by abstracting over what Chroma or
 Qdrant can do. An interface that admitted everything either engine offers would
 be an interface neither could implement.
 
-The three filters the application uses are `manual_id == x`, `bookmark_id in
+The filters the application uses are `manual_id in {...}`, `bookmark_id in
 {...}`, and the two together, so `ChunkFilter` expresses those and refuses the
 rest. Chroma renders it as a `where` dict, Qdrant as a `Filter(must=[...])`.
 
@@ -52,19 +52,24 @@ class ChunkFilter:
     caller has already flattened it there.
     """
 
-    manual_id: Optional[str] = None
+    manual_ids: Optional[Sequence[str]] = None
     bookmark_ids: Optional[Sequence[str]] = None
 
     def is_empty(self) -> bool:
-        return self.manual_id is None and self.bookmark_ids is None
+        return self.manual_ids is None and self.bookmark_ids is None
 
     def matches_nothing(self) -> bool:
         """True when the filter cannot match, so a backend can skip the call.
 
-        An empty `bookmark_ids` is not "any bookmark": it is the result of
-        asking for a section that has no chunks, and it must match none.
+        An empty explicit set is not "any": it means path or bookmark
+        resolution found no eligible chunks, and it must match none.
         """
-        return self.bookmark_ids is not None and len(self.bookmark_ids) == 0
+        return (
+            self.manual_ids is not None
+            and len(self.manual_ids) == 0
+            or self.bookmark_ids is not None
+            and len(self.bookmark_ids) == 0
+        )
 
 
 @dataclass

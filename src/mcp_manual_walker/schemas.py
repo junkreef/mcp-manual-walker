@@ -27,15 +27,16 @@ class DirectoryEntry(BaseModel):
         ...,
         description=(
             "The path of this entry relative to the library root, with `/` as "
-            "the separator. Pass a directory's path back to `list_manuals` to "
-            "see what is inside it."
+            "the separator. Pass a directory path to `list_manuals.folder`; "
+            "pass a manual path unchanged to `search_manual.manual_path` to "
+            "search exactly that manual. `document_title` is not a search path."
         ),
     )
     id: Optional[str] = Field(
         None,
         description=(
-            "The unique identifier of the manual, required by the other tools. "
-            "Null for directories."
+            "The unique identifier used by metadata and content tools. Search "
+            "uses this entry's `path` instead. Null for directories."
         ),
     )
     document_title: Optional[str] = Field(
@@ -118,6 +119,13 @@ class SearchResultItem(BaseModel):
         ..., description="The full text content of the matching chunk."
     )
     manual_id: str = Field(..., description="The unique identifier of the manual.")
+    manual_path: str = Field(
+        ...,
+        description=(
+            "The manual path returned by `list_manuals`, suitable for passing "
+            "back as `search_manual.manual_path`."
+        ),
+    )
     bookmark_id: Optional[str] = Field(
         None, description="The unique identifier of the bookmark this chunk belongs to."
     )
@@ -135,10 +143,16 @@ class SearchResultItem(BaseModel):
 
 
 class SearchResult(BaseModel):
-    manual_id: str = Field(..., description="The unique identifier of the manual.")
+    manual_path: str = Field(
+        ...,
+        description=(
+            "The path or wildcard pattern used to select manuals. An exact "
+            "value comes from `list_manuals.path`; `*` searches the corpus."
+        ),
+    )
     query: str = Field(..., description="The search query used.")
     results: List[SearchResultItem] = Field(
-        ..., description="A list of search results found in the manual."
+        ..., description="A list of search results from the selected manuals."
     )
 
 
@@ -197,8 +211,12 @@ class SearchResponse(BaseModel):
     """The REST search result: the query as understood, and what it matched."""
 
     query: str = Field(..., description="The search query used.")
-    manual_id: Optional[str] = Field(
-        None, description="The manual the search was restricted to, if any."
+    manual_path: str = Field(
+        ...,
+        description=(
+            "The exact path or wildcard pattern used to select manuals; `*` "
+            "means the whole corpus."
+        ),
     )
     bookmark_id: Optional[str] = Field(
         None, description="The section the search was restricted to, if any."

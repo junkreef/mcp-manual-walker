@@ -67,14 +67,15 @@ def _as_tool_error():
     Every entry has a `type`:
     * `"directory"` — a folder. Pass its `path` back as `folder` to look inside.
       Its `manual_count` tells how many manuals it holds at any depth.
-    * `"manual"` — a PDF. Its `id` is the `manual_id` the other tools need.
+    * `"manual"` — a PDF. Pass its `path` unchanged as `manual_path` to
+      `search_manual`; its `id` is used by metadata and content tools.
 
     Workflow Example:
     1. Call `list_manuals()` to see the top-level folders and manuals.
     2. Call `list_manuals(folder="Db2 for zOS")` to descend, repeating until the
        entries of type `"manual"` appear.
-    3. Use the `id` of the manual you want to call `get_manual_metadata()` and
-       retrieve its table of contents.""",
+    3. Pass a manual entry's `path` unchanged to `search_manual(manual_path=...)`,
+       or use its `id` with `get_manual_metadata()` to retrieve its contents.""",
     tags={"manual", "discovery"},
     annotations={"readOnlyHint": True},
 )
@@ -160,11 +161,17 @@ def get_markdown_content(
 
 @app.tool(
     name="search_manual",
-    description="""Searches for a query string within a specific manual using semantic search.
+    description="""Searches manuals using dense and lexical retrieval.
     Returns the top matching chunks.
 
-    Optionally, a `bookmark_id` can be provided to restrict the search to a specific
-    section of the manual (including subsections).
+    `manual_path` selects the manuals. For one manual, pass the `path` from its
+    `list_manuals` entry unchanged; do not use `document_title`, which is display
+    metadata only. Use `*` for the whole corpus or a pattern such
+    as `zOS/V3R1/*` for every manual below that folder. `*` also crosses nested
+    folder boundaries.
+
+    Optionally, a `bookmark_id` can restrict the search to that section and its
+    subsections; the bookmark must belong to the selected path range.
 
     Every result reports its `chunk_type` ("text", "table" or "figure"). A hit
     with `chunk_type` "figure" also carries a `figure` object whose `id` can be
@@ -172,21 +179,28 @@ def get_markdown_content(
     figure's caption, labels and description.
 
     Workflow Example:
-    1. Call `search_manual(manual_id=..., query="...")` to find occurrences.
-    2. Call `get_figure(figure_id=...)` for a hit whose `chunk_type` is "figure".
+    1. Call `list_manuals` until the desired manual entry appears.
+    2. Pass that entry's `path` to `search_manual(manual_path=..., query="...")`.
+    3. Call `get_figure(figure_id=...)` for a hit whose `chunk_type` is "figure".
     """,
     tags={"manual", "search"},
     annotations={"readOnlyHint": True},
 )
 def search_manual(
-    manual_id: Annotated[
-        str,
-        Field(description="The unique ID of the manual to search."),
-    ],
     query: Annotated[
         str,
         Field(description="The text to search for."),
     ],
+    manual_path: Annotated[
+        str,
+        Field(
+            description=(
+                "A manual `path` returned by `list_manuals` (not its "
+                "`document_title`), or a pattern such as `zOS/V3R1/*`. Use "
+                "`*` to search the whole corpus."
+            )
+        ),
+    ] = "*",
     bookmark_id: Annotated[
         Optional[str],
         Field(
@@ -194,16 +208,16 @@ def search_manual(
         ),
     ] = None,
 ) -> SearchResult:
-    """Searches for text in a manual and returns matches with context and hierarchy."""
+    """Searches selected manuals and returns matches with context and hierarchy."""
     with _as_tool_error():
-        hits = service.search(query, manual_id=manual_id, bookmark_id=bookmark_id)
+        hits = service.search(query, manual_path=manual_path, bookmark_id=bookmark_id)
 
     # A hit carries more than the tool has ever returned -- its rank, its score
     # and the manual it came from -- because the REST client showing a result
     # list needs those. The tool response is narrowed back to what its schema
     # promises rather than quietly growing.
     return SearchResult(
-        manual_id=manual_id,
+        manual_path=manual_path,
         query=query,
         results=[SearchResultItem(**hit.model_dump()) for hit in hits],
     )

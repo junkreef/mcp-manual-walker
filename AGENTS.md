@@ -52,7 +52,7 @@ The server automatically performs the following actions on startup:
 #### 3.2. Tools for AI Agents (APIs)
 
 The agent interacts with the system using stable, unique IDs for manuals and bookmarks. The typical workflow is:
-1. Call `list_manuals()` to browse the library folder by folder until the manual it wants appears, and take that manual's `id`.
+1. Call `list_manuals()` to browse the library folder by folder until the manual it wants appears. Its `path` is passed unchanged to `search_manual.manual_path`; its `id` is used by metadata tools.
 2. Call `get_manual_metadata(manual_id)` to get the table of contents for a specific manual, which includes the `id` for each bookmark.
 3. Call `get_markdown_content(bookmark_id)` to retrieve the content of a specific section.
 
@@ -60,7 +60,7 @@ The agent interacts with the system using stable, unique IDs for manuals and boo
 
 **Tool 1: `list_manuals(folder: str = "")`**
 
-*   **Function**: Lists what sits directly inside one folder of the manual library, the way `ls` does. Nothing deeper is returned, so a library of several hundred manuals is explored a folder at a time instead of arriving in a single response.
+*   **Function**: Lists what sits directly inside one folder of the manual library, the way `ls` does. Nothing deeper is returned, so a library of several hundred manuals is explored a folder at a time instead of arriving in a single response. A manual entry's `path` is passed unchanged to `search_manual.manual_path`.
 *   **Input**:
     *   `folder` (string, optional): The directory to list, relative to the PDF root directory and separated by `/`. Taken from the `path` of a `"directory"` entry of a previous call. Empty lists the root.
 *   **Output**: A flat list of entries. A `"directory"` entry carries the `path` to pass back and the `manual_count` of manuals below it at any depth; a `"manual"` entry carries the `id` the other tools need. Directories come first, then manuals, each in name order. An unknown `folder` is an error.
@@ -239,7 +239,7 @@ Before finalizing changes, always run the following commands to ensure code qual
 
 *   `src/mcp_manual_walker/main.py`: Main application entry point. Defines the `FastMCP` server and the tools available to the agent, and starts the REST API alongside it. The tool bodies are thin: they call `service.py` and translate its failures into `ToolError`.
 *   `src/mcp_manual_walker/service.py`: Everything both front ends do — browsing the library, the table of contents, section Markdown, hybrid search and figures — plus the vector store and embedder the process holds. **Retrieval logic belongs here, never in a tool or an endpoint**, so the MCP and REST answers cannot drift apart. Failures are `ServiceError` with a `kind`, which each front end renders its own way.
-*   `src/mcp_manual_walker/rest_api.py`: The FastAPI application served on the second port, and the threaded uvicorn runner that keeps it out of the MCP server's signal handling. Search here is corpus-wide by default; `manual_id` and `bookmark_id` are filters.
+*   `src/mcp_manual_walker/rest_api.py`: The FastAPI application served on the second port, and the threaded uvicorn runner that keeps it out of the MCP server's signal handling. Search is corpus-wide by default; `manual_path` accepts an exact `list_manuals.path` or a wildcard, and `bookmark_id` narrows it to a section.
 *   `webgui/`: The browser console — an nginx image serving `static/` and proxying `/api` to the REST port. No build step: the three files in `static/` are what runs.
 *   `src/mcp_manual_walker/models.py`: Defines the SQLAlchemy database schema (`Manual`, `Bookmark`, `Cache`). **Crucially, it defines the `cascade="all, delete-orphan"` behavior.**
 *   `src/mcp_manual_walker/database.py`: Handles database engine creation and session management.
@@ -251,5 +251,5 @@ Before finalizing changes, always run the following commands to ensure code qual
 
 ### 6. Key Architectural Decisions
 
-*   **ID-based Referencing**: The system uses UUIDs (`manual_id`, `bookmark_id`) instead of mutable names (`file_name`, `bookmark_title`) for all tool inputs and database relations. This ensures stability and prevents broken references if a file or bookmark is renamed.
+*   **Reference Semantics**: Metadata, bookmarks, figures and database relations use stable UUIDs. Search selection uses the normalized relative `path` returned by `list_manuals`, allowing exact paths and wildcard ranges without exposing index internals.
 *   **Database Cascade Deletes**: The data models are configured with `cascade="all, delete-orphan"`. This means deleting a `Manual` record from the database will automatically trigger the deletion of all its associated `Bookmark` and `Cache` records, ensuring data integrity.
