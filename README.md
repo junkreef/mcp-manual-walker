@@ -543,9 +543,16 @@ the proxy, which is the case `REST_CORS_ORIGINS` exists for. The API key field
 beside it fills in `X-API-Key` for a server that wants one. Both are kept in
 the browser, not on the server.
 
-`WEBGUI_PORT` and `WEBGUI_BIND` move where it is published;
-`WEBGUI_API_UPSTREAM` names the server it proxies to, which has to be
-`http://mcp-local:8001` when the `local` profile is the one running.
+`WEBGUI_PORT` and `WEBGUI_BIND` move where it is published.
+
+Moving the API itself is `REST_PORT`, and it is one setting rather than three:
+it is the port the server listens on, the port compose publishes, and the port
+the console proxies to, all at once. `WEBGUI_API_UPSTREAM` only exists to
+change the *host* — `http://mcp-local:8001` when the `local` profile is the one
+running, or a server outside this compose file altogether. It is an address on
+the compose network, so it takes the port the container listens on, never the
+published one; pointing it at the published port is how you get a `502` from
+nginx with a perfectly healthy server behind it.
 
 There is no build step and no bundler. `webgui/static/` is HTML, CSS and one
 JavaScript file that a browser runs as they are, so editing the console needs

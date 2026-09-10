@@ -57,6 +57,12 @@ x-app-env: &app-env
   # a compose network and a loopback publish already assume; set REST_API_KEY
   # in .env to close it.
   REST_API_KEY: ${REST_API_KEY:-}
+  # The port the REST API listens on, inside the container. It is the same
+  # number the host publishes below and the same one the console proxies to,
+  # because one port deserves one name: a variable that meant "the published
+  # port" alone would leave the in-network address on its old value, and the
+  # console would proxy to a port nothing listens on.
+  REST_PORT: ${REST_PORT:-8001}
   # Origins a browser may call the API from. The console does not need this --
   # it reaches the API through its own nginx, so the page and the API share an
   # origin -- but a page of your own served from somewhere else does. Not "*":
@@ -151,7 +157,7 @@ services:
       # than on this network. The console in webgui/ does not need it: it
       # reaches the API over the compose network, so this line can be deleted
       # if nothing on the host is going to call it.
-      - "${REST_BIND:-127.0.0.1}:${REST_PORT:-8001}:8001"
+      - "${REST_BIND:-127.0.0.1}:${REST_PORT:-8001}:${REST_PORT:-8001}"
 
   # The same server with the model in process. One or the other, never both:
   # they would fight over the port.
@@ -177,7 +183,7 @@ services:
     volumes: *app-volumes
     ports:
       - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8000}:8000"
-      - "${REST_BIND:-127.0.0.1}:${REST_PORT:-8001}:8001"
+      - "${REST_BIND:-127.0.0.1}:${REST_PORT:-8001}:${REST_PORT:-8001}"
 
   # One-off commands: import, export, delete, list, reindex-lexical. Uses the
   # small image, because none of those embed anything except `search`.
@@ -217,8 +223,10 @@ services:
     depends_on:
       - mcp
     environment:
-      # Which server the console talks to. `mcp-local` when the local profile
-      # is the one running.
-      API_UPSTREAM: ${WEBGUI_API_UPSTREAM:-http://mcp:8001}
+      # Which server the console talks to, as an address on the compose
+      # network -- not the published one. Only the host name needs changing,
+      # to `mcp-local`, when the local profile is the one running; the port
+      # follows REST_PORT on its own.
+      API_UPSTREAM: ${WEBGUI_API_UPSTREAM:-http://mcp:${REST_PORT:-8001}}
     ports:
       - "${WEBGUI_BIND:-127.0.0.1}:${WEBGUI_PORT:-8080}:80"
