@@ -38,34 +38,37 @@ def test_an_empty_filter_matches_everything():
 
 def test_one_condition_is_emitted_bare():
     """Chroma rejects a one-element $and, so it must not be wrapped."""
-    assert _where(ChunkFilter(manual_id="m1")) == {"manual_id": "m1"}
+    assert _where(ChunkFilter(manual_ids=["m1"])) == {"manual_id": {"$in": ["m1"]}}
     assert _where(ChunkFilter(bookmark_ids=["b1", "b2"])) == {
         "bookmark_id": {"$in": ["b1", "b2"]}
     }
 
 
 def test_two_conditions_are_joined_with_and():
-    assert _where(ChunkFilter(manual_id="m1", bookmark_ids=["b1"])) == {
-        "$and": [{"manual_id": "m1"}, {"bookmark_id": {"$in": ["b1"]}}]
+    assert _where(ChunkFilter(manual_ids=["m1"], bookmark_ids=["b1"])) == {
+        "$and": [{"manual_id": {"$in": ["m1"]}}, {"bookmark_id": {"$in": ["b1"]}}]
     }
 
 
 def test_an_empty_bookmark_set_matches_nothing_rather_than_anything():
     """A section with no chunks must return none, not the whole manual."""
-    assert ChunkFilter(manual_id="m1", bookmark_ids=[]).matches_nothing()
-    assert not ChunkFilter(manual_id="m1").matches_nothing()
+    assert ChunkFilter(manual_ids=["m1"], bookmark_ids=[]).matches_nothing()
+    assert ChunkFilter(manual_ids=[]).matches_nothing()
+    assert not ChunkFilter(manual_ids=["m1"]).matches_nothing()
     assert not ChunkFilter().matches_nothing()
 
 
 def test_scrolling_an_impossible_filter_asks_the_backend_nothing(store):
     vector_store, collection = store
-    assert list(vector_store.scroll(ChunkFilter(manual_id="m", bookmark_ids=[]))) == []
+    assert list(
+        vector_store.scroll(ChunkFilter(manual_ids=["m"], bookmark_ids=[]))
+    ) == []
     collection.get.assert_not_called()
 
 
 def test_searching_an_impossible_filter_asks_the_backend_nothing(store):
     vector_store, collection = store
-    impossible = ChunkFilter(manual_id="m", bookmark_ids=[])
+    impossible = ChunkFilter(manual_ids=["m"], bookmark_ids=[])
     assert vector_store.search([0.1], 5, impossible) == []
     collection.query.assert_not_called()
 
@@ -116,14 +119,14 @@ def test_a_filtered_scroll_is_one_unpaged_read(store):
     collection.get.return_value = {
         "ids": ["c0"],
         "documents": ["zero"],
-        "metadatas": [{"manual_id": "m1"}],
+        "metadatas": [{"manual_id": {"$in": ["m1"]}}],
     }
 
-    chunks = list(vector_store.scroll(ChunkFilter(manual_id="m1")))
+    chunks = list(vector_store.scroll(ChunkFilter(manual_ids=["m1"])))
 
     assert [c.id for c in chunks] == ["c0"]
     assert collection.get.call_count == 1
-    assert collection.get.call_args.kwargs["where"] == {"manual_id": "m1"}
+    assert collection.get.call_args.kwargs["where"] == {"manual_id": {"$in": ["m1"]}}
 
 
 def test_an_unfiltered_scroll_pages_until_the_store_is_exhausted(store):
@@ -146,10 +149,10 @@ def test_a_scroll_asks_for_embeddings_only_when_wanted(store):
     vector_store, collection = store
     collection.get.return_value = {"ids": [], "documents": [], "metadatas": []}
 
-    list(vector_store.scroll(ChunkFilter(manual_id="m")))
+    list(vector_store.scroll(ChunkFilter(manual_ids=["m"])))
     assert "embeddings" not in collection.get.call_args.kwargs["include"]
 
-    list(vector_store.scroll(ChunkFilter(manual_id="m"), with_embedding=True))
+    list(vector_store.scroll(ChunkFilter(manual_ids=["m"]), with_embedding=True))
     assert "embeddings" in collection.get.call_args.kwargs["include"]
 
 
@@ -158,7 +161,7 @@ def test_a_scroll_that_wants_no_document_still_returns_ids(store):
     collection.get.return_value = {"ids": ["c0"], "metadatas": [{}]}
 
     chunks = list(
-        vector_store.scroll(ChunkFilter(manual_id="m"), with_document=False)
+        vector_store.scroll(ChunkFilter(manual_ids=["m"]), with_document=False)
     )
     assert [c.id for c in chunks] == ["c0"]
     assert "documents" not in collection.get.call_args.kwargs["include"]
@@ -175,7 +178,9 @@ def test_numpy_embeddings_come_back_as_plain_lists(store):
         "embeddings": [numpy.array([0.1, 0.2], dtype=numpy.float32)],
     }
 
-    chunk = next(vector_store.scroll(ChunkFilter(manual_id="m"), with_embedding=True))
+    chunk = next(
+        vector_store.scroll(ChunkFilter(manual_ids=["m"]), with_embedding=True)
+    )
     assert isinstance(chunk.embedding, list)
     assert chunk.embedding == pytest.approx([0.1, 0.2], abs=1e-6)
 
@@ -206,12 +211,12 @@ def test_search_passes_the_query_vector_and_never_a_text(store):
     vector_store, collection = store
     collection.query.return_value = {"ids": [[]]}
 
-    vector_store.search([0.1, 0.2], limit=7, where=ChunkFilter(manual_id="m1"))
+    vector_store.search([0.1, 0.2], limit=7, where=ChunkFilter(manual_ids=["m1"]))
 
     kwargs = collection.query.call_args.kwargs
     assert kwargs["query_embeddings"] == [[0.1, 0.2]]
     assert kwargs["n_results"] == 7
-    assert kwargs["where"] == {"manual_id": "m1"}
+    assert kwargs["where"] == {"manual_id": {"$in": ["m1"]}}
 
 
 def test_a_search_that_matches_nothing_returns_an_empty_list(store):

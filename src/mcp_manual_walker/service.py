@@ -8,11 +8,10 @@ touches the databases lives here; the front ends only translate.
 
 Two differences from the MCP tools this was lifted out of are deliberate:
 
-* **Search is corpus-wide by default.** The MCP tool asks for a `manual_id`
-  because an agent has already browsed its way to one. A RAG client has not,
-  and asking it to pick a manual before it may search is asking it to solve the
-  retrieval problem first. `manual_id` and `bookmark_id` are filters here, and
-  both are optional.
+* **Search is corpus-wide by default.** Both front ends accept a
+  `manual_path` pattern, where `*` means the corpus and a path returned by
+  `list_manuals` names one manual. `bookmark_id` can narrow either scope to a
+  section and its descendants.
 * **Failures are `ServiceError`, not `ToolError`.** A layer that raises
   `ToolError` cannot be served over HTTP without every 404 arriving as a 500,
   so the reason is carried in `kind` and each front end renders it: MCP as a
@@ -22,6 +21,7 @@ Two differences from the MCP tools this was lifted out of are deliberate:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from typing import List, Literal, Optional, Sequence
 
@@ -239,6 +239,33 @@ def normalize_folder(folder: Optional[str]) -> str:
     if not cleaned or cleaned == ".":
         return ""
     return f"{cleaned}/"
+
+
+def resolve_manual_path(manual_path: str, db: Session) -> Optional[list[str]]:
+    """Resolves a public manual path pattern to IDs used by the indexes.
+
+    `*` deliberately crosses `/`, so `zOS/V3R1/*` includes manuals in nested
+    folders as well as PDFs directly in V3R1. Returning None represents the
+    whole corpus and lets both retrieval backends omit their filter entirely.
+    """
+    pattern = manual_path.replace("\\", "/").strip().strip("/")
+    if not pattern or pattern == ".":
+        raise ServiceError("manual_path must not be empty.", kind="invalid")
+    if pattern == "*":
+        return None
+
+    expression = re.compile(re.escape(pattern).replace(r"\*", ".*") + r"\Z")
+    manuals = db.execute(select(Manual.id, Manual.relative_path)).all()
+    ids = [
+        manual_id
+        for manual_id, relative_path in manuals
+        if expression.fullmatch(relative_path.replace("\\", "/"))
+    ]
+    if not ids:
+        raise ServiceError(
+            f"No manuals match manual_path '{manual_path}'.", kind="not_found"
+        )
+    return ids
 
 
 def list_folder(folder: str = "") -> List[DirectoryEntry]:
@@ -467,7 +494,7 @@ def _chunk_ids_in_bookmarks(store, manual_id: str, bookmark_ids: list[str]) -> s
     return {
         chunk.id
         for chunk in store.scroll(
-            ChunkFilter(manual_id=manual_id, bookmark_ids=bookmark_ids),
+            ChunkFilter(manual_ids=[manual_id], bookmark_ids=bookmark_ids),
             with_document=False,
         )
     }
@@ -513,14 +540,14 @@ def _manual_refs(db: Session, manual_ids: Sequence[str]) -> dict[str, ManualRef]
 def search(
     query: str,
     *,
-    manual_id: Optional[str] = None,
+    manual_path: str = "*",
     bookmark_id: Optional[str] = None,
     limit: int = DEFAULT_SEARCH_LIMIT,
 ) -> List[SearchHit]:
-    """Hybrid search over the corpus, or over one manual or section of it.
+    """Hybrid search over manuals selected by path, optionally within a section.
 
-    Both filters are optional and `bookmark_id` implies its manual, so a caller
-    holding only a bookmark does not have to look the manual up first.
+    `manual_path` is either the `path` returned by `list_manuals`, a pattern
+    containing `*`, or `*` for the whole corpus.
     """
     if not query or not query.strip():
         raise ServiceError("The search query is empty.", kind="invalid")
@@ -535,27 +562,35 @@ def search(
     db: Session = SessionLocal()
     try:
         target_ids: list[str] = []
+        selected_manual_ids = resolve_manual_path(manual_path, db)
+        effective_manual_ids = selected_manual_ids
+        bookmark_manual_id: Optional[str] = None
 
-        if bookmark_id and not manual_id:
-            # A bookmark names exactly one manual, so a caller who has one does
-            # not have to supply the other.
+        if bookmark_id:
             bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
             if not bookmark:
                 raise ServiceError(
                     f"Bookmark with id '{bookmark_id}' not found.", kind="not_found"
                 )
-            manual_id = bookmark.manual_id
-
-        if bookmark_id:
-            # Hierarchical filter
-            assert manual_id is not None  # set above when it was not given
-            target_ids = _get_descendant_bookmark_ids(manual_id, bookmark_id, db)
-            where = ChunkFilter(manual_id=manual_id, bookmark_ids=target_ids)
-        elif manual_id:
-            where = ChunkFilter(manual_id=manual_id)
+            bookmark_manual_id = bookmark.manual_id
+            if (
+                selected_manual_ids is not None
+                and bookmark_manual_id not in selected_manual_ids
+            ):
+                raise ServiceError(
+                    f"Bookmark '{bookmark_id}' is outside manual_path '{manual_path}'.",
+                    kind="invalid",
+                )
+            target_ids = _get_descendant_bookmark_ids(
+                bookmark_manual_id, bookmark_id, db
+            )
+            effective_manual_ids = [bookmark_manual_id]
+            where = ChunkFilter(
+                manual_ids=effective_manual_ids, bookmark_ids=target_ids
+            )
+        elif selected_manual_ids is not None:
+            where = ChunkFilter(manual_ids=selected_manual_ids)
         else:
-            # No filter at all: the whole corpus is the search space, which is
-            # what a RAG client asking a question about "the manuals" means.
             where = ChunkFilter()
 
         # Dense and lexical retrieval, fused by rank.
@@ -583,14 +618,16 @@ def search(
             lexical.sqlite_connection(db),
             query,
             limit=max(lexical.LEXICAL_CANDIDATES, limit),
-            manual_id=manual_id,
+            manual_ids=effective_manual_ids,
         )
         if bookmark_id:
             # The dense side got this through the filter; the lexical index does
             # not carry the bookmark, so it is filtered against the same set.
-            assert manual_id is not None
+            assert bookmark_manual_id is not None
             allowed = set(dense_ids)
-            allowed.update(_chunk_ids_in_bookmarks(store, manual_id, target_ids))
+            allowed.update(
+                _chunk_ids_in_bookmarks(store, bookmark_manual_id, target_ids)
+            )
             lexical_ids = [i for i in lexical_ids if i in allowed]
 
         ordered = lexical.fuse_dense_and_lexical(dense_ids, lexical_ids)[:limit]
@@ -634,8 +671,9 @@ def search(
         hits: List[SearchHit] = []
         for rank, chunk in enumerate(chunks, start=1):
             meta = chunk.metadata
-            chunk_manual_id = str(meta.get("manual_id") or manual_id or "")
+            chunk_manual_id = str(meta.get("manual_id") or bookmark_manual_id or "")
             chunk_bm_id = meta.get("bookmark_id")
+            manual_ref = manual_refs.get(chunk_manual_id)
 
             figure_ref = None
             figure_id = meta.get("figure_id")
@@ -664,6 +702,7 @@ def search(
                     bookmarks=_bookmark_path(bookmark_map, chunk_bm_id),
                     context=chunk.document or "",
                     manual_id=chunk_manual_id,
+                    manual_path=manual_ref.relative_path if manual_ref else "",
                     bookmark_id=chunk_bm_id,
                     chunk_type=str(meta.get("type", "text")),
                     figure=figure_ref,
@@ -713,7 +752,7 @@ def markdown_content(bookmark_id: str) -> MarkdownContent:
         # subsections.
         chunks = list(
             store.scroll(
-                ChunkFilter(manual_id=manual_id, bookmark_ids=target_bookmark_ids)
+                ChunkFilter(manual_ids=[manual_id], bookmark_ids=target_bookmark_ids)
             )
         )
 

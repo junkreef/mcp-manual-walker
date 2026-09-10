@@ -73,9 +73,9 @@ def test_an_empty_filter_is_no_filter():
 
 
 def test_a_manual_filter_is_a_single_match():
-    built = _filter(ChunkFilter(manual_id="m1"))
+    built = _filter(ChunkFilter(manual_ids=["m1"]))
     assert built.must == [
-        models.FieldCondition(key="manual_id", match=models.MatchValue(value="m1"))
+        models.FieldCondition(key="manual_id", match=models.MatchAny(any=["m1"]))
     ]
 
 
@@ -89,13 +89,13 @@ def test_a_bookmark_set_is_a_match_any():
 
 
 def test_both_conditions_are_required_together():
-    built = _filter(ChunkFilter(manual_id="m1", bookmark_ids=["b1"]))
+    built = _filter(ChunkFilter(manual_ids=["m1"], bookmark_ids=["b1"]))
     assert len(built.must) == 2
 
 
 def test_an_impossible_filter_asks_the_server_nothing(store):
     vector_store, client = store
-    impossible = ChunkFilter(manual_id="m", bookmark_ids=[])
+    impossible = ChunkFilter(manual_ids=["m"], bookmark_ids=[])
 
     assert list(vector_store.scroll(impossible)) == []
     assert vector_store.search([0.1], 5, impossible) == []
@@ -137,7 +137,7 @@ def test_the_reserved_payload_keys_are_stripped_on_the_way_out(store):
     record.vector = None
     client.scroll.return_value = ([record], None)
 
-    chunk = next(vector_store.scroll(ChunkFilter(manual_id="m1")))
+    chunk = next(vector_store.scroll(ChunkFilter(manual_ids=["m1"])))
 
     assert chunk.id == "c0"
     assert chunk.document == "text"
@@ -223,7 +223,7 @@ def test_a_scroll_that_wants_no_text_leaves_it_on_the_server(store):
     vector_store, client = store
     client.scroll.return_value = ([], None)
 
-    list(vector_store.scroll(ChunkFilter(manual_id="m"), with_document=False))
+    list(vector_store.scroll(ChunkFilter(manual_ids=["m"]), with_document=False))
 
     selector = client.scroll.call_args.kwargs["with_payload"]
     assert isinstance(selector, models.PayloadSelectorExclude)
@@ -234,10 +234,10 @@ def test_a_scroll_asks_for_vectors_only_when_wanted(store):
     vector_store, client = store
     client.scroll.return_value = ([], None)
 
-    list(vector_store.scroll(ChunkFilter(manual_id="m")))
+    list(vector_store.scroll(ChunkFilter(manual_ids=["m"])))
     assert client.scroll.call_args.kwargs["with_vectors"] is False
 
-    list(vector_store.scroll(ChunkFilter(manual_id="m"), with_embedding=True))
+    list(vector_store.scroll(ChunkFilter(manual_ids=["m"]), with_embedding=True))
     assert client.scroll.call_args.kwargs["with_vectors"] is True
 
 
@@ -271,12 +271,12 @@ def test_search_passes_the_query_vector_the_limit_and_the_filter(store):
     response.points = []
     client.query_points.return_value = response
 
-    vector_store.search([0.1, 0.2], limit=7, where=ChunkFilter(manual_id="m1"))
+    vector_store.search([0.1, 0.2], limit=7, where=ChunkFilter(manual_ids=["m1"]))
 
     kwargs = client.query_points.call_args.kwargs
     assert kwargs["query"] == [0.1, 0.2]
     assert kwargs["limit"] == 7
-    assert kwargs["query_filter"].must[0].match.value == "m1"
+    assert kwargs["query_filter"].must[0].match.any == ["m1"]
 
 
 def test_an_unquantized_search_asks_for_no_rescoring(store):
@@ -524,7 +524,7 @@ def test_live_a_chunk_survives_the_round_trip_unchanged(live_store):
     original = sample_chunks()[1]
     live_store.add([original])
 
-    read_back = next(live_store.scroll(ChunkFilter(manual_id="m1"),
+    read_back = next(live_store.scroll(ChunkFilter(manual_ids=["m1"]),
                                        with_embedding=True))
 
     assert read_back.id == original.id
@@ -539,19 +539,19 @@ def test_live_the_filters_actually_select(live_store):
 
     assert live_store.count() == 4
 
-    by_manual = {c.id for c in live_store.scroll(ChunkFilter(manual_id="m1"))}
+    by_manual = {c.id for c in live_store.scroll(ChunkFilter(manual_ids=["m1"]))}
     assert by_manual == {"m1_0", "m1_1", "m1_2"}
 
     by_section = {
         c.id for c in live_store.scroll(
-            ChunkFilter(manual_id="m1", bookmark_ids=["b2"])
+            ChunkFilter(manual_ids=["m1"], bookmark_ids=["b2"])
         )
     }
     assert by_section == {"m1_1", "m1_2"}
 
     both_sections = {
         c.id for c in live_store.scroll(
-            ChunkFilter(manual_id="m1", bookmark_ids=["b1", "b2"])
+            ChunkFilter(manual_ids=["m1"], bookmark_ids=["b1", "b2"])
         )
     }
     assert both_sections == {"m1_0", "m1_1", "m1_2"}
@@ -577,13 +577,13 @@ def test_live_search_ranks_by_similarity_and_respects_the_filter(live_store):
 
     # The shape search_manual actually issues.
     scoped = live_store.search(
-        [0.0, 1.0] + [0.0] * 6, limit=5, where=ChunkFilter(manual_id="m1")
+        [0.0, 1.0] + [0.0] * 6, limit=5, where=ChunkFilter(manual_ids=["m1"])
     )
     assert {h.id for h in scoped} == {"m1_0", "m1_1", "m1_2"}
     assert scoped[0].id == "m1_1"
 
     other = live_store.search([1.0] + [0.0] * 7, limit=5,
-                              where=ChunkFilter(manual_id="m2"))
+                              where=ChunkFilter(manual_ids=["m2"]))
     assert {h.id for h in other} == {"m2_0"}
 
 

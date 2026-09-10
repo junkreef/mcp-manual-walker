@@ -23,9 +23,9 @@ Three things this backend has to do that Chroma's does not:
   import, and the original id travels in the payload. The BM25 index in SQLite
   and the export archive therefore keep naming chunks exactly as they do now.
 
-* **Payload indexes.** Every search this application issues is filtered by
-  manual_id. Without a keyword index on it Qdrant cannot use the filter while
-  traversing the graph.
+* **Payload indexes.** Scoped searches filter by one or more `manual_id`
+  payload values. Without a keyword index Qdrant cannot use that restriction
+  while traversing the graph.
 
 * **The embedding model name.** Qdrant has no collection metadata, so the name
   is kept in the relational database (`vector_store.record_embedding_model`).
@@ -99,10 +99,10 @@ def _filter(where: Optional[ChunkFilter]) -> Optional[models.Filter]:
     if where is None:
         return None
     conditions: list[models.Condition] = []
-    if where.manual_id is not None:
+    if where.manual_ids is not None:
         conditions.append(
             models.FieldCondition(
-                key="manual_id", match=models.MatchValue(value=where.manual_id)
+                key="manual_id", match=models.MatchAny(any=list(where.manual_ids))
             )
         )
     if where.bookmark_ids is not None:

@@ -7,13 +7,11 @@ console in `webgui/` all want to ask the same question over plain HTTP and get
 JSON back. That is what this is -- the same retrieval the `search_manual` tool
 performs, reachable without a session, a handshake or a tool call.
 
-Two things it does that the MCP tool does not:
+Two things shape this front end:
 
-* **It searches the whole corpus by default.** `manual_id` and `bookmark_id`
-  narrow a search here rather than being required to start one. An agent has
-  browsed its way to a manual before it searches; a RAG client has a question
-  and nothing else, and making it choose a manual first would be asking it to
-  solve retrieval before it may use retrieval.
+* **It searches the whole corpus by default.** `manual_path` defaults to `*`,
+  but accepts an exact `path` returned by the manuals endpoint or a wildcard
+  such as `zOS/V3R1/*`. `bookmark_id` narrows that range to one section.
 * **It answers a browser.** CORS is on, so a page served from anywhere may
   call this, and the figure endpoint returns an image a `<img src>` can point
   at directly.
@@ -75,18 +73,18 @@ class SearchRequest(BaseModel):
         description="The question or text to search for.",
         examples=["how do I mount a zFS file system"],
     )
-    manual_id: Optional[str] = Field(
-        None,
+    manual_path: str = Field(
+        "*",
         description=(
-            "Restrict the search to one manual. Omit to search the whole "
-            "corpus, which is the point of this endpoint."
+            "A manual `path` returned by `/manuals` (not its `document_title`), "
+            "or a wildcard such as `zOS/V3R1/*`. `*` searches the whole corpus."
         ),
     )
     bookmark_id: Optional[str] = Field(
         None,
         description=(
             "Restrict the search to one section and its subsections. The "
-            "manual is implied, so `manual_id` may be omitted alongside it."
+            "bookmark must belong to the range selected by `manual_path`."
         ),
     )
     limit: int = Field(
@@ -214,7 +212,7 @@ def create_app() -> FastAPI:
         try:
             hits = service.search(
                 request.query,
-                manual_id=request.manual_id,
+                manual_path=request.manual_path,
                 bookmark_id=request.bookmark_id,
                 limit=request.limit,
             )
@@ -223,7 +221,7 @@ def create_app() -> FastAPI:
 
         return SearchResponse(
             query=request.query,
-            manual_id=request.manual_id,
+            manual_path=request.manual_path,
             bookmark_id=request.bookmark_id,
             limit=request.limit,
             count=len(hits),
@@ -239,14 +237,22 @@ def create_app() -> FastAPI:
     )
     def search_via_query_string(
         q: Annotated[str, Query(description="The question or text to search for.")],
-        manual_id: Annotated[Optional[str], Query()] = None,
+        manual_path: Annotated[
+            str,
+            Query(
+                description=(
+                    "A `path` returned by /manuals or a wildcard pattern; `*` "
+                    "searches the whole corpus."
+                )
+            ),
+        ] = "*",
         bookmark_id: Annotated[Optional[str], Query()] = None,
         limit: Annotated[int, Query(ge=1, le=MAX_SEARCH_LIMIT)] = DEFAULT_SEARCH_LIMIT,
     ) -> SearchResponse:
         """The same search as a GET, so a browser or `curl` can run one."""
         return search(
             SearchRequest(
-                query=q, manual_id=manual_id, bookmark_id=bookmark_id, limit=limit
+                query=q, manual_path=manual_path, bookmark_id=bookmark_id, limit=limit
             )
         )
 

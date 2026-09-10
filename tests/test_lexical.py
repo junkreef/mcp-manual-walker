@@ -61,9 +61,12 @@ def test_a_near_miss_identifier_is_not_confused_with_its_neighbour(conn):
     assert hits == ["c1"]
 
 
-def test_a_query_is_scoped_to_one_manual(conn):
-    assert search(conn, "mount point", manual_id="m1", max_df_ratio=1.0) == ["c3"]
-    assert search(conn, "mount point", manual_id="m2", max_df_ratio=1.0) == ["c4"]
+def test_a_query_is_scoped_to_selected_manuals(conn):
+    assert search(conn, "mount point", manual_ids=["m1"], max_df_ratio=1.0) == ["c3"]
+    assert search(conn, "mount point", manual_ids=["m2"], max_df_ratio=1.0) == ["c4"]
+    assert set(search(
+        conn, "mount point", manual_ids=["m1", "m2"], max_df_ratio=1.0
+    )) == {"c3", "c4"}
 
 
 def test_slashes_and_punctuation_do_not_break_the_match_syntax(conn):

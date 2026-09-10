@@ -25,7 +25,7 @@ seconds against the tens of minutes an import already takes.
 import logging
 import re
 import sqlite3
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -287,7 +287,7 @@ def search(
     conn: sqlite3.Connection,
     text: str,
     limit: int = LEXICAL_CANDIDATES,
-    manual_id: Optional[str] = None,
+    manual_ids: Optional[Sequence[str]] = None,
     max_df_ratio: float = MAX_TERM_DOCUMENT_FREQUENCY_RATIO,
 ) -> list[str]:
     """Returns chunk ids best matching `text` by BM25, best first.
@@ -302,15 +302,21 @@ def search(
     terms = discriminating_terms(conn, text, max_df_ratio)
     if not terms:
         return []
+    ids = list(dict.fromkeys(manual_ids)) if manual_ids is not None else None
+    if ids == []:
+        return []
+
     match = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
+    manual_clause = ""
+    params: list = [match]
+    if ids is not None:
+        placeholders = ",".join("?" for _ in ids)
+        manual_clause = f" AND manual_id IN ({placeholders})"
+        params.extend(ids)
     sql = (
         f"SELECT chunk_id FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ?"
-        + (" AND manual_id = ?" if manual_id else "")
-        + f" ORDER BY bm25({FTS_TABLE}) LIMIT ?"
+        f"{manual_clause} ORDER BY bm25({FTS_TABLE}) LIMIT ?"
     )
-    params: list = [match]
-    if manual_id:
-        params.append(manual_id)
     params.append(limit)
     try:
         return [r[0] for r in conn.execute(sql, params)]

@@ -252,7 +252,7 @@ def _write_chunks(store, manual_ids: list[str], out) -> int:
     written = 0
     for index, manual_id in enumerate(manual_ids, start=1):
         for chunk in store.scroll(
-            ChunkFilter(manual_id=manual_id), with_embedding=True
+            ChunkFilter(manual_ids=[manual_id]), with_embedding=True
         ):
             out.write(
                 json.dumps(

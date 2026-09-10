@@ -32,7 +32,7 @@ class FakeStore:
         self.queries = []
 
     def scroll(self, where, *, with_document=True, with_embedding=False, **kwargs):
-        ids = [where.manual_id] if where.manual_id is not None else []
+        ids = list(where.manual_ids) if where.manual_ids is not None else []
         self.queries.append(len(ids))
         if len(ids) * self.per_manual > self.chunk_limit:
             raise RuntimeError("too many SQL variables")
