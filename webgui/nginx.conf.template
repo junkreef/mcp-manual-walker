@@ -1,0 +1,40 @@
+# Static files, and one proxied path.
+#
+# The console could call the API directly -- CORS is on for exactly that -- but
+# proxying it here means the page and the API share an origin, so the browser
+# asks no preflight, no origin has to be configured on the server, and the API
+# port does not have to be published to the host at all. Pointing the console
+# at a different deployment is still possible: the base URL is a field on the
+# page, and anything absolute typed there bypasses this proxy.
+
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # The console is three files; nothing here is worth a stale cache while
+    # somebody is editing them.
+    location / {
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache";
+    }
+
+    location /api/ {
+        # The trailing slash on both sides is what strips the prefix: /api/search
+        # arrives at the server as /search, which is the path it serves.
+        proxy_pass ${API_UPSTREAM}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # A cold search embeds the query, and the first one after startup may
+        # also be waiting for the model to load.
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}

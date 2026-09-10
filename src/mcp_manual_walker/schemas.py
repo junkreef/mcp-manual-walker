@@ -140,3 +140,96 @@ class SearchResult(BaseModel):
     results: List[SearchResultItem] = Field(
         ..., description="A list of search results found in the manual."
     )
+
+
+class ManualRef(BaseModel):
+    """Enough of a manual to name it in a result list."""
+
+    id: str = Field(..., description="The unique identifier of the manual.")
+    file_name: str = Field(..., description="The filename of the manual PDF.")
+    document_title: Optional[str] = Field(
+        None, description="The title of the document as extracted from PDF metadata."
+    )
+    relative_path: str = Field(
+        ...,
+        description=(
+            "The path of the PDF relative to the library root, with `/` as the "
+            "separator."
+        ),
+    )
+
+
+class SearchHit(SearchResultItem):
+    """A search result carrying what a client other than an agent needs.
+
+    The MCP tool answers an agent that has already browsed to a manual and
+    wants the text. A REST client has usually searched the whole corpus and has
+    to show a user where each hit came from and how confident it is, so the
+    same result also states its manual, its rank and where it was found.
+    """
+
+    chunk_id: str = Field(..., description="The unique identifier of the chunk.")
+    rank: int = Field(..., description="The 1-based position in the fused ranking.")
+    score: Optional[float] = Field(
+        None,
+        description=(
+            "Cosine similarity to the query, larger being closer. Null for a "
+            "chunk that only the lexical retriever returned, which was never "
+            "scored against the query vector."
+        ),
+    )
+    retrieval: Literal["dense", "lexical", "both"] = Field(
+        "dense",
+        description=(
+            'Which retriever found this chunk: "dense" for the vector search, '
+            '"lexical" for BM25, "both" when they agreed.'
+        ),
+    )
+    page: Optional[int] = Field(
+        None, description="The page the chunk starts on, when it is recorded."
+    )
+    manual: Optional[ManualRef] = Field(
+        None, description="The manual this chunk belongs to."
+    )
+
+
+class SearchResponse(BaseModel):
+    """The REST search result: the query as understood, and what it matched."""
+
+    query: str = Field(..., description="The search query used.")
+    manual_id: Optional[str] = Field(
+        None, description="The manual the search was restricted to, if any."
+    )
+    bookmark_id: Optional[str] = Field(
+        None, description="The section the search was restricted to, if any."
+    )
+    limit: int = Field(..., description="The maximum number of results asked for.")
+    count: int = Field(..., description="How many results are returned.")
+    results: List[SearchHit] = Field(
+        ..., description="The matching chunks, best first."
+    )
+
+
+class HealthResponse(BaseModel):
+    """Whether the server can answer a search, and what it is holding."""
+
+    status: Literal["ok", "degraded"] = Field(
+        ...,
+        description=(
+            '"ok" when a search can be answered, "degraded" when the vector '
+            "store or the embedding model is not available yet."
+        ),
+    )
+    vector_backend: str = Field(..., description="The configured vector backend.")
+    embedding_model: str = Field(
+        ..., description="The embedding model this server expects the vectors to match."
+    )
+    manuals: Optional[int] = Field(
+        None, description="How many manuals the relational database holds."
+    )
+    chunks: Optional[int] = Field(
+        None, description="How many chunks the vector store holds."
+    )
+    detail: Optional[str] = Field(
+        None, description="Why the server is degraded, when it is."
+    )

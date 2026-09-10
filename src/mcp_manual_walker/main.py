@@ -1,148 +1,58 @@
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Annotated, List, Optional
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.types import Image
 from pydantic import Field
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from . import lexical
+from . import service
 from .config import settings
-from .database import SessionLocal, init_db
-from .embeddings import check_embedding_model, get_embedder
-from .models import Bookmark, Figure, Manual
 from .schemas import (
-    BookmarkNode,
     DirectoryEntry,
-    FigureInfo,
-    FigureRef,
     ManualMetadata,
     MarkdownContent,
     SearchResult,
     SearchResultItem,
 )
-from .vector_store import ChunkFilter, open_store
+from .service import ServiceError
+from .service import app_state as app_state  # re-exported: the tests reach for it here
 
 # Configure logging
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# Global AppState
-class AppState:
-    def __init__(self):
-        self.store = None
-        self.embedder = None
-        # Reason why the vector store could not be used, surfaced by the tools.
-        self.init_error = None
-
-
-app_state = AppState()
-
-
-def init_vector_store() -> None:
-    """
-    Connects app_state to the persisted vector collection.
-
-    Kept out of the lifespan so it can be re-run (the test suite reuses a single
-    server object). A failure is recorded instead of raised, so the server still
-    starts and every tool can explain why the vector store is unusable.
-    """
-    logger.info(f"Initializing the {settings.VECTOR_BACKEND} vector store...")
-    app_state.store = None
-    app_state.embedder = None
-    app_state.init_error = None
-
-    try:
-        store = open_store()
-
-        # Load the embedding model (the same one the builder used)
-        embedder = get_embedder()
-
-        # Vectors built with another model are not comparable to ours.
-        check_embedding_model(store.embedding_model, settings.EMBEDDING_MODEL)
-
-        app_state.embedder = embedder
-        app_state.store = store
-
-    except Exception as e:
-        logger.error(f"Failed to initialize the vector store: {e}")
-        app_state.init_error = str(e)
-
-
-def _reopen_store() -> bool:
-    """Tries again to attach to a store that was not there at startup.
-
-    A server started before its database exists is the normal case rather than
-    an error: `docker compose up` brings this up next to an empty Qdrant, and
-    the corpus arrives afterwards through `db_manager import`. Without this the
-    server would answer every request with the same stale complaint until
-    somebody restarted it.
-
-    The embedding model is not reloaded. It is the expensive half of startup --
-    1.11 GiB of weights under the local backend -- and it has nothing to do
-    with whether the collection has appeared yet.
-    """
-    try:
-        store = open_store()
-        check_embedding_model(store.embedding_model, settings.EMBEDDING_MODEL)
-    except Exception as e:  # noqa: BLE001 - reported through the tool below
-        app_state.init_error = str(e)
-        return False
-
-    if app_state.embedder is None:
-        app_state.embedder = get_embedder()
-    app_state.store = store
-    app_state.init_error = None
-    logger.info("The vector store is now available.")
-    return True
-
 
 def _require_store():
     """Returns the vector store, or raises a ToolError explaining why it is gone."""
-    if app_state.store is None and not _reopen_store():
-        message = "Vector database is not initialized."
-        if app_state.init_error:
-            message = f"{message} {app_state.init_error}"
-        raise ToolError(message)
-    return app_state.store
+    with _as_tool_error():
+        return service.require_store()
 
 
 @asynccontextmanager
 async def lifespan(app: FastMCP):
     """Server startup event handler."""
-    logger.info("Initializing application...")
-    # Ensure all necessary directories exist before initializing the database
-    settings.DB_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    settings.PDF_ROOT_DIR.mkdir(parents=True, exist_ok=True)
-    settings.CHROMADB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Initializing database...")
-    init_db()
-
-    init_vector_store()
-
+    service.ensure_initialized()
     yield
 
 
 app = FastMCP(lifespan=lifespan)
 
 
-def _normalize_folder(folder: str | None) -> str:
-    """Turns a caller-supplied folder into a path prefix: `''` or `'a/b/'`.
+@contextmanager
+def _as_tool_error():
+    """Renders a service failure the way the MCP protocol expects.
 
-    The trailing slash is what keeps the prefix match on a folder boundary, so
-    that listing `zOS` cannot pick up a sibling folder named `zOS-legacy`.
+    The service layer reports what went wrong and how, because the REST API has
+    to turn that into a status code. An agent gets neither: every failure is a
+    `ToolError` carrying the same sentence a human would have read.
     """
-    if not folder:
-        return ""
-    cleaned = folder.replace("\\", "/").strip().strip("/")
-    if not cleaned or cleaned == ".":
-        return ""
-    return f"{cleaned}/"
+    try:
+        yield
+    except ServiceError as e:
+        raise ToolError(str(e)) from e
 
 
 @app.tool(
@@ -180,76 +90,8 @@ def list_manuals(
     ] = "",
 ) -> List[DirectoryEntry]:
     """Returns the manuals and subfolders directly inside the given folder."""
-    prefix = _normalize_folder(folder)
-    db: Session = SessionLocal()
-    try:
-        manuals = db.query(Manual).order_by(Manual.relative_path).all()
-
-        # Manual counts per immediate subdirectory, keyed by its name.
-        subdirectories: dict[str, int] = {}
-        files: list[DirectoryEntry] = []
-        matched = False
-
-        for m in manuals:
-            # Paths written on Windows carry backslashes; the tool speaks `/`.
-            relative_path = m.relative_path.replace("\\", "/")
-            if prefix and not relative_path.startswith(prefix):
-                continue
-            matched = True
-
-            remainder = relative_path[len(prefix) :]
-            head, separator, _ = remainder.partition("/")
-            if separator:
-                subdirectories[head] = subdirectories.get(head, 0) + 1
-            else:
-                files.append(
-                    DirectoryEntry(
-                        type="manual",
-                        name=m.file_name,
-                        path=relative_path,
-                        id=m.id,
-                        document_title=m.document_title,
-                    )
-                )
-    except Exception as e:
-        logger.error(f"Error listing folder '{folder}': {e}")
-        raise ToolError(e)
-    finally:
-        db.close()
-
-    if prefix and not matched:
-        raise ToolError(
-            f"No folder named '{folder}' exists in the manual library. "
-            "Call `list_manuals()` without arguments to list the root, then "
-            "follow the `path` of the directory entries."
-        )
-
-    directories = [
-        DirectoryEntry(
-            type="directory",
-            name=name,
-            path=f"{prefix}{name}",
-            manual_count=count,
-        )
-        for name, count in sorted(subdirectories.items())
-    ]
-    return directories + sorted(files, key=lambda entry: entry.name)
-
-
-def _build_toc(bookmarks: list[Bookmark]) -> list[BookmarkNode]:
-    """Builds a nested table of contents from a flat list of bookmarks."""
-    toc = []
-    bookmark_map = {
-        bm.id: BookmarkNode(id=bm.id, title=bm.title, page=bm.page_num, children=[])
-        for bm in bookmarks
-    }
-    for bm in bookmarks:
-        if bm.parent_id:
-            if parent := bookmark_map.get(bm.parent_id):
-                parent.children.append(bookmark_map[bm.id])
-        else:
-            toc.append(bookmark_map[bm.id])
-    return toc
+    with _as_tool_error():
+        return service.list_folder(folder)
 
 
 @app.tool(
@@ -279,115 +121,8 @@ def get_manual_metadata(
     ],
 ) -> ManualMetadata:
     """Returns metadata and a hierarchical table of contents for a specified manual."""
-    db: Session = SessionLocal()
-    try:
-        manual = db.query(Manual).filter(Manual.id == manual_id).first()
-        if not manual:
-            raise ToolError(f"Manual with id '{manual_id}' not found.")
-
-        bookmarks = (
-            db.query(Bookmark)
-            .filter(Bookmark.manual_id == manual.id)
-            .order_by(Bookmark.ordering)
-            .all()
-        )
-        table_of_contents = _build_toc(bookmarks)
-
-        manual_data = {
-            "id": manual.id,
-            "file_name": manual.file_name,
-            "document_title": manual.document_title,
-            "file_hash": manual.file_hash,
-            "table_of_contents": table_of_contents,
-        }
-        return ManualMetadata.model_validate(manual_data)
-    except Exception as e:
-        logger.error(f"Error fetching metadata for manual_id '{manual_id}': {e}")
-        raise ToolError(e)
-    finally:
-        db.close()
-
-
-def _figure_ref(figure: Figure) -> FigureRef:
-    """Builds the lightweight figure reference embedded in tool responses."""
-    return FigureRef(
-        id=figure.id,
-        page=figure.page,
-        caption=figure.caption,
-        description=figure.description,
-        bookmark_id=figure.bookmark_id,
-    )
-
-
-def _load_figures(db: Session, figure_ids: list[str]) -> dict[str, Figure]:
-    """Loads the given figures in a single query, keyed by figure id."""
-    if not figure_ids:
-        return {}
-    figures = db.scalars(select(Figure).where(Figure.id.in_(figure_ids))).all()
-    return {figure.id: figure for figure in figures}
-
-
-def _get_descendant_bookmark_ids(
-    manual_id: str, bookmark_id: str, db: Session
-) -> List[str]:
-    """Retrieves the list of bookmark IDs for the given bookmark and all its descendants."""
-    target_bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
-    if not target_bookmark:
-        raise ToolError(f"Bookmark with id '{bookmark_id}' not found.")
-
-    if target_bookmark.manual_id != manual_id:
-        raise ToolError(
-            f"Bookmark '{bookmark_id}' does not belong to manual '{manual_id}'."
-        )
-
-    # Efficiently find descendants.
-    # Since we have 'ordering' and 'level', descendants follow immediately
-    # and have level > target.level.
-    # We stop when we hit a bookmark with level <= target.level.
-
-    # Get all subsequent bookmarks for this manual
-    subsequent_bookmarks = (
-        db.query(Bookmark)
-        .filter(
-            Bookmark.manual_id == manual_id,
-            Bookmark.ordering >= target_bookmark.ordering,
-        )
-        .order_by(Bookmark.ordering)
-        .all()
-    )
-
-    descendant_ids = []
-    # The first one is the target itself
-    for bm in subsequent_bookmarks:
-        if bm.id == bookmark_id:
-            descendant_ids.append(bm.id)
-            continue
-
-        if bm.level > target_bookmark.level:
-            descendant_ids.append(bm.id)
-        else:
-            # We reached a sibling or parent (level <= target), so we stop
-            break
-
-    return descendant_ids
-
-
-def _chunk_ids_in_bookmarks(store, manual_id: str, bookmark_ids: list[str]) -> set:
-    """Chunk ids under a bookmark subtree, for filtering lexical hits.
-
-    The FTS index stores the manual but not the bookmark, so a search narrowed
-    to a section has to intersect its results with the chunks the vector store
-    says are in it.
-    """
-    if not bookmark_ids:
-        return set()
-    return {
-        chunk.id
-        for chunk in store.scroll(
-            ChunkFilter(manual_id=manual_id, bookmark_ids=bookmark_ids),
-            with_document=False,
-        )
-    }
+    with _as_tool_error():
+        return service.manual_metadata(manual_id)
 
 
 @app.tool(
@@ -419,145 +154,8 @@ def get_markdown_content(
     ],
 ) -> MarkdownContent:
     """Returns the Markdown content for a specific bookmark from the Vector DB."""
-    store = _require_store()
-
-    db: Session = SessionLocal()
-    try:
-        # Resolve bookmark and manual
-        bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
-        if not bookmark:
-            raise ToolError(f"Bookmark with id '{bookmark_id}' not found.")
-
-        manual_id = bookmark.manual_id
-
-        # Get all relevant bookmark IDs (hierarchical)
-        target_bookmark_ids = _get_descendant_bookmark_ids(manual_id, bookmark_id, db)
-
-        # Every chunk of this manual that belongs to the section or one of its
-        # subsections.
-        chunks = list(
-            store.scroll(
-                ChunkFilter(manual_id=manual_id, bookmark_ids=target_bookmark_ids)
-            )
-        )
-
-        # The store does not promise an order, so chunks are sorted by their
-        # chunk_index metadata, falling back to the trailing index of the
-        # legacy "<manual_id>_<index>" chunk ids.
-        combined = []
-        for chunk in chunks:
-            meta = chunk.metadata
-
-            idx = 0
-            if "chunk_index" in meta:
-                idx = meta["chunk_index"]
-            else:
-                # Legacy fallback
-                parts = chunk.id.rsplit("_", 1)
-                if len(parts) == 2 and parts[1].isdigit():
-                    idx = int(parts[1])
-
-            combined.append((idx, chunk.document, meta))
-
-        # Sort by index
-        combined.sort(key=lambda x: x[0])
-
-        figure_ids = [
-            str(meta["figure_id"])
-            for _, _, meta in combined
-            if meta.get("type") == "figure" and meta.get("figure_id")
-        ]
-        figures_by_id = _load_figures(db, figure_ids)
-
-        # Text and table chunks overlap each other and are merged; a figure
-        # chunk is self-contained and is kept as its own block, so the overlap
-        # logic never glues it to a neighbour.
-        blocks: List[str] = []
-        pending_texts: List[str] = []
-        figure_refs: List[FigureRef] = []
-
-        for _, text, meta in combined:
-            if meta.get("type") != "figure":
-                pending_texts.append(text)
-                continue
-
-            if pending_texts:
-                blocks.append(_merge_chunks(pending_texts))
-                pending_texts = []
-
-            figure_id = meta.get("figure_id")
-            page = meta.get("page")
-            page_label = str(int(page)) if isinstance(page, (int, float)) else str(page)
-            if figure_id:
-                header = f"[Figure: {figure_id} (page {page_label})]"
-            else:
-                header = f"[Figure (page {page_label})]"
-            blocks.append(f"{header}\n\n{text}")
-
-            if figure_id:
-                figure = figures_by_id.get(str(figure_id))
-                if figure is not None:
-                    figure_refs.append(_figure_ref(figure))
-                else:
-                    logger.warning(
-                        f"Figure '{figure_id}' is referenced by a chunk of "
-                        f"bookmark '{bookmark_id}' but missing from the database."
-                    )
-
-        if pending_texts:
-            blocks.append(_merge_chunks(pending_texts))
-
-        final_content = "\n\n".join(blocks)
-
-        return MarkdownContent(markdown_content=final_content, figures=figure_refs)
-
-    except Exception as e:
-        logger.exception(f"Error getting content for bookmark_id '{bookmark_id}': {e}")
-        raise ToolError(e)
-    finally:
-        db.close()
-
-
-def _merge_chunks(chunks: List[str]) -> str:
-    """
-    Merges a list of text chunks, removing overlaps between adjacent chunks.
-    Assumes chunks are sorted by their original sequence.
-    """
-    if not chunks:
-        return ""
-    
-    merged = chunks[0]
-    
-    for next_chunk in chunks[1:]:
-        # Find overlap between end of merged and start of next_chunk
-        # Try to find the longest suffix of 'merged' that matches prefix of 'next_chunk'
-        # We limit search to a reasonable window (e.g., slightly larger than chunk_overlap)
-        
-        overlap_len = 0
-        max_overlap_search = settings.CHUNK_OVERLAP + settings.CHUNK_OVERLAP_SEARCH_MARGIN # Should cover chunk_overlap + margin
-        
-        # Search window in merged (last N chars)
-        search_start_idx = max(0, len(merged) - max_overlap_search)
-        suffix_window = merged[search_start_idx:]
-        
-        # Iterate over possible overlap lengths
-        # Optimized: checking logical overlaps
-        # It's cleaner to check if next_chunk starts with a suffix of merged
-        for length in range(min(len(suffix_window), len(next_chunk)), 0, -1):
-            if suffix_window.endswith(next_chunk[:length]):
-                overlap_len = length
-                break
-        
-        if overlap_len > 0:
-            merged += next_chunk[overlap_len:]
-        else:
-            # No overlap detected. Likely a section break or distinct block.
-            # Add separator.
-            merged += "\n\n" + next_chunk
-
-    return merged
-
-
+    with _as_tool_error():
+        return service.markdown_content(bookmark_id)
 
 
 @app.tool(
@@ -597,144 +195,18 @@ def search_manual(
     ] = None,
 ) -> SearchResult:
     """Searches for text in a manual and returns matches with context and hierarchy."""
-    store = _require_store()
+    with _as_tool_error():
+        hits = service.search(query, manual_id=manual_id, bookmark_id=bookmark_id)
 
-    if app_state.embedder is None:
-        raise ToolError("Embedding model is not initialized.")
-
-    embedder = app_state.embedder
-
-    db: Session = SessionLocal()
-    try:
-        target_ids: list[str] = []
-        where = ChunkFilter(manual_id=manual_id)
-
-        if bookmark_id:
-            # Hierarchical filter
-            target_ids = _get_descendant_bookmark_ids(manual_id, bookmark_id, db)
-            where = ChunkFilter(manual_id=manual_id, bookmark_ids=target_ids)
-
-        # Dense and lexical retrieval, fused by rank.
-        #
-        # Dense alone cannot find an identifier: measured against an *exact*
-        # scan of the vectors, the top 5 for "what does message IEF450I mean"
-        # held no chunk containing that string, though 13 chunks do. BM25 finds
-        # them, and finds nothing at all for a question with no indexable term
-        # -- a purely Japanese one against this English corpus -- which is why
-        # the two are fused by rank rather than by score. An empty lexical list
-        # simply leaves the dense ranking untouched.
-        dense_ids = [
-            hit.id
-            for hit in store.search(
-                embedder.embed_query(query),
-                limit=lexical.DENSE_CANDIDATES,
-                where=where,
-            )
-        ]
-
-        lexical_ids = lexical.search(
-            lexical.sqlite_connection(db),
-            query,
-            limit=lexical.LEXICAL_CANDIDATES,
-            manual_id=manual_id,
-        )
-        if bookmark_id:
-            # The dense side got this through the filter; the lexical index does
-            # not carry the bookmark, so it is filtered against the same set.
-            allowed = set(dense_ids)
-            allowed.update(_chunk_ids_in_bookmarks(store, manual_id, target_ids))
-            lexical_ids = [i for i in lexical_ids if i in allowed]
-
-        ordered = lexical.fuse_dense_and_lexical(dense_ids, lexical_ids)[:5]
-
-        # One fetch for whatever the fusion chose, in that order.
-        chunks = store.get(ordered)
-
-        search_result_items = []
-
-        if chunks:
-            # Pre-fetch bookmarks for hierarchy reconstruction
-            # We can't easily pre-fetch just the parents needed without knowing them.
-            # But we can cache the manual's bookmarks map.
-            all_bookmarks = (
-                db.scalars(select(Bookmark).where(Bookmark.manual_id == manual_id)).all()
-            )
-            bookmark_map = {bm.id: bm for bm in all_bookmarks}
-
-            # Figures referenced by the hits, resolved in a single query.
-            figures_by_id = _load_figures(
-                db,
-                [
-                    str(chunk.metadata["figure_id"])
-                    for chunk in chunks
-                    if chunk.metadata.get("figure_id")
-                ],
-            )
-
-            for chunk in chunks:
-                chunk_id = chunk.id
-                text = chunk.document
-                meta = chunk.metadata
-
-                # Get Bookmark Info
-                chunk_bm_id = meta.get("bookmark_id")
-
-                # Build hierarchy path
-                bookmark_node_list = []
-
-                if chunk_bm_id and chunk_bm_id in bookmark_map:
-                    temp_bm = bookmark_map[chunk_bm_id]
-                    path_nodes = []
-                    while temp_bm:
-                        path_nodes.append(temp_bm)
-                        if temp_bm.parent_id:
-                            temp_bm = bookmark_map.get(temp_bm.parent_id)
-                        else:
-                            temp_bm = None
-                    path_nodes.reverse()
-
-                    for node in path_nodes:
-                        bookmark_node_list.append(
-                            BookmarkNode(
-                                id=node.id,
-                                title=node.title,
-                                page=node.page_num,
-                                children=[],
-                            )
-                        )
-
-                figure_ref = None
-                figure_id = meta.get("figure_id")
-                if figure_id:
-                    figure = figures_by_id.get(str(figure_id))
-                    if figure is not None:
-                        figure_ref = _figure_ref(figure)
-                    else:
-                        logger.warning(
-                            f"Chunk '{chunk_id}' references figure "
-                            f"'{figure_id}', which is missing from the database."
-                        )
-
-                search_result_items.append(
-                    SearchResultItem(
-                        bookmarks=bookmark_node_list,
-                        context=text,
-                        manual_id=manual_id,
-                        bookmark_id=chunk_bm_id,
-                        chunk_type=str(meta.get("type", "text")),
-                        figure=figure_ref,
-                    )
-                )
-
-        return SearchResult(
-            manual_id=manual_id, query=query, results=search_result_items
-        )
-
-    except Exception as e:
-        logger.error(f"Error searching manual '{manual_id}': {e}")
-        raise ToolError(e)
-    finally:
-        db.close()
+    # A hit carries more than the tool has ever returned -- its rank, its score
+    # and the manual it came from -- because the REST client showing a result
+    # list needs those. The tool response is narrowed back to what its schema
+    # promises rather than quietly growing.
+    return SearchResult(
+        manual_id=manual_id,
+        query=query,
+        results=[SearchResultItem(**hit.model_dump()) for hit in hits],
+    )
 
 
 @app.tool(
@@ -755,34 +227,44 @@ def get_figure(
     figure_id: Annotated[str, Field(description="The unique ID of the figure.")],
 ):
     """Returns the PNG image of a figure plus its metadata as JSON."""
-    db: Session = SessionLocal()
-    try:
-        figure = db.get(Figure, figure_id)
-        if not figure:
-            raise ToolError(f"Figure with id '{figure_id}' not found.")
+    with _as_tool_error():
+        image, info = service.get_figure(figure_id)
 
-        info = FigureInfo(
-            id=figure.id,
-            page=figure.page,
-            caption=figure.caption,
-            description=figure.description,
-            bookmark_id=figure.bookmark_id,
-            manual_id=figure.manual_id,
-            labels=figure.labels,
-            width=figure.width,
-            height=figure.height,
-            mime_type=figure.mime_type or "image/png",
-        )
-        return [
-            Image(data=figure.image, format="png"),
-            json.dumps(info.model_dump()),
-        ]
-    except Exception as e:
-        logger.error(f"Error fetching figure '{figure_id}': {e}")
-        raise ToolError(e)
+    return [
+        Image(data=image, format="png"),
+        json.dumps(info.model_dump()),
+    ]
+
+
+def serve() -> None:
+    """Serves MCP on PORT and, unless disabled, the REST API on REST_PORT.
+
+    The REST API runs in a thread of its own rather than as a second task on
+    this loop. Both halves are uvicorn servers, and uvicorn installs its own
+    SIGINT/SIGTERM handlers whenever it is started on the main thread: the
+    second one to start would replace the first one's, and Ctrl-C would stop
+    one server while the process went on running the other. Off the main
+    thread uvicorn installs nothing, so the signal keeps reaching the MCP
+    server, and this shuts the REST half down after it returns.
+    """
+    # Before the REST thread, not after: it starts listening the moment it is
+    # asked to, and the MCP server's lifespan -- which is what would otherwise
+    # open the databases -- does not run until `app.run()` below. A request
+    # arriving in between would find a session bound to no engine.
+    service.ensure_initialized()
+
+    rest_server = None
+    if settings.REST_ENABLED:
+        from .rest_api import serve_in_thread
+
+        rest_server = serve_in_thread()
+
+    try:
+        app.run(transport="http", host=settings.HOST, port=settings.PORT)
     finally:
-        db.close()
+        if rest_server is not None:
+            rest_server.stop()
 
 
 if __name__ == "__main__":
-    app.run(transport="http", host=settings.HOST, port=settings.PORT)
+    serve()

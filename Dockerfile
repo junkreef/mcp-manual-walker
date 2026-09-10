@@ -78,16 +78,20 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=8000 \
+    REST_HOST=0.0.0.0 \
+    REST_PORT=8001 \
     DB_FILE_PATH=/app/data/mcp_manual_walker.db \
     CHROMADB_PATH=/app/data/db/chroma_db \
     PDF_ROOT_DIR=/app/data/pdfs \
     HF_HOME=/home/app/.cache/huggingface
 
 # 127.0.0.1 is right on a laptop and useless here: a server bound to loopback
-# inside its own network namespace is reachable by nothing. HOST above is the
-# only setting this image overrides for that reason rather than for a path.
+# inside its own network namespace is reachable by nothing. HOST and REST_HOST
+# above are the only settings this image overrides for that reason rather than
+# for a path. Which of the two ports is published, and to what address, is the
+# compose file's decision.
 
-EXPOSE 8000
+EXPOSE 8000 8001
 USER app
 VOLUME ["/app/data"]
 

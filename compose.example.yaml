@@ -19,6 +19,10 @@
 #   docker compose --profile tools run --rm db_manager import --input /app/data/corpus.zip
 #       Any db_manager subcommand against the same databases.
 #
+#   docker compose --profile gui up -d --build
+#       Adds the browser console on http://127.0.0.1:8080, which is a way to
+#       try a query without an agent in the way.
+#
 # Everything persistent lives in one host directory -- ./data by default, the
 # same place a non-container install puts it, so the two can share one database
 # and a backup is a copy of a directory. MMW_DATA_DIR moves it elsewhere. That
@@ -49,6 +53,16 @@ x-app-env: &app-env
   VECTOR_BACKEND: qdrant
   QDRANT_URL: http://qdrant:6333
   QDRANT_GRPC_PORT: 6334
+  # The REST search API, on the second port. Empty means no key, which is what
+  # a compose network and a loopback publish already assume; set REST_API_KEY
+  # in .env to close it.
+  REST_API_KEY: ${REST_API_KEY:-}
+  # Origins a browser may call the API from. The console does not need this --
+  # it reaches the API through its own nginx, so the page and the API share an
+  # origin -- but a page of your own served from somewhere else does. Not "*":
+  # loopback keeps external clients out and browsers in, so a wildcard is what
+  # would let any site the user visits read the corpus off their machine.
+  REST_CORS_ORIGINS: ${REST_CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
   # Both halves of a corpus have to agree about which model made the vectors,
   # so this is stated once and shared by the server and the tools.
   EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
@@ -132,6 +146,12 @@ services:
     volumes: *app-volumes
     ports:
       - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8000}:8000"
+      # The REST search API. Published because the callers it exists for --
+      # a RAG pipeline, a script, a browser -- are usually on the host rather
+      # than on this network. The console in webgui/ does not need it: it
+      # reaches the API over the compose network, so this line can be deleted
+      # if nothing on the host is going to call it.
+      - "${REST_BIND:-127.0.0.1}:${REST_PORT:-8001}:8001"
 
   # The same server with the model in process. One or the other, never both:
   # they would fight over the port.
@@ -157,6 +177,7 @@ services:
     volumes: *app-volumes
     ports:
       - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8000}:8000"
+      - "${REST_BIND:-127.0.0.1}:${REST_PORT:-8001}:8001"
 
   # One-off commands: import, export, delete, list, reindex-lexical. Uses the
   # small image, because none of those embed anything except `search`.
@@ -179,3 +200,25 @@ services:
     volumes: *app-volumes
     entrypoint: ["python", "-m", "mcp_manual_walker.db_manager"]
 
+  # The browser console: nginx and three static files, and no state of its own.
+  # Behind a profile because it is a way to try a query by hand rather than
+  # part of serving anything, and a deployment that only feeds agents has no
+  # use for it.
+  #
+  # It proxies /api to the server over this network, so the page and the API
+  # share an origin and the REST port does not have to be published at all for
+  # the console to work.
+  webgui:
+    profiles: ["gui"]
+    build:
+      context: ./webgui
+    image: mcp-manual-walker-webgui:latest
+    restart: unless-stopped
+    depends_on:
+      - mcp
+    environment:
+      # Which server the console talks to. `mcp-local` when the local profile
+      # is the one running.
+      API_UPSTREAM: ${WEBGUI_API_UPSTREAM:-http://mcp:8001}
+    ports:
+      - "${WEBGUI_BIND:-127.0.0.1}:${WEBGUI_PORT:-8080}:80"
