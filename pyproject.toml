@@ -22,6 +22,11 @@ dependencies = [
     # Compresses the chunk stream in an export archive. Already present as a
     # chromadb dependency, but db_manager imports it directly.
     "zstandard",
+    # The REST search API. Starlette and uvicorn are already here under
+    # fastmcp; FastAPI is the layer above them that turns the same pydantic
+    # schemas the MCP tools return into request validation and an OpenAPI
+    # document, which is what gives the API a /docs page to try a query in.
+    "fastapi",
 ]
 
 [project.optional-dependencies]

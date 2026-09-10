@@ -29,5 +29,7 @@ poc/
 tests/
 docs/
 deploy/
+# The test console is its own image, built from ./webgui as its own context.
+webgui/
 *.md
 !README.md

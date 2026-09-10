@@ -85,9 +85,13 @@ cp .env.example .env                                  # set EMBEDDING_API_BASE
 printf 'MMW_UID=%s\nMMW_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 docker compose up -d --build
 docker compose --profile tools run --rm db_manager import --input /app/data/corpus.zip
+docker compose --profile gui up -d --build            # optional: the console
 ```
 
-The server is on `http://127.0.0.1:8000/mcp`.
+The server answers on two ports: MCP on `http://127.0.0.1:8000/mcp`, and the
+[REST search API](#-the-rest-api) on `http://127.0.0.1:8001`, which is what a
+caller that does not speak MCP uses. The optional
+[browser console](#-the-browser-console) is on `http://127.0.0.1:8080`.
 
 The first line matters: Docker creates a missing bind-mount source itself, and
 it creates it owned by root. The fourth is only needed if your account is not
@@ -398,6 +402,154 @@ Figures are first-class results, so an agent can find a diagram by what it shows
 *   `get_figure(figure_id)` returns two content blocks: the PNG image itself (an image content block, `image/png`) and a JSON text block with the figure's `id`, `manual_id`, `bookmark_id`, `page`, `caption`, `labels`, `description`, `width`, `height` and `mime_type`. An unknown id is an error.
 
 The typical figure workflow is therefore: `search_manual(...)` → take `figure.id` from a hit whose `chunk_type` is `"figure"` (or an id from the `figures` list of `get_markdown_content`) → `get_figure(figure_id=...)`.
+
+## 🔌 The REST API
+
+MCP is how an agent uses this corpus. It is not the only kind of caller: a RAG
+pipeline retrieving passages for a prompt, a script checking what a manual says
+about an error code, and the browser console below all want to ask the same
+question over plain HTTP. The server answers them on a second port, in the same
+process, out of the same index — the vector store is already open and the
+embedding model is already resident, and a separate service would need its own
+copy of both.
+
+It is on by default, on `127.0.0.1:8001`; `REST_ENABLED=false` turns it off and
+`REST_HOST`/`REST_PORT` move it. Interactive documentation, generated from the
+same pydantic models the MCP tools return, is at `/docs`.
+
+```bash
+curl -s localhost:8001/health
+
+curl -s localhost:8001/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "how do I mount a zFS file system", "limit": 5}'
+
+# The same search, as a GET, for when a browser address bar is what you have.
+curl -s 'localhost:8001/search?q=IEF450I&limit=3'
+```
+
+| Endpoint | Answers with |
+| --- | --- |
+| `GET /health` | Whether a search can be answered, the backend and model in use, and how many manuals and chunks are held. Never requires the API key. |
+| `POST /search` | The best matching chunks for `query`, with `manual_id`, `bookmark_id` and `limit` all optional. |
+| `GET /search?q=…` | The same search from query-string parameters. |
+| `GET /manuals?folder=…` | One folder of the library, one level deep, exactly as `list_manuals` returns it. |
+| `GET /manuals/{manual_id}` | The manual's metadata and hierarchical table of contents. |
+| `GET /bookmarks/{bookmark_id}/markdown` | The Markdown of that section and its subsections, plus the figures in it. |
+| `GET /figures/{figure_id}` | A figure's caption, labels, description and size. |
+| `GET /figures/{figure_id}/image` | The PNG itself, so an `<img src>` can point straight at it. |
+
+**A search here does not need a manual.** The `search_manual` tool requires one
+because an agent has already browsed its way to it; a RAG client has a question
+and nothing else, and making it choose a manual first would be asking it to
+solve retrieval before it may use retrieval. So `manual_id` narrows a search
+rather than starting one, `bookmark_id` narrows it to a section — and since a
+bookmark names exactly one manual, `bookmark_id` alone is enough.
+
+Each hit carries more than the tool returns, because a client showing a result
+list has to say where it came from:
+
+```json
+{
+  "query": "how do I mount a zFS file system",
+  "manual_id": null,
+  "bookmark_id": null,
+  "limit": 5,
+  "count": 5,
+  "results": [
+    {
+      "chunk_id": "8f0c…", "rank": 1, "score": 0.71, "retrieval": "both",
+      "chunk_type": "text", "page": 214,
+      "manual_id": "d10e…",
+      "manual": {
+        "id": "d10e…", "file_name": "zos-unix-sysadmin.pdf",
+        "document_title": "z/OS UNIX System Services Planning",
+        "relative_path": "z/OS/v2r5/zos-unix-sysadmin.pdf"
+      },
+      "bookmark_id": "7e14…",
+      "bookmarks": [{"id": "ed98…", "title": "Chapter 8", "page": 201, "children": []}],
+      "context": "…the text of the chunk…",
+      "figure": null
+    }
+  ]
+}
+```
+
+`score` is the cosine similarity to the query, and it is `null` for a hit that
+only BM25 returned: such a chunk was never scored against the query vector, and
+inventing a number for it would be worse than saying nothing. `retrieval` says
+which half found it — `"dense"`, `"lexical"` or `"both"`. The ranking itself is
+the same rank fusion the MCP tool uses, described under "Lexical retrieval
+alongside the vectors".
+
+### Closing it
+
+`REST_API_KEY` is empty by default, which leaves the API open — the right
+answer only while it is bound to loopback or to a private network. Setting it
+requires every request except `/health` to present the key:
+
+```bash
+curl -s localhost:8001/search -H 'X-API-Key: …' -d '{"query": "…"}'
+curl -s localhost:8001/search -H 'Authorization: Bearer …' -d '{"query": "…"}'
+```
+
+`/health` stays open on purpose: a container health check and a load balancer
+call it, and neither should have to hold a credential to ask whether the
+process is alive. It reveals sizes and the model name, never content.
+
+### Two doors
+
+Everything that is not a browser talks to `127.0.0.1:8001` directly; that is
+what compose publishes and what the examples above use. A page in a browser has
+a second option: the console's nginx forwards `/api` to the same server, so
+`http://127.0.0.1:8080/api/search` reaches the same endpoint from the page's own
+origin. Nothing says the second door is only for the page — publish `8080` and
+leave `8001` unpublished and nginx becomes the single front door for
+everything.
+
+Which door a browser uses decides whether CORS is involved. Through `/api` it is
+not: same origin, no preflight, nothing to configure. Straight to `:8001` it is,
+and `REST_CORS_ORIGINS` has to name the page's origin. It defaults to
+`http://localhost:8080` and `http://127.0.0.1:8080` — the console's own address
+— and empty sends no CORS headers at all.
+
+It does not default to `*`, and the reason is worth stating: binding to loopback
+keeps external HTTP clients out, but it does not keep browsers out. A page on
+any site the person running this server happens to visit can issue requests to
+`127.0.0.1:8001`; without `Access-Control-Allow-Origin` the browser blocks it
+from *reading* the answer, and `*` is precisely what would let it read — and
+exfiltrate — the corpus. Name the origins you mean, or set an API key, or both.
+
+## 🖥️ The browser console
+
+A page for trying a query by hand: type a question, see what comes back, read
+the section a hit belongs to, look at a figure. It is nginx serving three
+static files in a container of its own, behind a profile, because it is a way
+to look at the corpus rather than part of serving it.
+
+```bash
+docker compose --profile gui up -d --build
+# http://127.0.0.1:8080
+```
+
+<!-- A screenshot belongs here once the console has been run against a real corpus. -->
+
+The console proxies `/api` to the server over the compose network, so the page
+and the API share an origin, no CORS is involved and the REST port does not
+have to be published to the host at all for it to work. To point it at a
+different deployment, open **Settings** and put an absolute URL in **API base
+URL** — `http://localhost:8001` to go straight to the API rather than through
+the proxy, which is the case `REST_CORS_ORIGINS` exists for. The API key field
+beside it fills in `X-API-Key` for a server that wants one. Both are kept in
+the browser, not on the server.
+
+`WEBGUI_PORT` and `WEBGUI_BIND` move where it is published;
+`WEBGUI_API_UPSTREAM` names the server it proxies to, which has to be
+`http://mcp-local:8001` when the `local` profile is the one running.
+
+There is no build step and no bundler. `webgui/static/` is HTML, CSS and one
+JavaScript file that a browser runs as they are, so editing the console needs
+nothing installed and a rebuild of that image is a file copy.
 
 ## 🏗️ Building the Database
 

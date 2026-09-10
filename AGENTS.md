@@ -197,9 +197,16 @@ This guide provides essential information for an AI agent to effectively contrib
 
 ### 3. Running the Application
 
-*   To start the server, run the `main.py` script. It will be accessible at `http://0.0.0.0:8000`.
+*   To start the server, run the `main.py` script. It serves two ports: the MCP
+    endpoint on `HOST:PORT` (`http://127.0.0.1:8000/mcp`) and the REST search
+    API on `REST_HOST:REST_PORT` (`http://127.0.0.1:8001`, with interactive
+    documentation at `/docs`). `REST_ENABLED=false` leaves the second one off.
     ```bash
     python src/mcp_manual_walker/main.py
+    ```
+*   To try a query by hand, bring up the browser console beside it:
+    ```bash
+    docker compose --profile gui up -d --build   # http://127.0.0.1:8080
     ```
 
 ### 4. Quality & Verification
@@ -230,7 +237,10 @@ Before finalizing changes, always run the following commands to ensure code qual
 
 ### 5. Project Structure Overview
 
-*   `src/mcp_manual_walker/main.py`: Main application entry point. Defines the server (`FastMCP`) and the tools available to the agent. Contains the core database synchronization logic.
+*   `src/mcp_manual_walker/main.py`: Main application entry point. Defines the `FastMCP` server and the tools available to the agent, and starts the REST API alongside it. The tool bodies are thin: they call `service.py` and translate its failures into `ToolError`.
+*   `src/mcp_manual_walker/service.py`: Everything both front ends do — browsing the library, the table of contents, section Markdown, hybrid search and figures — plus the vector store and embedder the process holds. **Retrieval logic belongs here, never in a tool or an endpoint**, so the MCP and REST answers cannot drift apart. Failures are `ServiceError` with a `kind`, which each front end renders its own way.
+*   `src/mcp_manual_walker/rest_api.py`: The FastAPI application served on the second port, and the threaded uvicorn runner that keeps it out of the MCP server's signal handling. Search here is corpus-wide by default; `manual_id` and `bookmark_id` are filters.
+*   `webgui/`: The browser console — an nginx image serving `static/` and proxying `/api` to the REST port. No build step: the three files in `static/` are what runs.
 *   `src/mcp_manual_walker/models.py`: Defines the SQLAlchemy database schema (`Manual`, `Bookmark`, `Cache`). **Crucially, it defines the `cascade="all, delete-orphan"` behavior.**
 *   `src/mcp_manual_walker/database.py`: Handles database engine creation and session management.
 *   `src/mcp_manual_walker/config.py`: Defines application settings using Pydantic, loaded from the `.env` file.

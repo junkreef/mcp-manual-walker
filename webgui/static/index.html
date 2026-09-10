@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Manual Walker — search console</title>
+    <link rel="stylesheet" href="styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🚶</text></svg>"
+    />
+  </head>
+  <body>
+    <header>
+      <h1>Manual Walker</h1>
+      <div id="health" class="health unknown" title="Server status">checking…</div>
+      <button id="settings-toggle" type="button" class="ghost">Settings</button>
+    </header>
+
+    <section id="settings" hidden>
+      <label>
+        API base URL
+        <input id="api-base" type="text" spellcheck="false" />
+        <small
+          >Where the REST API lives. <code>/api</code> is this page's own nginx,
+          proxied to the server. An absolute URL such as
+          <code>http://localhost:8001</code> goes straight to it.</small
+        >
+      </label>
+      <label>
+        API key
+        <input id="api-key" type="password" spellcheck="false" autocomplete="off" />
+        <small
+          >Only needed when the server was started with
+          <code>REST_API_KEY</code>. Kept in this browser, sent as
+          <code>X-API-Key</code>.</small
+        >
+      </label>
+    </section>
+
+    <form id="search-form">
+      <input
+        id="query"
+        type="search"
+        placeholder="Ask the manuals something…"
+        autocomplete="off"
+        autofocus
+      />
+      <button type="submit" id="submit">Search</button>
+    </form>
+
+    <section id="filters">
+      <label>
+        Results
+        <select id="limit">
+          <option>5</option>
+          <option selected>10</option>
+          <option>20</option>
+          <option>50</option>
+        </select>
+      </label>
+      <label class="grow">
+        Restrict to
+        <span id="scope">
+          <span class="scope-all">the whole corpus</span>
+        </span>
+      </label>
+      <button type="button" id="browse-toggle" class="ghost">Browse library</button>
+    </section>
+
+    <section id="browser" hidden>
+      <nav id="breadcrumb"></nav>
+      <ul id="entries"></ul>
+    </section>
+
+    <main>
+      <p id="status" class="status"></p>
+      <ol id="results"></ol>
+    </main>
+
+    <dialog id="detail">
+      <header>
+        <h2 id="detail-title"></h2>
+        <button type="button" id="detail-close" class="ghost">Close</button>
+      </header>
+      <div id="detail-body"></div>
+    </dialog>
+
+    <script src="app.js"></script>
+  </body>
+</html>

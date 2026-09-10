@@ -67,6 +67,40 @@ class Settings(BaseSettings):
     HOST: str = "127.0.0.1"
     PORT: int = 8000
 
+    # The REST search API, served next to the MCP endpoint on a port of its
+    # own. It exists because the corpus is worth querying from things that do
+    # not speak MCP -- a RAG pipeline, a script, the test console in webgui/ --
+    # and because those callers want a plain JSON request rather than a tool
+    # call inside a session.
+    #
+    # Same process, second port: the expensive part of this server is the
+    # embedding model and the open vector store, and a separate process would
+    # need its own copy of both. A second port rather than a second path
+    # because the two audiences want different exposure -- MCP to an agent
+    # runtime, REST possibly to a browser -- and a port is what a firewall,
+    # a reverse proxy and `docker compose` can all tell apart.
+    REST_ENABLED: bool = True
+    REST_HOST: str = "127.0.0.1"
+    REST_PORT: int = 8001
+    # Sent by the client as "X-API-Key: ..." or "Authorization: Bearer ...".
+    # Empty, the default, means the API is open, which is the right answer only
+    # while it is bound to loopback or to a private network.
+    REST_API_KEY: str = ""
+    # Origins allowed to call the API from a browser, comma-separated. Empty
+    # sends no CORS headers at all, which is what a caller that is not a
+    # browser wants and all a browser needs when the page came from the same
+    # origin -- the console in webgui/ reaches the API through its own nginx,
+    # so it never depends on this.
+    #
+    # The default names the console's own address rather than "*", because
+    # loopback is not the protection it looks like: an external HTTP client
+    # cannot reach 127.0.0.1:8001, but a page in the browser of whoever is
+    # running this server can, and "*" is exactly what would let that page read
+    # the answer. Naming the origins costs a line in .env when the console is
+    # served from somewhere else; "*" costs every site the user visits a copy
+    # of the corpus. Set it to "*" deliberately, not by default.
+    REST_CORS_ORIGINS: str = "http://localhost:8080,http://127.0.0.1:8080"
+
     # Docling Configuration
     # DOCLING_NUM_THREADS is the TOTAL CPU thread budget shared by all Docling
     # worker processes; each worker gets DOCLING_NUM_THREADS // DOCLING_WORKERS.

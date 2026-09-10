@@ -12,7 +12,7 @@ from fastmcp.client import Client
 from fastmcp.exceptions import ToolError
 from PIL import Image as PILImage
 
-from mcp_manual_walker import config, database, main
+from mcp_manual_walker import config, database, service
 from mcp_manual_walker.embeddings import COLLECTION_NAME
 from mcp_manual_walker.main import app
 from mcp_manual_walker.models import Bookmark, Figure, Manual
@@ -129,7 +129,7 @@ def _build_test_environment(tmp_path, monkeypatch, dummy_pdf_factory, stored_mod
 
     # The server must not try to download the real model during the tests.
     fake_embedder = FakeEmbedder()
-    monkeypatch.setattr(main, "get_embedder", lambda: fake_embedder)
+    monkeypatch.setattr(service, "get_embedder", lambda: fake_embedder)
 
     # 4. Manually run sync_database to populate the test SQLite DB
     sync_database()
@@ -241,7 +241,7 @@ def _build_test_environment(tmp_path, monkeypatch, dummy_pdf_factory, stored_mod
 
     # The in-memory FastMCP server runs its lifespan only once per process, so
     # every test wires app_state to its own temporary vector store explicitly.
-    main.init_vector_store()
+    service.init_vector_store()
 
 
 @pytest.fixture(scope="function")
