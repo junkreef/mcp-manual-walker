@@ -91,17 +91,25 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # for a path. Which of the two ports is published, and to what address, is the
 # compose file's decision.
 
+# The default ports, named here for documentation: EXPOSE is metadata and
+# cannot follow an environment variable, so a container whose REST_PORT has
+# been moved publishes whatever the compose file says regardless of this line.
 EXPOSE 8000 8001
 USER app
 VOLUME ["/app/data"]
 
-# Proves the port is accepting connections. Deliberately not a request to
-# /mcp: that transport expects a session, and a health check that has to
-# speak the protocol correctly is a health check that breaks when the
-# protocol moves. start-period covers loading the embedding model, which the
-# local target does before it listens.
+# Proves the ports are accepting connections -- both of them, because one
+# process serves two servers and a container answering MCP while its REST half
+# is dead is not healthy, merely half-dead. That distinction is load-bearing:
+# the systemd unit starts the stack with `docker compose up -d --wait`, which
+# waits on exactly this and would otherwise report a successful start.
+#
+# Deliberately not a request to /mcp: that transport expects a session, and a
+# health check that has to speak the protocol correctly is a health check that
+# breaks when the protocol moves. start-period covers loading the embedding
+# model, which the local target does before it listens.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
-    CMD ["python", "-c", "import os,socket; socket.create_connection(('127.0.0.1', int(os.environ['PORT'])), 4).close()"]
+    CMD ["python", "-c", "import os,socket; rest=os.environ.get('REST_ENABLED','true').strip().lower() not in ('0','false','no','off'); ports=[int(os.environ.get('PORT',8000))]+([int(os.environ.get('REST_PORT',8001))] if rest else []); [socket.create_connection(('127.0.0.1',p),4).close() for p in ports]"]
 
 CMD ["python", "-m", "mcp_manual_walker.main"]
 
