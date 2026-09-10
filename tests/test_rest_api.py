@@ -6,6 +6,7 @@ translation: corpus-wide search, status codes, the API key, CORS, the image
 bytes, and the fact that the second port really does come up next to the first.
 """
 
+import socket
 import threading
 
 import httpx
@@ -298,3 +299,31 @@ def test_the_api_really_listens_on_its_own_port(
 
     if database.engine:
         database.engine.dispose()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_taken_rest_port_fails_loudly_instead_of_serving_half_a_server(monkeypatch):
+    """Moving REST_PORT onto something already listening must not be quiet.
+
+    The alternative is a process that serves MCP, answers nothing on the REST
+    port and reports no error, which is the hardest kind of misconfiguration to
+    find: everything looks up until a client asks.
+
+    The uvicorn thread raises the bind error on its way out, which is the
+    mechanism being tested rather than an unhandled failure.
+    """
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    taken = blocker.getsockname()[1]
+
+    monkeypatch.setattr(config.settings, "REST_HOST", "127.0.0.1")
+    monkeypatch.setattr(config.settings, "REST_PORT", taken)
+
+    try:
+        with pytest.raises(RuntimeError, match=f"127.0.0.1:{taken}"):
+            rest_api.serve_in_thread(startup_timeout=10)
+    finally:
+        blocker.close()
+
+    assert not any(t.name == "rest-api" and t.is_alive() for t in threading.enumerate())
