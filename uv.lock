@@ -2204,7 +2204,7 @@ qdrant = [
 requires-dist = [
     { name = "chromadb" },
     { name = "docling", marker = "extra == 'builder'", specifier = ">=2.120" },
-    { name = "fastapi", specifier = ">=0.141.1" },
+    { name = "fastapi" },
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "langchain-text-splitters", marker = "extra == 'builder'" },
